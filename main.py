@@ -1,10 +1,12 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
-import openai
 import os
+from openai import OpenAI
 from slack_sdk.webhook import WebhookClient
 
 app = FastAPI()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 class HostawayWebhook(BaseModel):
     id: int
     body: str
@@ -16,27 +18,23 @@ async def receive_message(payload: HostawayWebhook):
     listing_name = payload.listingName or "Guest"
     message_id = payload.id
 
-    # Generate reply using ChatGPT
     prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
 \"{guest_message}\"
 
 Write a warm, professional reply. Be friendly and helpful. Sign off politely."""
 
-    from openai import OpenAI
+    # ✅ ChatGPT call using new SDK
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
+            {"role": "user", "content": prompt}
+        ]
+    )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    ai_reply = response.choices[0].message.content.strip()
 
-response = client.chat.completions.create(
-    model="gpt-4",
-    messages=[
-        {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
-        {"role": "user", "content": prompt}
-    ]
-)
-
-ai_reply = response.choices[0].message.content.strip()
-
-    # Send to Slack
+    # Send message to Slack
     slack_message = {
         "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
         "attachments": [
@@ -65,4 +63,3 @@ ai_reply = response.choices[0].message.content.strip()
     webhook.send(**slack_message)
 
     return {"status": "sent_to_slack"}
-
