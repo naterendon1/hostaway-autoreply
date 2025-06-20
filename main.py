@@ -42,10 +42,18 @@ Write a friendly, helpful reply in a professional tone. Sign off politely."""
 
 
 @app.post("/hostaway-webhook")
-async def receive_message(payload: HostawayMessage):
-    guest_name = payload.guest.get("firstName", "Guest")
-    guest_message = payload.body
-    message_id = payload.id
+async def receive_message(request: Request):
+    body = await request.body()
+    print("🔥 RAW PAYLOAD RECEIVED:", body.decode())
+
+    try:
+        json_data = await request.json()
+        print("✅ PARSED JSON:", json_data)
+    except Exception as e:
+        print("❌ FAILED TO PARSE JSON:", e)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    return {"status": "test"}
 
     ai_reply = generate_reply(guest_message, guest_name)
 
