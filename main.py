@@ -1,10 +1,10 @@
-from fastapi import Request
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-from fastapi import HTTPException
 import openai
 import os
 from slack_sdk.webhook import WebhookClient
 
+app = FastAPI()
 class HostawayWebhook(BaseModel):
     id: int
     body: str
