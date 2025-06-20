@@ -41,6 +41,8 @@ Write a friendly, helpful reply in a professional tone. Sign off politely."""
     return response.choices[0].message.content.strip()
 
 
+from fastapi import HTTPException 
+
 @app.post("/hostaway-webhook")
 async def receive_message(request: Request):
     body = await request.body()
