@@ -22,15 +22,19 @@ async def receive_message(payload: HostawayWebhook):
 
 Write a warm, professional reply. Be friendly and helpful. Sign off politely."""
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
-            {"role": "user", "content": prompt}
-        ]
-    )
+    from openai import OpenAI
 
-    ai_reply = response.choices[0].message.content.strip()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+response = client.chat.completions.create(
+    model="gpt-4",
+    messages=[
+        {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
+        {"role": "user", "content": prompt}
+    ]
+)
+
+ai_reply = response.choices[0].message.content.strip()
 
     # Send to Slack
     slack_message = {
