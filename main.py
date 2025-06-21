@@ -25,7 +25,7 @@ Write a warm, professional reply. Be friendly and helpful. Sign off politely."""
 
     # ✅ ChatGPT call using new SDK
     response = client.chat.completions.create(
-        model="gpt-4",
+        model="gpt-3.5-turbo",
         messages=[
             {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
             {"role": "user", "content": prompt}
