@@ -2,6 +2,8 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 import os
 import logging
+import json
+import requests
 from openai import OpenAI, OpenAIError
 from slack_sdk.webhook import WebhookClient
 from slack_sdk.errors import SlackApiError
@@ -91,3 +93,39 @@ async def receive_message(payload: HostawayWebhook):
     except Exception as e:
         logging.exception("🔥 Unexpected error in /hostaway-webhook")
         return {"status": "error", "detail": str(e)}
+
+# --------------------------------------
+# Slack Interactivity Handler (Approve button)
+# --------------------------------------
+
+@app.post("/slack-interactivity")
+async def handle_slack_button(request: Request):
+    form_data = await request.form()
+    payload = json.loads(form_data["payload"])
+    action = payload["actions"][0]
+    message_id = int(payload["callback_id"])
+    action_value = action["value"]
+
+    logging.info(f"🟢 Slack button clicked: {action['name']} for message {message_id}")
+
+    if action["name"] == "approve":
+        return post_reply_to_hostaway(message_id, action_value)
+    else:
+        return {"text": "❌ Rejected. No reply sent."}
+
+def post_reply_to_hostaway(message_id: int, reply_text: str):
+    url = f"https://api.hostaway.com/v1/messages/{message_id}/reply"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('HOSTAWAY_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {"body": reply_text}
+
+    try:
+        res = requests.post(url, headers=headers, json=payload)
+        res.raise_for_status()
+        logging.info(f"✅ Sent reply to Hostaway message {message_id}")
+        return {"text": "✅ Reply sent to guest!"}
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Failed to send reply to Hostaway: {e}")
+        return {"text": f"❌ Failed to send: {e}"}
