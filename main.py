@@ -1,4 +1,6 @@
+from pathlib import Path
 
+main_py_contents = """
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -11,15 +13,15 @@ from openai import OpenAI
 from slack_sdk.webhook import WebhookClient
 import yaml
 
-# Load environment and toggles
-load_dotenv()
+# Load feature toggles from YAML
 with open("config/feature_toggles.yaml", "r") as f:
     FEATURE_TOGGLES = yaml.safe_load(f)
+
+load_dotenv()
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# ENV Variables
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_API_KEY")
@@ -38,10 +40,10 @@ async def receive_message(payload: HostawayWebhook):
 
     logging.info(f"📩 New guest message received: {guest_message}")
 
-    prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
-"{guest_message}"
+    prompt = f\"\"\"You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
+\"{guest_message}\"
 
-Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
+Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff.\"\"\"
 
     try:
         response = client.chat.completions.create(
@@ -57,11 +59,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         ai_reply = "(Error generating reply with OpenAI.)"
 
     slack_message = {
-        "text": f"""*New Guest Message for {listing_name}:*
->{guest_message}
-
-*Suggested Reply:*
->{ai_reply}""",
+        "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
         "attachments": [
             {
                 "callback_id": str(message_id),
@@ -69,30 +67,10 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
                 "color": "#3AA3E3",
                 "attachment_type": "default",
                 "actions": [
-                    {
-                        "name": "approve",
-                        "text": "✅ Approve",
-                        "type": "button",
-                        "value": ai_reply
-                    },
-                    {
-                        "name": "reject",
-                        "text": "❌ Reject",
-                        "type": "button",
-                        "value": "reject"
-                    },
-                    {
-                        "name": "improve",
-                        "text": "✏️ Improve with AI",
-                        "type": "button",
-                        "value": ai_reply
-                    },
-                    {
-                        "name": "write_own",
-                        "text": "📝 Write Your Own",
-                        "type": "button",
-                        "value": str(message_id)
-                    }
+                    {"name": "approve", "text": "✅ Approve", "type": "button", "value": ai_reply},
+                    {"name": "reject", "text": "❌ Reject", "type": "button", "value": "reject"},
+                    {"name": "improve", "text": "✏️ Improve with AI", "type": "button", "value": ai_reply},
+                    {"name": "write_own", "text": "📝 Write Your Own", "type": "button", "value": str(message_id)}
                 ]
             }
         ]
@@ -123,7 +101,46 @@ async def slack_action(request: Request):
         return JSONResponse({"text": "🔄 Improving message with AI... (feature coming soon)"})
 
     elif action_type == "write_own":
-        return JSONResponse({"text": "📝 You can now write your own reply below. (feature coming soon)"})
+        return JSONResponse({
+            "text": "📝 You can now write your own reply below.",
+            "attachments": [
+                {
+                    "callback_id": str(message_id),
+                    "fallback": "Back to main actions",
+                    "color": "#CCCCCC",
+                    "attachment_type": "default",
+                    "actions": [
+                        {
+                            "name": "back_to_main",
+                            "text": "🔙 Back",
+                            "type": "button",
+                            "value": str(message_id)
+                        }
+                    ]
+                }
+            ]
+        })
+
+    elif action_type == "back_to_main":
+        guest_message = "(guest message placeholder)"
+        ai_reply = "(AI reply placeholder)"
+        return JSONResponse({
+            "text": f"*New Guest Message:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+            "attachments": [
+                {
+                    "callback_id": str(message_id),
+                    "fallback": "You are unable to choose a response",
+                    "color": "#3AA3E3",
+                    "attachment_type": "default",
+                    "actions": [
+                        {"name": "approve", "text": "✅ Approve", "type": "button", "value": ai_reply},
+                        {"name": "reject", "text": "❌ Reject", "type": "button", "value": "reject"},
+                        {"name": "improve", "text": "✏️ Improve with AI", "type": "button", "value": ai_reply},
+                        {"name": "write_own", "text": "📝 Write Your Own", "type": "button", "value": str(message_id)}
+                    ]
+                }
+            ]
+        })
 
     return JSONResponse({"text": "⚠️ Unknown action"})
 
@@ -136,3 +153,9 @@ def send_reply_to_hostaway(message_id: int, reply_text: str):
     payload = {"body": reply_text}
     r = requests.post(url, headers=headers, json=payload)
     r.raise_for_status()
+"""
+
+output_path = Path("/mnt/data/main.py")
+output_path.write_text(main_py_contents)
+
+output_path
