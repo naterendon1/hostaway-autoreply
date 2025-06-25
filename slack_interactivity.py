@@ -12,6 +12,11 @@ import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 from slack_sdk.webhook import WebhookClient
+import yaml
+
+# Load feature toggles from YAML
+with open("config/feature_toggles.yaml", "r") as f:
+    FEATURE_TOGGLES = yaml.safe_load(f)
 
 load_dotenv()
 
