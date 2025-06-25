@@ -1,6 +1,4 @@
-from pathlib import Path
 
-main_py_content = '''
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -41,7 +39,7 @@ async def receive_message(payload: HostawayWebhook):
     logging.info(f"📩 New guest message received: {guest_message}")
 
     prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
-\"{guest_message}\"
+"{guest_message}"
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
@@ -59,7 +57,11 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         ai_reply = "(Error generating reply with OpenAI.)"
 
     slack_message = {
-        "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+        "text": f"*New Guest Message for {listing_name}:*
+>{guest_message}
+
+*Suggested Reply:*
+>{ai_reply}",
         "attachments": [
             {
                 "callback_id": str(message_id),
@@ -134,8 +136,3 @@ def send_reply_to_hostaway(message_id: int, reply_text: str):
     payload = {"body": reply_text}
     r = requests.post(url, headers=headers, json=payload)
     r.raise_for_status()
-'''
-
-path = Path("/mnt/data/main.py")
-path.write_text(main_py_content)
-path
