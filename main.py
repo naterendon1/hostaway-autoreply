@@ -200,5 +200,3 @@ output_path = Path("/mnt/data/main.py")
 output_path.write_text(main_py_contents)
 
 output_path
-Result
-PosixPath('/mnt/data/main.py')
