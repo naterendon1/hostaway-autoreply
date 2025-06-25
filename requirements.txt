@@ -1,6 +1,5 @@
 fastapi
 uvicorn
 openai>=1.0.0
-slack-sdk
-requests
-python-dotenv
+slack_sdk
+pydantic
