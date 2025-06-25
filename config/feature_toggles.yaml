@@ -1,0 +1,16 @@
+# Toggle specific AI and app behaviors on or off
+
+ai_reply_enabled: true
+slack_buttons_enabled: true
+improve_with_ai_enabled: true
+write_your_own_enabled: true
+ai_learning_enabled: true
+early_checkin_prompt_enabled: true
+golf_cart_prompt_enabled: true
+cargo_lift_prompt_enabled: true
+calendar_lookup_enabled: true
+alternate_listings_enabled: true
+guest_portal_link_lookup_enabled: true
+external_research_enabled: true
+create_maintenance_task_enabled: true
+memory_enabled: true
