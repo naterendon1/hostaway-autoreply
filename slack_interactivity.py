@@ -1,6 +1,5 @@
 from pathlib import Path
 
-# Re-define the contents after reset
 main_py_contents = """
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import JSONResponse
@@ -14,20 +13,24 @@ from openai import OpenAI
 from slack_sdk.webhook import WebhookClient
 import yaml
 
-# Load feature toggles from YAML
+# Load environment variables
+load_dotenv()
+
+# Load feature toggles
 with open("config/feature_toggles.yaml", "r") as f:
     FEATURE_TOGGLES = yaml.safe_load(f)
 
-load_dotenv()
-
+# Initialize app and logging
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
+# Load environment variables
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_API_KEY")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
+# Define payload model
 class HostawayWebhook(BaseModel):
     id: int
     body: str
@@ -41,14 +44,16 @@ async def receive_message(payload: HostawayWebhook):
 
     logging.info(f"📩 New guest message received: {guest_message}")
 
-    prompt = f\"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
+    prompt = f\"\"\"You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
 \"{guest_message}\"
 
-Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff.\"""
+Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff.\"\"\"
+
+    model_name = "gpt-4" if FEATURE_TOGGLES.get("use_gpt4", True) else "gpt-3.5-turbo"
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4",
+            model=model_name,
             messages=[
                 {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
                 {"role": "user", "content": prompt}
