@@ -33,11 +33,10 @@ async def receive_message(payload: HostawayWebhook):
 
     logging.info(f"📩 New guest message received: {guest_message}")
 
-        prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
+    prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
 {guest_message}
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
-
 
     try:
         response = client.chat.completions.create(
