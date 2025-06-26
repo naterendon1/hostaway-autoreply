@@ -149,8 +149,8 @@ def send_reply_to_hostaway(conversation_id: int, reply_text: str):
     logging.info(f"Payload: {payload}")
 
     r = requests.post(url, headers=headers, json=payload)
-    if r.status_code >= 400:
-        logging.error(f"❌ Failed to send reply: {r.status_code} {r.text}")
+if r.status_code >= 400:
+    logging.error(f"❌ Failed to send reply: {r.status_code} {r.text}")
     r.raise_for_status()
-    else:
-        logging.info(f"✅ Reply sent successfully.")
+else:
+    logging.info("✅ Reply sent successfully.")
