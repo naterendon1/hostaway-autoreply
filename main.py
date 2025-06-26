@@ -143,7 +143,8 @@ def send_reply_to_hostaway(reservation_id: int, reply_text: str):
     }
     payload = {"body": reply_text}
 
-    logging.info(f"🕒 Waiting 2 seconds before sending reply to Hostaway for message ID {message_id}")
+    logging.info(f"🕒 Waiting 2 seconds before sending reply to Hostaway for reservation ID {reservation_id}")
+
     time.sleep(2)
 
     logging.info(f"📬 Sending reply to Hostaway: {url}")
