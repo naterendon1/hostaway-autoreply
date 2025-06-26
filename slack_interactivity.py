@@ -16,7 +16,7 @@ async def slack_action(request: Request):
     payload = json.loads(form_data["payload"])
     action = payload["actions"][0]
     action_type = action["name"]
-    message_id = int(payload["callback_id"])
+    reservation_id = int(payload["callback_id"])
 
     if action_type == "approve":
         reply = action["value"]
