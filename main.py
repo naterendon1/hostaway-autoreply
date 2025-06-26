@@ -142,15 +142,15 @@ def send_reply_to_hostaway(conversation_id: int, reply_text: str):
         "Content-Type": "application/json"
     }
     payload = {"body": reply_text}
-    
+
     logging.info(f"🕒 Waiting 2 seconds before sending reply to Hostaway for conversation ID {conversation_id}")
     time.sleep(2)
     logging.info(f"📬 Sending reply to Hostaway: {url}")
     logging.info(f"Payload: {payload}")
 
-    r = requests.post(url, headers=headers, json=payload)
-if r.status_code >= 400:
-    logging.error(f"❌ Failed to send reply: {r.status_code} {r.text}")
-    r.raise_for_status()
-else:
-    logging.info("✅ Reply sent successfully.")
+    try:
+        r = requests.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        logging.info("✅ Reply sent successfully.")
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"❌ Failed to send reply: {e.response.status_code} {e.response.text}")
