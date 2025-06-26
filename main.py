@@ -29,7 +29,7 @@ class HostawayWebhook(BaseModel):
 async def receive_message(payload: HostawayWebhook):
     guest_message = payload.body
     listing_name = payload.listingName or "Guest"
-    message_id = payload.id
+    reservation_id = payload.id
 
     logging.info(f"📩 New guest message received: {guest_message}")
 
@@ -55,7 +55,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
         "attachments": [
             {
-                "callback_id": str(message_id),
+                "callback_id": str(reservation_id),
                 "fallback": "You are unable to choose a response",
                 "color": "#3AA3E3",
                 "attachment_type": "default",
@@ -70,7 +70,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
                         "name": "write_own",
                         "text": "📝 Write Your Own",
                         "type": "button",
-                        "value": str(message_id)
+                        "value": str(reservation_id)
                     }
                 ]
             }
@@ -92,7 +92,7 @@ async def slack_action(request: Request):
 
     if action_type == "approve":
         reply = action["value"]
-        send_reply_to_hostaway(message_id, reply)
+        send_reply_to_hostaway(reservation_id, reply)
         return JSONResponse({"text": "✅ Reply approved and sent."})
 
     elif action_type == "write_own":
@@ -100,7 +100,7 @@ async def slack_action(request: Request):
             "text": "📝 Please compose your message below.",
             "attachments": [
                 {
-                    "callback_id": str(message_id),
+                    "callback_id": str(reservation_id),
                     "fallback": "Compose your reply",
                     "color": "#3AA3E3",
                     "attachment_type": "default",
@@ -135,15 +135,15 @@ async def slack_action(request: Request):
 
 import time
 
-def send_reply_to_hostaway(conversation_id: int, reply_text: str):
-    url = f"{HOSTAWAY_API_BASE}/messages/{conversation_id}/reply"
+def send_reply_to_hostaway(reservation_id: int, reply_text: str):
+    url = f"{HOSTAWAY_API_BASE}/reservations/{reservation_id}/message"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {"body": reply_text}
 
-    logging.info(f"🕒 Waiting 2 seconds before sending reply to Hostaway for conversation ID {conversation_id}")
+    logging.info(f"🕒 Waiting 2 seconds before sending reply to Hostaway for reservation ID {reservation_id}")
     time.sleep(2)
     logging.info(f"📬 Sending reply to Hostaway: {url}")
     logging.info(f"Payload: {payload}")
