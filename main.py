@@ -136,7 +136,7 @@ async def slack_action(request: Request):
 import time
 
 def send_reply_to_hostaway(message_id: int, reply_text: str):
-    url = f"{HOSTAWAY_API_BASE}/message/{message_id}/reply"
+    url = f"{HOSTAWAY_API_BASE}/messages/{message_id}/reply"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
         "Content-Type": "application/json"
