@@ -9,28 +9,21 @@ import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 from slack_sdk.webhook import WebhookClient
-import yaml
 
-# Load environment and config
 load_dotenv()
-with open("config/feature_toggles.yaml", "r") as f:
-    FEATURE_TOGGLES = yaml.safe_load(f)
-
-# Setup
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_API_KEY")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
-# Webhook model
 class HostawayWebhook(BaseModel):
     id: int
     body: str
     listingName: str
 
-# Handle guest messages
 @app.post("/hostaway-webhook")
 async def receive_message(payload: HostawayWebhook):
     guest_message = payload.body
@@ -58,29 +51,21 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         ai_reply = "(Error generating reply with OpenAI.)"
 
     slack_message = {
-        "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+        "text": f"*New Guest Message for {listing_name}:*
+>{guest_message}
+
+*Suggested Reply:*
+>{ai_reply}",
         "attachments": [
             {
                 "callback_id": str(message_id),
-                "fallback": "You are unable to choose a response",
+                "fallback": "Choose a response",
                 "color": "#3AA3E3",
                 "attachment_type": "default",
                 "actions": [
                     {
                         "name": "approve",
                         "text": "✅ Approve",
-                        "type": "button",
-                        "value": ai_reply
-                    },
-                    {
-                        "name": "reject",
-                        "text": "❌ Reject",
-                        "type": "button",
-                        "value": "reject"
-                    },
-                    {
-                        "name": "improve",
-                        "text": "✏️ Improve with AI",
                         "type": "button",
                         "value": ai_reply
                     },
@@ -100,7 +85,6 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
 
     return {"status": "sent_to_slack"}
 
-# Handle Slack button clicks
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
     form_data = await request.form()
@@ -114,66 +98,31 @@ async def slack_action(request: Request):
         send_reply_to_hostaway(message_id, reply)
         return JSONResponse({"text": "✅ Reply approved and sent."})
 
-    elif action_type == "reject":
-        return JSONResponse({"text": "❌ Reply rejected."})
-
-    elif action_type == "improve":
-        return JSONResponse({"text": "🔄 Improving message with AI... (feature coming soon)", "replace_original": False})
-
     elif action_type == "write_own":
         return JSONResponse({
-            "text": "📝 You can now write your own reply below. (feature coming soon)",
+            "text": "✍️ Compose your reply below:",
             "attachments": [
                 {
-                    "text": "⬅️ Go Back",
                     "callback_id": str(message_id),
-                    "color": "#CCCCCC",
                     "attachment_type": "default",
                     "actions": [
                         {
-                            "name": "go_back",
-                            "text": "⬅️ Back",
+                            "name": "back",
+                            "text": "🔙 Back",
                             "type": "button",
                             "value": "back"
-                        }
-                    ]
-                }
-            ]
-        })
-
-    elif action_type == "go_back":
-        return JSONResponse({
-            "text": f"↩️ Back to options for message {message_id}.",
-            "attachments": [
-                {
-                    "text": "Choose what you'd like to do:",
-                    "callback_id": str(message_id),
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {
-                            "name": "approve",
-                            "text": "✅ Approve",
-                            "type": "button",
-                            "value": "REPLACE_WITH_AI_REPLY"
                         },
                         {
-                            "name": "reject",
-                            "text": "❌ Reject",
+                            "name": "improve_custom",
+                            "text": "✨ Improve with AI",
                             "type": "button",
-                            "value": "reject"
+                            "value": "improve"
                         },
                         {
-                            "name": "improve",
-                            "text": "✏️ Improve with AI",
+                            "name": "send_custom",
+                            "text": "📤 Send",
                             "type": "button",
-                            "value": "REPLACE_WITH_AI_REPLY"
-                        },
-                        {
-                            "name": "write_own",
-                            "text": "📝 Write Your Own",
-                            "type": "button",
-                            "value": str(message_id)
+                            "value": "send"
                         }
                     ]
                 }
@@ -182,7 +131,6 @@ async def slack_action(request: Request):
 
     return JSONResponse({"text": "⚠️ Unknown action"})
 
-# Send approved reply back to Hostaway
 def send_reply_to_hostaway(message_id: int, reply_text: str):
     url = f"{HOSTAWAY_API_BASE}/messages/{message_id}/reply"
     headers = {
