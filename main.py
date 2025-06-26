@@ -11,6 +11,7 @@ from openai import OpenAI
 from slack_sdk.webhook import WebhookClient
 
 load_dotenv()
+
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
@@ -32,10 +33,7 @@ async def receive_message(payload: HostawayWebhook):
 
     logging.info(f"📩 New guest message received: {guest_message}")
 
-    prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
-"{guest_message}"
-
-Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
+    prompt = f"You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:\n"{guest_message}"\n\nWrite a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."
 
     try:
         response = client.chat.completions.create(
@@ -52,13 +50,10 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
 
     slack_message = {
         "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
-
-*Suggested Reply:*
->{ai_reply}",
         "attachments": [
             {
                 "callback_id": str(message_id),
-                "fallback": "Choose a response",
+                "fallback": "You are unable to choose a response",
                 "color": "#3AA3E3",
                 "attachment_type": "default",
                 "actions": [
@@ -99,10 +94,12 @@ async def slack_action(request: Request):
 
     elif action_type == "write_own":
         return JSONResponse({
-            "text": "✍️ Compose your reply below:",
+            "text": "📝 Please compose your message below.",
             "attachments": [
                 {
                     "callback_id": str(message_id),
+                    "fallback": "Compose your reply",
+                    "color": "#3AA3E3",
                     "attachment_type": "default",
                     "actions": [
                         {
@@ -112,14 +109,14 @@ async def slack_action(request: Request):
                             "value": "back"
                         },
                         {
-                            "name": "improve_custom",
-                            "text": "✨ Improve with AI",
+                            "name": "improve",
+                            "text": "✏️ Improve with AI",
                             "type": "button",
                             "value": "improve"
                         },
                         {
-                            "name": "send_custom",
-                            "text": "📤 Send",
+                            "name": "send",
+                            "text": "📨 Send",
                             "type": "button",
                             "value": "send"
                         }
@@ -127,6 +124,9 @@ async def slack_action(request: Request):
                 }
             ]
         })
+
+    elif action_type == "back":
+        return JSONResponse({"text": "🔙 Returning to original options."})
 
     return JSONResponse({"text": "⚠️ Unknown action"})
 
