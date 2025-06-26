@@ -20,7 +20,7 @@ async def slack_action(request: Request):
 
     if action_type == "approve":
         reply = action["value"]
-        send_reply_to_hostaway(conversation_id, reply)
+        send_reply_to_hostaway(reservation_id, reply)
         return JSONResponse({"text": "✅ Reply approved and sent to guest."})
 
     elif action_type == "write_own":
@@ -28,7 +28,7 @@ async def slack_action(request: Request):
             "text": "📝 Please compose your message below.",
             "attachments": [
                 {
-                    "callback_id": str(message_id),
+                    "callback_id": str(reservation_id),
                     "fallback": "Compose your reply",
                     "color": "#3AA3E3",
                     "attachment_type": "default",
