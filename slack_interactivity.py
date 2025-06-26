@@ -1,6 +1,6 @@
 from pathlib import Path
 
-main_py_contents = """
+main_py_code = """
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -11,49 +11,50 @@ import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 from slack_sdk.webhook import WebhookClient
-import yaml
 
-# Load environment variables
 load_dotenv()
 
-# Load feature toggles
-with open("config/feature_toggles.yaml", "r") as f:
-    FEATURE_TOGGLES = yaml.safe_load(f)
-
-# Initialize app and logging
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# Load environment variables
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_API_KEY")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
-# Define payload model
 class HostawayWebhook(BaseModel):
     id: int
     body: str
     listingName: str
+    guestName: str = "Guest"
+    checkIn: str = ""
+    checkOut: str = ""
 
 @app.post("/hostaway-webhook")
 async def receive_message(payload: HostawayWebhook):
     guest_message = payload.body
-    listing_name = payload.listingName or "Guest"
+    listing_name = payload.listingName or "Unknown Listing"
+    guest_name = payload.guestName or "Guest"
+    check_in = payload.checkIn or "?"
+    check_out = payload.checkOut or "?"
     message_id = payload.id
 
-    logging.info(f"📩 New guest message received: {guest_message}")
+    logging.info(f"📩 New guest message from {guest_name}: {guest_message}")
 
-    prompt = f\"\"\"You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
+    # Ask for clarification if needed
+    known_questions = ["early check-in", "fireworks", "pets", "check out", "wifi"]
+    if any(q in guest_message.lower() for q in known_questions):
+        ask_me_text = f"The guest asked: \"{guest_message}\"\n\nThis question needs host input. Please provide the correct information so I can craft a response."
+        return JSONResponse({"text": ask_me_text})
+
+    prompt = f\"\"\"You are a professional short-term rental manager. A guest named {guest_name} staying at '{listing_name}' from {check_in} to {check_out} sent this message:
 \"{guest_message}\"
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff.\"\"\"
 
-    model_name = "gpt-4" if FEATURE_TOGGLES.get("use_gpt4", True) else "gpt-3.5-turbo"
-
     try:
         response = client.chat.completions.create(
-            model=model_name,
+            model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
                 {"role": "user", "content": prompt}
@@ -65,7 +66,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         ai_reply = "(Error generating reply with OpenAI.)"
 
     slack_message = {
-        "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+        "text": f"*New Guest Message from {guest_name} for {listing_name} ({check_in} - {check_out}):*\\n>{guest_message}\\n\\n*Suggested Reply:*\\n>{ai_reply}",
         "attachments": [
             {
                 "callback_id": str(message_id),
@@ -76,18 +77,6 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
                     {
                         "name": "approve",
                         "text": "✅ Approve",
-                        "type": "button",
-                        "value": ai_reply
-                    },
-                    {
-                        "name": "reject",
-                        "text": "❌ Reject",
-                        "type": "button",
-                        "value": "reject"
-                    },
-                    {
-                        "name": "improve",
-                        "text": "✏️ Improve with AI",
                         "type": "button",
                         "value": ai_reply
                     },
@@ -120,14 +109,41 @@ async def slack_action(request: Request):
         send_reply_to_hostaway(message_id, reply)
         return JSONResponse({"text": "✅ Reply approved and sent."})
 
-    elif action_type == "reject":
-        return JSONResponse({"text": "❌ Reply rejected."})
-
-    elif action_type == "improve":
-        return JSONResponse({"text": "🔄 Improving message with AI... (feature coming soon)"})
-
     elif action_type == "write_own":
-        return JSONResponse({"text": "📝 You can now write your own reply below. (feature coming soon)"})
+        return JSONResponse({
+            "text": "📝 Please compose your message below.",
+            "attachments": [
+                {
+                    "callback_id": str(message_id),
+                    "fallback": "Compose your reply",
+                    "color": "#3AA3E3",
+                    "attachment_type": "default",
+                    "actions": [
+                        {
+                            "name": "back",
+                            "text": "🔙 Back",
+                            "type": "button",
+                            "value": "back"
+                        },
+                        {
+                            "name": "improve",
+                            "text": "✏️ Improve with AI",
+                            "type": "button",
+                            "value": "improve"
+                        },
+                        {
+                            "name": "send",
+                            "text": "📨 Send",
+                            "type": "button",
+                            "value": "send"
+                        }
+                    ]
+                }
+            ]
+        })
+
+    elif action_type == "back":
+        return JSONResponse({"text": "🔙 Returning to original options."})
 
     return JSONResponse({"text": "⚠️ Unknown action"})
 
@@ -142,8 +158,7 @@ def send_reply_to_hostaway(message_id: int, reply_text: str):
     r.raise_for_status()
 """
 
-# Save the script to a file
-output_path = Path("/mnt/data/main.py")
-output_path.write_text(main_py_contents)
-
-output_path
+# Save to /mnt/data for user access
+path = Path("/mnt/data/main.py")
+path.write_text(main_py_code)
+path
