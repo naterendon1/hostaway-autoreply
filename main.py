@@ -135,25 +135,22 @@ async def slack_action(request: Request):
 
 import time
 
-def send_reply_to_hostaway(reservation_id: int, reply_text: str):
-    url = f"{HOSTAWAY_API_BASE}/reservations/{reservation_id}/message"
+def send_reply_to_hostaway(conversation_id: int, reply_text: str):
+    url = f"{HOSTAWAY_API_BASE}/messages/{conversation_id}/reply"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {"body": reply_text}
-
-    logging.info(f"🕒 Waiting 2 seconds before sending reply to Hostaway for reservation ID {reservation_id}")
-
+    
+    logging.info(f"🕒 Waiting 2 seconds before sending reply to Hostaway for conversation ID {conversation_id}")
     time.sleep(2)
-
     logging.info(f"📬 Sending reply to Hostaway: {url}")
     logging.info(f"Payload: {payload}")
 
     r = requests.post(url, headers=headers, json=payload)
-
-    if r.status_code != 200:
+    if r.status_code >= 400:
         logging.error(f"❌ Failed to send reply: {r.status_code} {r.text}")
-        r.raise_for_status()
+    r.raise_for_status()
     else:
         logging.info(f"✅ Reply sent successfully.")
