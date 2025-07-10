@@ -52,35 +52,36 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-slack_message = {
-    "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
-    "attachments": [
-        {
-            "callback_id": str(message_id),
-            "fallback": "You are unable to choose a response",
-            "color": "#3AA3E3",
-            "attachment_type": "default",
-            "actions": [
+        slack_message = {
+            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+            "attachments": [
                 {
-                    "name": "approve",
-                    "text": "✅ Approve",
-                    "type": "button",
-                    "value": ai_reply
-                },
-                {
-                    "name": "write_own",
-                    "text": "📝 Write Your Own",
-                    "type": "button",
-                    "value": str(message_id)
+                    "callback_id": str(message_id),
+                    "fallback": "You are unable to choose a response",
+                    "color": "#3AA3E3",
+                    "attachment_type": "default",
+                    "actions": [
+                        {
+                            "name": "approve",
+                            "text": "✅ Approve",
+                            "type": "button",
+                            "value": ai_reply
+                        },
+                        {
+                            "name": "write_own",
+                            "text": "📝 Write Your Own",
+                            "type": "button",
+                            "value": str(message_id)
+                        }
+                    ]
                 }
             ]
         }
-    ]
-}
 
-webhook = WebhookClient(SLACK_WEBHOOK_URL)
-webhook.send(**slack_message)
-return {"status": "ok"}
+        webhook = WebhookClient(SLACK_WEBHOOK_URL)
+        webhook.send(**slack_message)
+
+    return {"status": "ok"}  # This line should be inside the function
 
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
