@@ -57,7 +57,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
 >{guest_message}
 
 *Suggested Reply:*
->{ai_reply}",
+>{ai_reply}"
             "attachments": [
                 {
                     "callback_id": str(message_id),
