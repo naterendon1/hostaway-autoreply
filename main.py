@@ -52,7 +52,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-        slack_message = {
+slack_message = {
     "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
     "attachments": [
         {
@@ -77,6 +77,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         }
     ]
 }
+
 
         webhook = WebhookClient(SLACK_WEBHOOK_URL)
         webhook.send(**slack_message)
