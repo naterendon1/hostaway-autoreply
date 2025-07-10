@@ -80,7 +80,7 @@ slack_message = {
 
 webhook = WebhookClient(SLACK_WEBHOOK_URL)
 webhook.send(**slack_message)
-    return {"status": "ok"}
+return {"status": "ok"}
 
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
