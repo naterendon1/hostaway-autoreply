@@ -53,7 +53,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             ai_reply = "(Error generating reply with OpenAI.)"
 
         slack_message = {
-            "text": f"*New Guest Message for {listing_name}:*
+            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
 >{guest_message}
 
 *Suggested Reply:*
