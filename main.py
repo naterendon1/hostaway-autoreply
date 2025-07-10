@@ -53,34 +53,30 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             ai_reply = "(Error generating reply with OpenAI.)"
 
         slack_message = {
-            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
->{guest_message}
-
-*Suggested Reply:*
-{ai_reply}"
-            "attachments": [
+    "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+    "attachments": [
+        {
+            "callback_id": str(message_id),
+            "fallback": "You are unable to choose a response",
+            "color": "#3AA3E3",
+            "attachment_type": "default",
+            "actions": [
                 {
-                    "callback_id": str(message_id),
-                    "fallback": "You are unable to choose a response",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {
-                            "name": "approve",
-                            "text": "✅ Approve",
-                            "type": "button",
-                            "value": ai_reply
-                        },
-                        {
-                            "name": "write_own",
-                            "text": "📝 Write Your Own",
-                            "type": "button",
-                            "value": str(message_id)
-                        }
-                    ]
+                    "name": "approve",
+                    "text": "✅ Approve",
+                    "type": "button",
+                    "value": ai_reply
+                },
+                {
+                    "name": "write_own",
+                    "text": "📝 Write Your Own",
+                    "type": "button",
+                    "value": str(message_id)
                 }
             ]
         }
+    ]
+}
 
         webhook = WebhookClient(SLACK_WEBHOOK_URL)
         webhook.send(**slack_message)
