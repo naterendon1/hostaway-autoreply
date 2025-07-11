@@ -9,16 +9,20 @@ from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
 
+# Load environment variables
 load_dotenv()
 
+# Set up FastAPI app and logging
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
+# Set up OpenAI and API keys
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_API_KEY")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
+# Define Pydantic model for payload
 class HostawayUnifiedWebhook(BaseModel):
     event: str
     entityId: int
@@ -27,20 +31,25 @@ class HostawayUnifiedWebhook(BaseModel):
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    logging.info(f"Received payload: {payload}")
+    # Log the incoming payload for debugging
+    logging.info(f"Received payload: {payload.dict()}")
+
     if payload.event == "guestMessage" and payload.entityType == "message":
         guest_message = payload.data.get("body", "")
         listing_name = payload.data.get("listingName", "Guest")
         message_id = payload.entityId
 
+        # Log the guest message for debugging
         logging.info(f"📩 New guest message received: {guest_message}")
 
+        # Prepare prompt for OpenAI to generate a reply
         prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
 {guest_message}
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
         try:
+            # Generate reply using OpenAI
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -53,6 +62,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
+        # Prepare Slack message
         slack_message = {
             "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
             "attachments": [
@@ -79,19 +89,25 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             ]
         }
 
-        webhook = WebhookClient(SLACK_WEBHOOK_URL)
-        webhook.send(**slack_message)
+        # Send the message to Slack
+        try:
+            webhook = WebhookClient(SLACK_WEBHOOK_URL)
+            webhook.send(**slack_message)
+        except Exception as e:
+            logging.error(f"❌ Failed to send Slack message: {str(e)}")
 
-    return {"status": "ok"}  # This line should be inside the function
+    return {"status": "ok"}
 
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
+    # Handle interactivity from Slack
     form_data = await request.form()
     payload = json.loads(form_data["payload"])
     action = payload["actions"][0]
     action_type = action["name"]
     message_id = int(payload["callback_id"])
 
+    # Handle different action types
     if action_type == "approve":
         reply = action["value"]
         send_reply_to_hostaway(message_id, reply)
@@ -140,6 +156,7 @@ async def slack_action(request: Request):
     return JSONResponse({"text": "⚠️ Unknown action"})
 
 def send_reply_to_hostaway(message_id: int, reply_text: str):
+    # Send the reply back to Hostaway
     url = f"{HOSTAWAY_API_BASE}/messages/{message_id}/reply"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
