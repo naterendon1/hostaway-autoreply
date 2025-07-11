@@ -1,13 +1,14 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from typing import Optional  # Ensure this is imported
 import os
+import requests
 import json
 import logging
 from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
-import requests
 
 # Load environment variables
 load_dotenv()
