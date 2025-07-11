@@ -53,6 +53,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
         try:
+            # Generate reply using OpenAI
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -101,7 +102,6 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ Failed to send Slack message: {str(e)}")
 
     return {"status": "ok"}
-
 
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
