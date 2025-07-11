@@ -36,14 +36,9 @@ class HostawayUnifiedWebhook(BaseModel):
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    # Log the raw payload as JSON for inspection
-    logging.info(f"Raw payload received: {payload.dict()}")
+    # Log the entire payload as a string to understand its structure
+    logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
     
-    # Check if it matches the expected format (optional)
-    if not isinstance(payload.data, dict):
-        logging.error("Payload 'data' is not a dictionary, check structure.")
-        return {"status": "error", "message": "'data' should be a dictionary."}
-
     if payload.event == "guestMessage" and payload.entityType == "message":
         guest_message = payload.data.get("body", "")
         listing_name = payload.data.get("listingName", "Guest")
@@ -51,14 +46,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
         logging.info(f"📩 New guest message received: {guest_message}")
 
-        # Prepare prompt for OpenAI to generate a reply
+        # Generate the response with OpenAI as usual
         prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
 {guest_message}
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
         try:
-            # Generate reply using OpenAI
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -107,6 +101,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ Failed to send Slack message: {str(e)}")
 
     return {"status": "ok"}
+
 
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
