@@ -37,8 +37,9 @@ class HostawayUnifiedWebhook(BaseModel):
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Log the entire payload as a string to understand its structure
-    logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
+    logging.info(f"Received raw payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
     
+    # If event and entityType match, process the guest message
     if payload.event == "guestMessage" and payload.entityType == "message":
         guest_message = payload.data.get("body", "")
         listing_name = payload.data.get("listingName", "Guest")
@@ -53,7 +54,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
         try:
-            # Generate reply using OpenAI
+            # Generate reply using OpenAI API
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
