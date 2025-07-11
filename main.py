@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 import os
 import requests
 import json
@@ -28,7 +28,7 @@ class HostawayUnifiedWebhook(BaseModel):
     event: str
     entityId: int
     entityType: str
-    data: dict
+    data: Optional[Dict[str, Any]] = {}  # Allow any dictionary for data field
     
     # Optional fields in case they are missing from the payload
     body: Optional[str] = None
@@ -36,13 +36,15 @@ class HostawayUnifiedWebhook(BaseModel):
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    # Log the incoming payload as a dictionary for easier inspection
+    # Log the incoming payload for easier inspection
     logging.info(f"Received payload: {payload.dict()}")
-    
+
+    # Process only guest messages
     if payload.event == "guestMessage" and payload.entityType == "message":
         guest_message = payload.data.get("body", "")
         listing_name = payload.data.get("listingName", "Guest")
         message_id = payload.entityId
+
         logging.info(f"📩 New guest message received: {guest_message}")
 
         # Prepare prompt for OpenAI to generate a reply
@@ -51,8 +53,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
+        # Generate reply using OpenAI
         try:
-            # Generate reply using OpenAI
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -61,6 +63,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
                 ]
             )
             ai_reply = response.choices[0].message.content.strip()
+            logging.info(f"Generated AI reply: {ai_reply}")
         except Exception as e:
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
@@ -96,6 +99,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         try:
             webhook = WebhookClient(SLACK_WEBHOOK_URL)
             webhook.send(**slack_message)
+            logging.info("✅ Slack message sent successfully.")
         except Exception as e:
             logging.error(f"❌ Failed to send Slack message: {str(e)}")
 
