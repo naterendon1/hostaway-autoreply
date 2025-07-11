@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from typing import Optional
 import os
 import requests
 import json
@@ -22,18 +23,22 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_API_KEY")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
-# Define Pydantic model for payload
+# Define Pydantic model for payload with Optional fields
 class HostawayUnifiedWebhook(BaseModel):
     event: str
     entityId: int
     entityType: str
     data: dict
+    
+    # Optional fields in case they are missing from the payload
+    body: Optional[str] = None
+    listingName: Optional[str] = None
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Log the incoming payload for debugging
     logging.info(f"Received payload: {payload.dict()}")
-
+    
     if payload.event == "guestMessage" and payload.entityType == "message":
         guest_message = payload.data.get("body", "")
         listing_name = payload.data.get("listingName", "Guest")
