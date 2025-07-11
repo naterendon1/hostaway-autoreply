@@ -35,73 +35,80 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: Optional[str] = None
 
 @app.post("/unified-webhook")
-async def unified_webhook(payload: dict):
-    logging.info(f"Received payload: {json.dumps(payload, indent=2)}")
+async def unified_webhook(payload: HostawayUnifiedWebhook):
+    # Log the entire payload as a string to understand its structure
+    logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
     
-    # If event and entityType match, process the guest message
-    if payload.event == "guestMessage" and payload.entityType == "message":
-        guest_message = payload.data.get("body", "")
-        listing_name = payload.data.get("listingName", "Guest")
-        message_id = payload.entityId
+    try:
+        if payload.event == "guestMessage" and payload.entityType == "message":
+            guest_message = payload.data.get("body", "")
+            listing_name = payload.data.get("listingName", "Guest")
+            message_id = payload.entityId
 
-        logging.info(f"📩 New guest message received: {guest_message}")
+            logging.info(f"📩 New guest message received: {guest_message}")
 
-        # Generate the response with OpenAI as usual
-        prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
-{guest_message}
+            # Prepare prompt for OpenAI to generate a reply
+            prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
+            {guest_message}
 
-Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
+            Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
-        try:
-            # Generate reply using OpenAI API
-            response = client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            ai_reply = response.choices[0].message.content.strip()
-        except Exception as e:
-            logging.error(f"❌ OpenAI error: {str(e)}")
-            ai_reply = "(Error generating reply with OpenAI.)"
-
-        # Prepare Slack message
-        slack_message = {
-            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
-            "attachments": [
-                {
-                    "callback_id": str(message_id),
-                    "fallback": "You are unable to choose a response",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {
-                            "name": "approve",
-                            "text": "✅ Approve",
-                            "type": "button",
-                            "value": ai_reply
-                        },
-                        {
-                            "name": "write_own",
-                            "text": "📝 Write Your Own",
-                            "type": "button",
-                            "value": str(message_id)
-                        }
+            try:
+                # Generate reply using OpenAI
+                response = client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
+                        {"role": "user", "content": prompt}
                     ]
-                }
-            ]
-        }
+                )
+                ai_reply = response.choices[0].message.content.strip()
+            except Exception as e:
+                logging.error(f"❌ OpenAI error: {str(e)}")
+                ai_reply = "(Error generating reply with OpenAI.)"
 
-        # Send the message to Slack
-        try:
-            webhook = WebhookClient(SLACK_WEBHOOK_URL)
-            webhook.send(**slack_message)
-            logging.info("✅ Slack message sent successfully.")
-        except Exception as e:
-            logging.error(f"❌ Failed to send Slack message: {str(e)}")
+            # Prepare Slack message
+            slack_message = {
+                "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+                "attachments": [
+                    {
+                        "callback_id": str(message_id),
+                        "fallback": "You are unable to choose a response",
+                        "color": "#3AA3E3",
+                        "attachment_type": "default",
+                        "actions": [
+                            {
+                                "name": "approve",
+                                "text": "✅ Approve",
+                                "type": "button",
+                                "value": ai_reply
+                            },
+                            {
+                                "name": "write_own",
+                                "text": "📝 Write Your Own",
+                                "type": "button",
+                                "value": str(message_id)
+                            }
+                        ]
+                    }
+                ]
+            }
+
+            # Send the message to Slack
+            try:
+                webhook = WebhookClient(SLACK_WEBHOOK_URL)
+                webhook.send(**slack_message)
+                logging.info("✅ Slack message sent successfully.")
+            except Exception as e:
+                logging.error(f"❌ Failed to send Slack message: {str(e)}")
+        
+        else:
+            logging.warning(f"❌ Unexpected payload: {json.dumps(payload.dict(), indent=2)}")
+    except Exception as e:
+        logging.error(f"❌ Error processing webhook: {str(e)}")
 
     return {"status": "ok"}
+
 
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
