@@ -36,15 +36,13 @@ class HostawayUnifiedWebhook(BaseModel):
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    # Log the incoming payload for debugging
+    # Log the incoming payload as a dictionary for easier inspection
     logging.info(f"Received payload: {payload.dict()}")
     
     if payload.event == "guestMessage" and payload.entityType == "message":
         guest_message = payload.data.get("body", "")
         listing_name = payload.data.get("listingName", "Guest")
         message_id = payload.entityId
-
-        # Log the guest message for debugging
         logging.info(f"📩 New guest message received: {guest_message}")
 
         # Prepare prompt for OpenAI to generate a reply
