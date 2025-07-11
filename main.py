@@ -35,9 +35,8 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: Optional[str] = None
 
 @app.post("/unified-webhook")
-async def unified_webhook(payload: HostawayUnifiedWebhook):
-    # Log the entire payload as a string to understand its structure
-    logging.info(f"Received raw payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
+async def unified_webhook(payload: dict):
+    logging.info(f"Received payload: {json.dumps(payload, indent=2)}")
     
     # If event and entityType match, process the guest message
     if payload.event == "guestMessage" and payload.entityType == "message":
