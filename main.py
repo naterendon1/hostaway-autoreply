@@ -109,26 +109,27 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
 
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
-    # Handle interactivity from Slack
     form_data = await request.form()
     payload = json.loads(form_data["payload"])
 
-    # Extract the action and callback_id
+    # Log the entire payload to inspect its structure
+    logging.info(f"Received Slack payload: {json.dumps(payload, indent=2)}")
+
     action = payload["actions"][0]
     action_type = action["name"]
-    message_id = int(payload["callback_id"])  # Assuming callback_id is message_id
-    
-    # Check if the conversationId exists in the payload and extract it (if present)
-    conversation_id = payload.get("conversationId", None)  # Safely retrieve the conversationId
+    message_id = int(payload["callback_id"])
 
-    if not conversation_id:
+    # Check if 'message' exists in the payload
+    if "message" in payload:
+        # Now access the conversationId correctly
+        conversation_id = payload["message"].get("conversationId", None)
+    else:
         logging.error("❌ conversationId not found in Slack payload")
-        return JSONResponse({"text": "⚠️ conversationId not found in the payload"})
 
     # Handle different action types
-    if action_type == "approve":
+    if action_type == "approve" and conversation_id:
         reply = action["value"]
-        send_reply_to_hostaway(message_id, reply, conversation_id)  # Pass conversation_id to the function
+        send_reply_to_hostaway(conversation_id, reply)  # Use the correct conversation_id here
         return JSONResponse({"text": "✅ Reply approved and sent."})
 
     elif action_type == "write_own":
@@ -163,6 +164,13 @@ async def slack_action(request: Request):
                 }
             ]
         })
+
+    elif action_type == "back":
+        return JSONResponse({"text": "🔙 Returning to original options. (Feature coming soon)"})
+    elif action_type == "improve":
+        return JSONResponse({"text": "✏️ Improve with AI feature coming soon."})
+    elif action_type == "send":
+        return JSONResponse({"text": "📨 Send functionality coming soon."})
 
     return JSONResponse({"text": "⚠️ Unknown action"})
 
