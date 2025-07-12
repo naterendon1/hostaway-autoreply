@@ -25,9 +25,9 @@ HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 # Define Pydantic model for payload with Optional fields
 class HostawayUnifiedWebhook(BaseModel):
+    object: str
     event: str
-    entityId: int
-    entityType: str
+    accountId: int
     data: dict
 
     # Optional fields in case they are missing from the payload
