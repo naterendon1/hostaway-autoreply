@@ -135,7 +135,7 @@ async def slack_action(request: Request):
             })
         else:
             return JSONResponse({
-                "text": "❌ Failed to send reply. Please check:\n1. API key permissions\n2. Conversation still exists",
+                "text": "❌ Failed to send reply. Please check:\n1. API key permissions\n2. Conversation still exists\n3. Correct endpoint URL",
                 "replace_original": True
             })
 
@@ -184,25 +184,28 @@ async def slack_action(request: Request):
 
 def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
     """Send a reply to Hostaway's messaging system"""
-    url = f"{HOSTAWAY_API_BASE}/messages"
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
         "Cache-Control": "no-cache",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
     payload = {
-        "conversationId": int(conversation_id),
         "body": reply_text,
-        "isIncoming": 0  # 0 = host to guest (outgoing)
+        "isIncoming": 0,  # 0 = host to guest (outgoing)
+        "communicationType": "email"  # Added based on Hostaway API requirements
     }
 
     logging.info(f"🕒 Attempting to send reply to Hostaway for conversation {conversation_id}")
+    logging.debug(f"Full request URL: {url}")
+    logging.debug(f"Request headers: {headers}")
+    logging.debug(f"Request payload: {payload}")
     
     try:
         response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
         
-        # Log successful response details
         logging.info(f"✅ Successfully sent reply. Response: {response.text}")
         return True
         
@@ -216,8 +219,12 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
         }
         logging.error(f"❌ HTTP error sending reply: {json.dumps(error_detail, indent=2)}")
         
-        # Special handling for 403 errors
-        if e.response.status_code == 403:
+        if e.response.status_code == 404:
+            logging.error("🔍 404 Not Found - Possible issues:")
+            logging.error(f"1. Invalid conversation ID: {conversation_id}")
+            logging.error(f"2. Incorrect endpoint URL: {url}")
+            logging.error("3. Missing required parameters in payload")
+        elif e.response.status_code == 403:
             logging.error("🔒 403 Forbidden - Please verify:")
             logging.error("1. Your API key has 'messages:write' permission")
             logging.error("2. Your API key is valid and not expired")
