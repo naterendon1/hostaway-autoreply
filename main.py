@@ -38,24 +38,6 @@ class HostawayUnifiedWebhook(BaseModel):
 def read_root():
     return {"message": "Welcome to the Hostaway Auto Reply Service!"}
 
-def verify_conversation_exists(conversation_id: str) -> bool:
-    """Verify the conversation exists by checking message logs"""
-    url = f"{HOSTAWAY_API_BASE}/conversationMessageWebhooklogs"
-    params = {"conversationMessageId": conversation_id}
-    headers = {
-        "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
-        "Cache-Control": "no-cache"
-    }
-    
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        logs = response.json()
-        return len(logs) > 0  # If we get any logs, conversation exists
-    except Exception as e:
-        logging.error(f"Error verifying conversation: {str(e)}")
-        return False
-
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Log the entire payload
@@ -143,14 +125,7 @@ async def slack_action(request: Request):
     if action_type == "approve" and conversation_id:
         reply = action["value"]
         
-        # Verify conversation exists before sending
-        if not verify_conversation_exists(conversation_id):
-            return JSONResponse({
-                "text": "❌ Conversation not found or unauthorized. Please check your Hostaway account.",
-                "replace_original": True
-            })
-        
-        # Send the reply to Hostaway
+        # Directly attempt to send the message
         success = send_reply_to_hostaway(conversation_id, reply)
         
         if success:
@@ -160,7 +135,7 @@ async def slack_action(request: Request):
             })
         else:
             return JSONResponse({
-                "text": "❌ Failed to send reply to Hostaway. Please try again or contact support.",
+                "text": "❌ Failed to send reply. Please check:\n1. API key permissions\n2. Conversation still exists",
                 "replace_original": True
             })
 
@@ -240,6 +215,14 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
             "request_payload": payload
         }
         logging.error(f"❌ HTTP error sending reply: {json.dumps(error_detail, indent=2)}")
+        
+        # Special handling for 403 errors
+        if e.response.status_code == 403:
+            logging.error("🔒 403 Forbidden - Please verify:")
+            logging.error("1. Your API key has 'messages:write' permission")
+            logging.error("2. Your API key is valid and not expired")
+            logging.error("3. Your server IP is whitelisted if required")
+        
         return False
         
     except Exception as e:
