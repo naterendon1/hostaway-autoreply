@@ -28,11 +28,11 @@ class HostawayUnifiedWebhook(BaseModel):
     event: str
     accountId: int
     data: dict
-    object: Optional[str] = None  # Handle missing entityType field
+    object: Optional[str] = None
 
 @app.get("/")
 async def root():
-    return {"message": "API is live"}  # Handles the root URL request to avoid 404
+    return {"message": "API is live"}
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -170,7 +170,7 @@ def send_reply_to_hostaway(message_id: int, reply_text: str):
     logging.info(f"🕒 Sending reply to Hostaway for message ID {message_id}")
     try:
         r = requests.post(url, headers=headers, json=payload)
-        r.raise_for_status()
+        r.raise_for_status()  # Ensure we catch HTTP errors properly
         logging.info("✅ Reply sent successfully.")
     except requests.exceptions.HTTPError as e:
         logging.error(f"❌ Failed to send reply: {e.response.status_code} {e.response.text}")
