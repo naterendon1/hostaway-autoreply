@@ -119,12 +119,18 @@ async def slack_action(request: Request):
     action_type = action["name"]
     message_id = int(payload["callback_id"])
 
+    # Initialize conversation_id to None if it's not found
+    conversation_id = None
+
     # Check if 'message' exists in the payload
     if "message" in payload:
-        # Now access the conversationId correctly
         conversation_id = payload["message"].get("conversationId", None)
     else:
         logging.error("❌ conversationId not found in Slack payload")
+
+    # If conversation_id is still None, log the issue
+    if not conversation_id:
+        logging.error("❌ conversationId is missing in the payload")
 
     # Handle different action types
     if action_type == "approve" and conversation_id:
