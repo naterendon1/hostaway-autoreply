@@ -25,9 +25,9 @@ HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 # Define Pydantic model for payload with Optional fields
 class HostawayUnifiedWebhook(BaseModel):
+    object: str
     event: str
-    entityId: int
-    entityType: str
+    accountId: int
     data: dict
 
     # Optional fields in case they are missing from the payload
@@ -40,11 +40,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Log the entire payload as a string to understand its structure
     logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
 
-    if payload.event == "guestMessage" and payload.entityType == "message":
+    # Check if the event is a guest message and entity type is a message
+    if payload.event == "message.received" and payload.object == "conversationMessage":
+        # Access the body of the message
         guest_message = payload.data.get("body", "")
-        listing_name = payload.data.get("listingName", "Guest")  # Fixed the missing quote here
-        message_id = payload.entityId
-
+        
+        # Access the listing name, which may be null in the payload
+        listing_name = payload.data.get("listingName", "Guest")
+        
+        # Get the message ID (conversation ID) from the payload
+        message_id = payload.data.get("conversationId", None)
+        
+        # Log the guest message
         logging.info(f"📩 New guest message received: {guest_message}")
 
         # Prepare prompt for OpenAI to generate a reply
@@ -67,7 +74,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-        # Prepare Slack message
+        # Prepare Slack message with the generated reply
         slack_message = {
             "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
             "attachments": [
