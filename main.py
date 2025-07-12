@@ -25,9 +25,9 @@ HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 # Define Pydantic model for payload with Optional fields
 class HostawayUnifiedWebhook(BaseModel):
-    object: str
     event: str
-    accountId: int
+    entityId: int
+    entityType: str
     data: dict
 
     # Optional fields in case they are missing from the payload
@@ -40,18 +40,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Log the entire payload as a string to understand its structure
     logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
 
-    # Check if the event is a guest message and entity type is a message
-    if payload.event == "message.received" and payload.object == "conversationMessage":
-        # Access the body of the message
+    if payload.event == "guestMessage" and payload.entityType == "message":
         guest_message = payload.data.get("body", "")
-        
-        # Access the listing name, which may be null in the payload
-        listing_name = payload.data.get("listingName", "Guest")
-        
-        # Get the message ID (conversation ID) from the payload
-        message_id = payload.data.get("conversationId", None)
-        
-        # Log the guest message
+        listing_name = payload.data.get("listingName", "Guest")  # Fixed the missing quote here
+        message_id = payload.entityId
+
         logging.info(f"📩 New guest message received: {guest_message}")
 
         # Prepare prompt for OpenAI to generate a reply
@@ -74,7 +67,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-        # Prepare Slack message with the generated reply
+        # Prepare Slack message
         slack_message = {
             "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
             "attachments": [
@@ -120,11 +113,19 @@ async def slack_action(request: Request):
     action_type = action["name"]
     message_id = int(payload["callback_id"])
 
+    logging.info(f"Received action: {action_type} for message ID: {message_id}")
+
     # Handle different action types
     if action_type == "approve":
         reply = action["value"]
-        send_reply_to_hostaway(message_id, reply)
-        return JSONResponse({"text": "✅ Reply approved and sent."})
+        logging.info(f"Replying with: {reply}")
+        response = send_reply_to_hostaway(message_id, reply)
+        if response:
+            logging.info("Reply successfully sent to Hostaway.")
+            return JSONResponse({"text": "✅ Reply approved and sent."})
+        else:
+            logging.error("Failed to send reply to Hostaway.")
+            return JSONResponse({"text": "❌ Failed to send reply to Hostaway."})
 
     elif action_type == "write_own":
         return JSONResponse({
@@ -182,5 +183,7 @@ def send_reply_to_hostaway(message_id: int, reply_text: str):
         r = requests.post(url, headers=headers, json=payload)
         r.raise_for_status()
         logging.info("✅ Reply sent successfully.")
+        return True  # Return True if successful
     except requests.exceptions.HTTPError as e:
         logging.error(f"❌ Failed to send reply: {e.response.status_code} {e.response.text}")
+        return False  # Return False if there is an error
