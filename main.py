@@ -112,21 +112,15 @@ async def slack_action(request: Request):
     form_data = await request.form()
     payload = json.loads(form_data["payload"])
 
-    # Log the entire payload to inspect its structure
+    # Log the entire Slack payload to inspect its structure
     logging.info(f"Received Slack payload: {json.dumps(payload, indent=2)}")
 
     action = payload["actions"][0]
     action_type = action["name"]
     message_id = int(payload["callback_id"])
 
-    # Initialize conversation_id to None if it's not found
-    conversation_id = None
-
-    # Check if 'message' exists in the payload
-    if "message" in payload:
-        conversation_id = payload["message"].get("conversationId", None)
-    else:
-        logging.error("❌ conversationId not found in Slack payload")
+    # Set conversation_id to the callback_id, which is the same as message_id
+    conversation_id = message_id  # We can use message_id directly as conversationId
 
     # If conversation_id is still None, log the issue
     if not conversation_id:
@@ -135,7 +129,7 @@ async def slack_action(request: Request):
     # Handle different action types
     if action_type == "approve" and conversation_id:
         reply = action["value"]
-        send_reply_to_hostaway(conversation_id, reply)  # Use the correct conversation_id here
+        send_reply_to_hostaway(conversation_id, reply)  # Use conversation_id here
         return JSONResponse({"text": "✅ Reply approved and sent."})
 
     elif action_type == "write_own":
