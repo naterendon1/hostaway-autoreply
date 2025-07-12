@@ -9,6 +9,7 @@ import logging
 from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
+import time
 
 # Load environment variables
 load_dotenv()
@@ -121,11 +122,16 @@ async def slack_action(request: Request):
     # Handle different action types
     if action_type == "approve" and conversation_id:
         reply = action["value"]
-        send_reply_to_hostaway(conversation_id, reply)
-        return JSONResponse({
-            "text": "✅ Reply approved and sent to guest.",
-            "replace_original": True
-        })
+        if send_reply_to_hostaway(conversation_id, reply):
+            return JSONResponse({
+                "text": "✅ Reply approved and sent to guest.",
+                "replace_original": True
+            })
+        else:
+            return JSONResponse({
+                "text": "❌ Failed to send reply to Hostaway. Please try again later.",
+                "replace_original": True
+            })
 
     elif action_type == "write_own":
         return JSONResponse({
