@@ -9,7 +9,6 @@ import logging
 from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
-import time
 
 # Load environment variables
 load_dotenv()
