@@ -36,22 +36,25 @@ async def root():
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    # Log the entire payload as a string to understand its structure
-    logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")
+    logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
 
-    if payload.event == "message.received" and payload.object == "conversationMessage":
+    if payload.event == "guestMessage" and payload.entityType == "message":
         guest_message = payload.data.get("body", "")
-        message_id = payload.data.get("id", "")
+        listing_name = payload.data.get("listingName", "Guest")  # Fixed the missing quote here
+        message_id = payload.entityId
+
+        logging.info(f"📩 Message ID to reply to: {message_id}")  # Log the message ID to verify it's being captured
+
         logging.info(f"📩 New guest message received: {guest_message}")
 
         # Prepare prompt for OpenAI to generate a reply
-        prompt = f"""You are a professional short-term rental manager. A guest sent this message:
+        prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
 {guest_message}
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
         try:
-            # Generate reply using OpenAI
+            # Generate the response with OpenAI
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -66,7 +69,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
 
         # Prepare Slack message
         slack_message = {
-            "text": f"*New Guest Message:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
             "attachments": [
                 {
                     "callback_id": str(message_id),
