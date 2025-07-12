@@ -29,7 +29,6 @@ class HostawayUnifiedWebhook(BaseModel):
     event: str
     accountId: int
     data: dict
-
     body: Optional[str] = None
     listingName: Optional[str] = None
     date: Optional[str] = None
@@ -70,7 +69,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-        # Prepare Slack message
+        # Prepare Slack message with the generated reply
         slack_message = {
             "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
             "attachments": [
