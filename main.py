@@ -171,15 +171,17 @@ async def slack_action(request: Request):
     return JSONResponse({"text": "⚠️ Unknown action"})
 
 def send_reply_to_hostaway(conversation_id: str, reply_text: str):
-    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
+    url = f"{HOSTAWAY_API_BASE}/messages"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
+        "Cache-Control": "no-cache",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
     payload = {
+        "conversationId": int(conversation_id),
         "body": reply_text,
-        "isIncoming": 0  # Important: indicates this is an outgoing message
+        "isIncoming": 0  # 0 for outgoing (host to guest)
     }
 
     logging.info(f"🕒 Sending reply to Hostaway for conversation ID {conversation_id}")
@@ -189,7 +191,14 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str):
         logging.info(f"✅ Reply sent successfully. Response: {response.text}")
         return True
     except requests.exceptions.HTTPError as e:
-        logging.error(f"❌ Failed to send reply: {e.response.status_code} {e.response.text}")
+        error_msg = f"❌ Failed to send reply: {e.response.status_code} {e.response.text}"
+        logging.error(error_msg)
+        
+        # Additional debug info
+        logging.debug(f"Request URL: {url}")
+        logging.debug(f"Request Headers: {headers}")
+        logging.debug(f"Request Payload: {payload}")
+        
         return False
     except Exception as e:
         logging.error(f"❌ Unexpected error sending reply: {str(e)}")
