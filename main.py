@@ -30,32 +30,28 @@ class HostawayUnifiedWebhook(BaseModel):
     accountId: int
     data: dict
 
-    # Optional fields in case they are missing from the payload
     body: Optional[str] = None
     listingName: Optional[str] = None
     date: Optional[str] = None
 
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the Hostaway Auto Reply Service!"}
+
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    # Log the entire payload as a string to understand its structure
-    logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
-
-    # Check if the event is a guest message and entity type is a message
+    # Log the entire payload
+    logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")
+    
     if payload.event == "message.received" and payload.object == "conversationMessage":
-        # Access the body of the message
         guest_message = payload.data.get("body", "")
-        
-        # Access the listing name, which may be null in the payload
         listing_name = payload.data.get("listingName", "Guest")
-        
-        # Get the message ID (conversation ID) from the payload
         message_id = payload.data.get("conversationId", None)
-        
-        # Log the guest message
+
         logging.info(f"📩 New guest message received: {guest_message}")
 
         # Prepare prompt for OpenAI to generate a reply
-        prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
+        prompt = f"""You are a professional short-term rental manager. A guest sent this message:
 {guest_message}
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
@@ -74,7 +70,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-        # Prepare Slack message with the generated reply
+        # Prepare Slack message
         slack_message = {
             "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
             "attachments": [
@@ -120,7 +116,8 @@ async def slack_action(request: Request):
     action_type = action["name"]
     message_id = int(payload["callback_id"])
 
-    # Handle different action types
+    logging.info(f"Received Slack action: {action_type} for message ID {message_id}")
+
     if action_type == "approve":
         reply = action["value"]
         send_reply_to_hostaway(message_id, reply)
@@ -159,17 +156,9 @@ async def slack_action(request: Request):
             ]
         })
 
-    elif action_type == "back":
-        return JSONResponse({"text": "🔙 Returning to original options. (Feature coming soon)"})
-    elif action_type == "improve":
-        return JSONResponse({"text": "✏️ Improve with AI feature coming soon."})
-    elif action_type == "send":
-        return JSONResponse({"text": "📨 Send functionality coming soon."})
-
     return JSONResponse({"text": "⚠️ Unknown action"})
 
 def send_reply_to_hostaway(message_id: int, reply_text: str):
-    # Send the reply back to Hostaway
     url = f"{HOSTAWAY_API_BASE}/messages/{message_id}/reply"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
