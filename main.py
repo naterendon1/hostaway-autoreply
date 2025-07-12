@@ -9,7 +9,6 @@ import logging
 from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
-import time
 
 # Load environment variables
 load_dotenv()
@@ -135,7 +134,7 @@ async def slack_action(request: Request):
             })
         else:
             return JSONResponse({
-                "text": "❌ Failed to send reply. Please check:\n1. API key permissions\n2. Conversation still exists\n3. Correct endpoint URL",
+                "text": "❌ Failed to send reply to Hostaway. Please check:\n1. API key permissions\n2. Conversation still exists\n3. Correct endpoint URL",
                 "replace_original": True
             })
 
