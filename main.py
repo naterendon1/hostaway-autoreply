@@ -109,20 +109,20 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
 
 @app.post("/slack-interactivity")
 async def slack_action(request: Request):
-    # Handle interactivity from Slack
     form_data = await request.form()
     payload = json.loads(form_data["payload"])
     action = payload["actions"][0]
     action_type = action["name"]
     message_id = int(payload["callback_id"])
+    conversation_id = payload["message"]["conversationId"]  # Fetching conversation_id from Slack payload
 
-    logging.info(f"Received Slack action: {action_type} for message ID {message_id}")
-
+    # Handle different action types
     if action_type == "approve":
         reply = action["value"]
-        send_reply_to_hostaway(message_id, reply)
+        send_reply_to_hostaway(message_id, reply, conversation_id)  # Pass conversation_id to the function
         return JSONResponse({"text": "✅ Reply approved and sent."})
 
+    # Handle other actions (write_own, etc.)
     elif action_type == "write_own":
         return JSONResponse({
             "text": "📝 Please compose your message below.",
