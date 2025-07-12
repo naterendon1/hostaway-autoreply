@@ -189,9 +189,13 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str):
     }
 
     logging.info(f"🕒 Sending reply to Hostaway for conversation ID {conversation_id}")
+    logging.debug(f"Request URL: {url}")
+    logging.debug(f"Request Headers: {headers}")
+    logging.debug(f"Request Payload: {json.dumps(payload, indent=2)}")
+
     try:
         response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
+        response.raise_for_status()  # This will raise an exception for HTTP errors
         logging.info(f"✅ Reply sent successfully. Response: {response.text}")
         return True
     except requests.exceptions.HTTPError as e:
@@ -201,7 +205,7 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str):
         # Additional debug info
         logging.debug(f"Request URL: {url}")
         logging.debug(f"Request Headers: {headers}")
-        logging.debug(f"Request Payload: {payload}")
+        logging.debug(f"Request Payload: {json.dumps(payload, indent=2)}")
         
         return False
     except Exception as e:
