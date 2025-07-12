@@ -40,67 +40,72 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Log the entire payload as a string to understand its structure
     logging.info(f"Received payload: {json.dumps(payload.dict(), indent=2)}")  # Log the entire payload
 
-    if payload.event == "guestMessage" and payload.entityType == "message":
-        guest_message = payload.data.get("body", "")
-        listing_name = payload.data.get("listingName", "Guest")  # Fixed the missing quote here
-        message_id = payload.entityId
+    try:
+        if payload.event == "message.received" and payload.entityType == "conversationMessage":
+            guest_message = payload.data.get("body", "No message provided")
+            listing_name = payload.data.get("listingName", "Guest")  # Default to "Guest" if not found
+            message_id = payload.data.get("id", None)  # Ensure to get message ID
 
-        logging.info(f"📩 New guest message received: {guest_message}")
+            logging.info(f"📩 New guest message received: {guest_message}")
+            logging.info(f"Message from listing: {listing_name} with ID: {message_id}")
 
-        # Prepare prompt for OpenAI to generate a reply
-        prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
+            # Generate the response with OpenAI as usual
+            prompt = f"""You are a professional short-term rental manager. A guest staying at '{listing_name}' sent this message:
 {guest_message}
 
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don’t include a signoff."""
 
-        try:
-            # Generate reply using OpenAI
-            response = client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            ai_reply = response.choices[0].message.content.strip()
-        except Exception as e:
-            logging.error(f"❌ OpenAI error: {str(e)}")
-            ai_reply = "(Error generating reply with OpenAI.)"
-
-        # Prepare Slack message
-        slack_message = {
-            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
-            "attachments": [
-                {
-                    "callback_id": str(message_id),
-                    "fallback": "You are unable to choose a response",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {
-                            "name": "approve",
-                            "text": "✅ Approve",
-                            "type": "button",
-                            "value": ai_reply
-                        },
-                        {
-                            "name": "write_own",
-                            "text": "📝 Write Your Own",
-                            "type": "button",
-                            "value": str(message_id)
-                        }
+            try:
+                # Generate reply using OpenAI
+                response = client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
+                        {"role": "user", "content": prompt}
                     ]
-                }
-            ]
-        }
+                )
+                ai_reply = response.choices[0].message.content.strip()
+            except Exception as e:
+                logging.error(f"❌ OpenAI error: {str(e)}")
+                ai_reply = "(Error generating reply with OpenAI.)"
 
-        # Send the message to Slack
-        try:
-            webhook = WebhookClient(SLACK_WEBHOOK_URL)
-            webhook.send(**slack_message)
-            logging.info("✅ Slack message sent successfully.")
-        except Exception as e:
-            logging.error(f"❌ Failed to send Slack message: {str(e)}")
+            # Prepare Slack message
+            slack_message = {
+                "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+                "attachments": [
+                    {
+                        "callback_id": str(message_id),
+                        "fallback": "You are unable to choose a response",
+                        "color": "#3AA3E3",
+                        "attachment_type": "default",
+                        "actions": [
+                            {
+                                "name": "approve",
+                                "text": "✅ Approve",
+                                "type": "button",
+                                "value": ai_reply
+                            },
+                            {
+                                "name": "write_own",
+                                "text": "📝 Write Your Own",
+                                "type": "button",
+                                "value": str(message_id)
+                            }
+                        ]
+                    }
+                ]
+            }
+
+            # Send the message to Slack
+            try:
+                webhook = WebhookClient(SLACK_WEBHOOK_URL)
+                webhook.send(**slack_message)
+                logging.info("✅ Slack message sent successfully.")
+            except Exception as e:
+                logging.error(f"❌ Failed to send Slack message: {str(e)}")
+
+    except Exception as e:
+        logging.error(f"❌ Error processing webhook payload: {str(e)}")
 
     return {"status": "ok"}
 
@@ -113,19 +118,11 @@ async def slack_action(request: Request):
     action_type = action["name"]
     message_id = int(payload["callback_id"])
 
-    logging.info(f"Received action: {action_type} for message ID: {message_id}")
-
     # Handle different action types
     if action_type == "approve":
         reply = action["value"]
-        logging.info(f"Replying with: {reply}")
-        response = send_reply_to_hostaway(message_id, reply)
-        if response:
-            logging.info("Reply successfully sent to Hostaway.")
-            return JSONResponse({"text": "✅ Reply approved and sent."})
-        else:
-            logging.error("Failed to send reply to Hostaway.")
-            return JSONResponse({"text": "❌ Failed to send reply to Hostaway."})
+        send_reply_to_hostaway(message_id, reply)
+        return JSONResponse({"text": "✅ Reply approved and sent."})
 
     elif action_type == "write_own":
         return JSONResponse({
@@ -183,7 +180,5 @@ def send_reply_to_hostaway(message_id: int, reply_text: str):
         r = requests.post(url, headers=headers, json=payload)
         r.raise_for_status()
         logging.info("✅ Reply sent successfully.")
-        return True  # Return True if successful
     except requests.exceptions.HTTPError as e:
         logging.error(f"❌ Failed to send reply: {e.response.status_code} {e.response.text}")
-        return False  # Return False if there is an error
