@@ -9,6 +9,7 @@ import logging
 from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
+import time
 
 # Load environment variables
 load_dotenv()
@@ -36,6 +37,25 @@ class HostawayUnifiedWebhook(BaseModel):
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Hostaway Auto Reply Service!"}
+
+def get_conversation_log(conversation_id: str):
+    """Fetches the conversation log to verify its validity before replying."""
+    url = f"{HOSTAWAY_API_BASE}/conversationMessageWebhooklogs?conversationMessageId={conversation_id}"
+    headers = {
+        "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
+        "Cache-Control": "no-cache",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        log_data = response.json()  # Assuming response is JSON
+        logging.info(f"Retrieved conversation log: {log_data}")
+        return log_data
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"❌ Failed to fetch log: {e.response.status_code} {e.response.text}")
+        return None
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -121,14 +141,22 @@ async def slack_action(request: Request):
     # Handle different action types
     if action_type == "approve" and conversation_id:
         reply = action["value"]
-        if send_reply_to_hostaway(conversation_id, reply):
-            return JSONResponse({
-                "text": "✅ Reply approved and sent to guest.",
-                "replace_original": True
-            })
+        
+        # Before sending, check if conversation exists
+        if get_conversation_log(conversation_id):
+            if send_reply_to_hostaway(conversation_id, reply):
+                return JSONResponse({
+                    "text": "✅ Reply approved and sent to guest.",
+                    "replace_original": True
+                })
+            else:
+                return JSONResponse({
+                    "text": "❌ Failed to send reply to Hostaway. Please try again later.",
+                    "replace_original": True
+                })
         else:
             return JSONResponse({
-                "text": "❌ Failed to send reply to Hostaway. Please try again later.",
+                "text": "❌ Conversation not found. Unable to send reply.",
                 "replace_original": True
             })
 
@@ -189,13 +217,9 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str):
     }
 
     logging.info(f"🕒 Sending reply to Hostaway for conversation ID {conversation_id}")
-    logging.debug(f"Request URL: {url}")
-    logging.debug(f"Request Headers: {headers}")
-    logging.debug(f"Request Payload: {json.dumps(payload, indent=2)}")
-
     try:
         response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()  # This will raise an exception for HTTP errors
+        response.raise_for_status()
         logging.info(f"✅ Reply sent successfully. Response: {response.text}")
         return True
     except requests.exceptions.HTTPError as e:
@@ -205,7 +229,7 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str):
         # Additional debug info
         logging.debug(f"Request URL: {url}")
         logging.debug(f"Request Headers: {headers}")
-        logging.debug(f"Request Payload: {json.dumps(payload, indent=2)}")
+        logging.debug(f"Request Payload: {payload}")
         
         return False
     except Exception as e:
