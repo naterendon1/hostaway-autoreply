@@ -7,6 +7,7 @@ import os
 
 router = APIRouter()
 
+# Ensure your API key is loaded properly
 HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_API_KEY")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
@@ -68,17 +69,22 @@ async def slack_action(request: Request):
     return JSONResponse({"text": "⚠️ Unknown action"})
 
 def send_reply_to_hostaway(message_id: int, reply_text: str):
-    url = f"{HOSTAWAY_API_BASE}/messages/{message_id}/reply"
+    # Correct the URL to match the Hostaway API documentation
+    url = f"{HOSTAWAY_API_BASE}/conversations/{message_id}/messages"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {"body": reply_text}
+    payload = {"body": reply_text, "isIncoming": 0, "communicationType": "email"}
 
-    logging.info(f"📬 Sending reply to Hostaway (message ID: {message_id})")
-    r = requests.post(url, headers=headers, json=payload)
-
-    if r.status_code != 200:
-        logging.error(f"❌ Hostaway reply failed: {r.status_code} - {r.text}")
-    else:
-        logging.info("✅ Hostaway reply sent successfully.")
+    logging.info(f"📬 Sending reply to Hostaway (conversation ID: {message_id})")
+    logging.debug(f"Payload sent to Hostaway: {json.dumps(payload, indent=2)}")
+    
+    try:
+        r = requests.post(url, headers=headers, json=payload)
+        if r.status_code == 200:
+            logging.info(f"✅ Successfully sent reply to Hostaway: {r.text}")
+        else:
+            logging.error(f"❌ Hostaway reply failed: {r.status_code} - {r.text}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Error sending request to Hostaway: {str(e)}")
