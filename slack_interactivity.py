@@ -7,7 +7,8 @@ import os
 
 router = APIRouter()
 
-HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_ACCESS_TOKEN")  # Use the access token from the .env file
+HOSTAWAY_API_KEY = os.getenv("eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJhdWQiOiIxMzI5NiIsImp0aSI6IjhiN2I5OTA0MjNhYTkzYWVjYzQ1NmFmOTE2ODk5NWJmMGQyNmIyMmI2NDMwM2IxYjNmOGJkMTMyYjBiMjVhODU5YjYyMTc3NDI1ODY3NzU1IiwiaWF0IjoxNzUyNDQ1MzY0LjkyNjUwMSwibmJmIjoxNzUyNDQ1MzY0LjkyNjUwMywiZXhwIjoyMDY3OTc4MTY0LjkyNjUwNiwic3ViIjoiIiwic2NvcGVzIjpbImdlbmVyYWwiXSwic2VjcmV0SWQiOjY3MjA5fQ.pNkPVX97kOqQxea_3mFkow3CnNA6Zjwb08Bfbr4h_bbfrPuO2Qjk8SdLTVXA1mfDrKh6MuZPKqNEImssELVcg515dwIM8-4-JdplN7DBjxFgB7csqLkGDO1PpmgovycMhzR0eC8_be62FMRUQZYp5P4WDNYVvZsRUPf_JnggE2cPekcjW_KgaN64_XuEuPBudRxQXK-qiBIC8Fb1rz5nwIXKcOpXYuTYs4ijHx0tO31WIwJZFAkySIU3_qNTw81q2qiK73NGLZDo9m3-4YhQgKGMKUljvdfhh7sanQtm4dyAat6CmVhJhfgP5OVt3tQrQRieKi5F0zC1M9xvfqElQA
+")  # Use the access token from the .env file
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 @router.post("/slack-interactivity")
