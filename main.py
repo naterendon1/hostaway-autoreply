@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 # Set up OpenAI and API keys
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_API_KEY")
+HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_ACCESS_TOKEN")  # Using access token instead of API key
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 # Define Pydantic model for payload with Optional fields
@@ -173,7 +173,7 @@ async def slack_action(request: Request):
         })
 
     elif action_type == "back":
-        return JSONResponse({"text": "🔙 Returning to original options."})
+        return JSONResponse({"text": "🔙 Returning to original options. (Feature coming soon)"})
     elif action_type == "improve":
         return JSONResponse({"text": "✏️ Improve with AI feature coming soon."})
     elif action_type == "send":
