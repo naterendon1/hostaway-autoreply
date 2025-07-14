@@ -10,9 +10,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest  # Use the latest Ubuntu environment for the job
 
-    env:
-      HOSTAWAY_ACCESS_TOKEN: ${{ secrets.HOSTAWAY_ACCESS_TOKEN }}  # Reference the secret in GitHub
-
     steps:
       # Checkout the repository to the GitHub runner
       - name: Checkout repository
