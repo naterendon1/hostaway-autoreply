@@ -1,5 +1,4 @@
 # Toggle specific AI and app behaviors on or off
-
 ai_reply_enabled: true
 slack_buttons_enabled: true
 improve_with_ai_enabled: true
