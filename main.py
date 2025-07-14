@@ -6,12 +6,8 @@ import os
 import requests
 import json
 import logging
-from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
-
-# Load environment variables (ensure this is called first)
-load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
