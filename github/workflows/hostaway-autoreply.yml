@@ -10,27 +10,29 @@ jobs:
   autoreply:
     runs-on: ubuntu-latest  # Set up the environment for the job
 
-    env:
-      HOSTAWAY_ACCESS_TOKEN: ${{ secrets.HOSTAWAY_ACCESS_TOKEN }}  # Reference the secret in GitHub
-
     steps:
+      # Step 1: Checkout the repository
       - name: Checkout repository
         uses: actions/checkout@v2  # This step checks out your repository
 
+      # Step 2: Set up Python
       - name: Set up Python
         uses: actions/setup-python@v2  # Set up Python environment
         with:
           python-version: '3.9'  # Specify Python version
 
+      # Step 3: Install dependencies
       - name: Install dependencies
         run: |
           pip install -r requirements.txt  # Install dependencies
 
+      # Step 4: Run Hostaway Auto-Reply Script
       - name: Run Hostaway Auto-Reply Script
         run: |
           python hostaway_autoreply.py  # Replace with your script to handle the Hostaway interaction
 
+      # Optional: Step 5: Deploy (if applicable)
       - name: Deploy (if applicable)
         run: |
-          # Your deployment steps go here (if necessary)
-          echo "Deployment step for Hostaway autoreply" 
+          # Render handles deployments automatically through GitHub integration
+          echo "Deployment step for Hostaway autoreply"  # Placeholder for deployment logic if needed
