@@ -9,6 +9,10 @@ import logging
 from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
+import os
+import logging
+
+logging.info(f"Hostaway Access Token: {os.getenv('HOSTAWAY_ACCESS_TOKEN')}")
 
 # Load environment variables
 load_dotenv()
