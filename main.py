@@ -185,7 +185,7 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
     """Send a reply to Hostaway's messaging system"""
     url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
     headers = {
-        "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
+        "Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}",
         "Cache-Control": "no-cache",
         "Content-Type": "application/json",
         "Accept": "application/json"
