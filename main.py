@@ -6,18 +6,18 @@ import os
 import requests
 import json
 import logging
-from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
-
-# Load environment variables (ensure this is called first)
-load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 
-# Debugging line to check if the token is being loaded correctly
-logging.info(f"Hostaway Access Token: {os.getenv('HOSTAWAY_ACCESS_TOKEN')}")
+# Directly access the environment variables set in Render
+HOSTAWAY_ACCESS_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")
+if HOSTAWAY_ACCESS_TOKEN:
+    logging.info("Hostaway Access Token successfully loaded.")
+else:
+    logging.error("❌ HOSTAWAY_ACCESS_TOKEN is not set. Please check your environment variables.")
 
 # Set up FastAPI app
 app = FastAPI()
@@ -25,7 +25,6 @@ app = FastAPI()
 # Set up OpenAI and API keys
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_ACCESS_TOKEN")  # Using access token instead of API key
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 # Define Pydantic model for payload with Optional fields
