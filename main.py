@@ -9,17 +9,18 @@ import logging
 from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
-import os
-import logging
 
-logging.info(f"Hostaway Access Token: {os.getenv('HOSTAWAY_ACCESS_TOKEN')}")
-
-# Load environment variables
+# Load environment variables (ensure this is called first)
 load_dotenv()
 
-# Set up FastAPI app and logging
-app = FastAPI()
+# Set up logging
 logging.basicConfig(level=logging.INFO)
+
+# Debugging line to check if the token is being loaded correctly
+logging.info(f"Hostaway Access Token: {os.getenv('HOSTAWAY_ACCESS_TOKEN')}")
+
+# Set up FastAPI app
+app = FastAPI()
 
 # Set up OpenAI and API keys
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
