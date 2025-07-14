@@ -7,7 +7,8 @@ import os
 
 router = APIRouter()
 
-HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_ACCESS_TOKEN")  # Use the access token from the .env file
+# Directly access the environment variable set in Render
+HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_ACCESS_TOKEN")  # This will use the Render environment variable
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 @router.post("/slack-interactivity")
