@@ -13,7 +13,7 @@ from openai import OpenAI
 logging.basicConfig(level=logging.INFO)
 
 # Directly access the environment variables set in Render
-HOSTAWAY_ACCESS_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")
+HOSTAWAY_ACCESS_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")  # Directly access the token from Render's environment
 if HOSTAWAY_ACCESS_TOKEN:
     logging.info("Hostaway Access Token successfully loaded.")
 else:
@@ -22,7 +22,7 @@ else:
 # Set up FastAPI app
 app = FastAPI()
 
-# Set up OpenAI and API keys
+# Set up OpenAI and API keys from Render environment
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
