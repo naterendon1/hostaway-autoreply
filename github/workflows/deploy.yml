@@ -1,40 +1,43 @@
-
-name: Deploy Python FastAPI App
+name: Deploy FastAPI App to Render
 
 on:
   push:
     branches:
-      - main   # This will trigger the workflow on a push to the main branch
-  workflow_dispatch:   # Allows for manual trigger as well
+      - main   # Trigger on push to main branch
+  workflow_dispatch:   # Allows manual trigger
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest  # Set up the environment for the job
+    runs-on: ubuntu-latest  # Use the latest Ubuntu environment for the job
 
     env:
       HOSTAWAY_ACCESS_TOKEN: ${{ secrets.HOSTAWAY_ACCESS_TOKEN }}  # Reference the secret in GitHub
 
     steps:
+      # Checkout the repository to the GitHub runner
       - name: Checkout repository
-        uses: actions/checkout@v2  # This step checks out your repository
+        uses: actions/checkout@v2
 
+      # Set up Python environment
       - name: Set up Python
-        uses: actions/setup-python@v2  # Set up Python environment
+        uses: actions/setup-python@v2
         with:
-          python-version: '3.9'  # Specify Python version
+          python-version: '3.9'  # Specify the version of Python to use
 
+      # Install dependencies
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt  # Install dependencies
+          pip install -r requirements.txt  # Install dependencies from requirements.txt
 
-      - name: Run tests (optional)
+      # Log in to Render using the Render CLI (optional but recommended)
+      - name: Install Render CLI
         run: |
-          pytest  # If you have any tests to run, you can add them here
+          curl -fsSL https://cli.render.com | bash  # Install the Render CLI
 
-      - name: Deploy to Render (or other platform)
+      # Render CLI: Deploy to Render (ensure you have Render API Key or authentication set)
+      - name: Deploy to Render
         run: |
-          # For Render, use the Render CLI to deploy, or use `scp` or other commands
-          # Example:
-          render deploy --service my-service-name  # Replace with the actual command for deployment
-          # Or you could use Docker to push if deploying with Docker:
-          # docker-compose up -d
+          render login --token ${{ secrets.RENDER_API_KEY }}  # Login with the API Key (store in GitHub Secrets)
+          render deploy --service <your-render-service-name>  # Replace <your-render-service-name> with your actual service name
+
+      # Alternatively, if Render automatically handles deployments from GitHub, this part isn't necessary, and you can skip it.
