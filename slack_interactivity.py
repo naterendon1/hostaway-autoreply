@@ -68,18 +68,26 @@ async def slack_action(request: Request):
 
     return JSONResponse({"text": "⚠️ Unknown action"})
 
-def send_reply_to_hostaway(message_id: int, reply_text: str):
-    url = f"{HOSTAWAY_API_BASE}/conversations/{message_id}/messages"
+def send_reply_to_hostaway(conversation_id: int, reply_text: str):
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Accept": "application/json"
     }
-    payload = {"body": reply_text}
+    payload = {
+        "body": reply_text,
+        "isIncoming": 0,  # 0 = host-to-guest
+        "communicationType": "email"  # or "sms" depending on what Hostaway supports
+    }
 
-    logging.info(f"📬 Sending reply to Hostaway (message ID: {message_id})")
+    logging.info(f"📬 Sending reply to Hostaway (conversation ID: {conversation_id})")
     r = requests.post(url, headers=headers, json=payload)
 
     if r.status_code != 200:
         logging.error(f"❌ Hostaway reply failed: {r.status_code} - {r.text}")
+        return False
     else:
         logging.info("✅ Hostaway reply sent successfully.")
+        return True
