@@ -73,7 +73,6 @@ async def slack_action(request: Request):
 
 
 def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
-    """Send a reply to Hostaway's API. Returns True if successful."""
     url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
@@ -81,16 +80,11 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
     }
     payload = {
         "body": reply_text,
-        "isIncoming": 0,  # 0 = host-to-guest (outgoing)
-        "communicationType": "email"  # or "sms" if needed
+        "isIncoming": 0,  # Must be 0 for host-to-guest
+        "communicationType": "email"  # or "sms"
     }
-
-    logging.info(f"📬 Sending reply to Hostaway (conversation ID: {conversation_id})")
     response = requests.post(url, headers=headers, json=payload)
-
-    if response.status_code == 200:
-        logging.info(f"✅ Reply sent successfully. Response: {response.json()}")
-        return True
-    else:
-        logging.error(f"❌ Failed to send reply. Status: {response.status_code}, Response: {response.text}")
+    if response.status_code != 200:
+        logging.error(f"Hostaway API Error: {response.text}")  # Log detailed error
         return False
+    return True
