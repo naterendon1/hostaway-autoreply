@@ -78,8 +78,8 @@ def send_reply_to_hostaway(conversation_id: int, reply_text: str):
     }
     payload = {
         "body": reply_text,
-        "isIncoming": 0,  # 0 = host-to-guest
-        "communicationType": "email"  # or "sms" depending on what Hostaway supports
+        "isIncoming": 0,  # 0 = host-to-guest (outgoing)
+        "communicationType": "email"  # This can also be "sms" if needed
     }
 
     logging.info(f"📬 Sending reply to Hostaway (conversation ID: {conversation_id})")
