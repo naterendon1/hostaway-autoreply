@@ -7,8 +7,8 @@ import os
 
 router = APIRouter()
 
-# Directly access the environment variable set in Render
-HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_ACCESS_TOKEN")  # This will use the Render environment variable
+# Environment variables
+HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_ACCESS_TOKEN")  # Ensure this matches your curl token
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 @router.post("/slack-interactivity")
@@ -17,19 +17,22 @@ async def slack_action(request: Request):
     payload = json.loads(form_data["payload"])
     action = payload["actions"][0]
     action_type = action["name"]
-    reservation_id = int(payload["callback_id"])
+    callback_id = payload["callback_id"]  # Renamed for clarity (may be conversation_id)
 
     if action_type == "approve":
         reply = action["value"]
-        send_reply_to_hostaway(reservation_id, reply)
-        return JSONResponse({"text": "✅ Reply approved and sent to guest."})
+        success = send_reply_to_hostaway(callback_id, reply)  # Pass callback_id directly
+        if success:
+            return JSONResponse({"text": "✅ Reply approved and sent to guest."})
+        else:
+            return JSONResponse({"text": "❌ Failed to send reply to Hostaway."})
 
     elif action_type == "write_own":
         return JSONResponse({
             "text": "📝 Please compose your message below.",
             "attachments": [
                 {
-                    "callback_id": str(reservation_id),
+                    "callback_id": callback_id,  # Use callback_id here too
                     "fallback": "Compose your reply",
                     "color": "#3AA3E3",
                     "attachment_type": "default",
@@ -67,7 +70,10 @@ async def slack_action(request: Request):
         return JSONResponse({"text": "📨 Send functionality coming soon."})
 
     return JSONResponse({"text": "⚠️ Unknown action"})
-def send_reply_to_hostaway(conversation_id: int, reply_text: str):
+
+
+def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
+    """Send a reply to Hostaway's API. Returns True if successful."""
     url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
     headers = {
         "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
@@ -75,26 +81,16 @@ def send_reply_to_hostaway(conversation_id: int, reply_text: str):
     }
     payload = {
         "body": reply_text,
-        "isIncoming": 0,  # Must be 0 for host-to-guest messages
-        "communicationType": "email"  # Or "sms" if applicable
+        "isIncoming": 0,  # 0 = host-to-guest (outgoing)
+        "communicationType": "email"  # or "sms" if needed
     }
 
     logging.info(f"📬 Sending reply to Hostaway (conversation ID: {conversation_id})")
-    r = requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=headers, json=payload)
 
-    if r.status_code != 200:
-        logging.error(f"❌ Hostaway reply failed: {r.status_code} - {r.text}")
-        return False
-    else:
-        logging.info(f"✅ Hostaway reply sent successfully. Response: {r.json()}")
+    if response.status_code == 200:
+        logging.info(f"✅ Reply sent successfully. Response: {response.json()}")
         return True
-
-    logging.info(f"📬 Sending reply to Hostaway (conversation ID: {conversation_id})")
-    r = requests.post(url, headers=headers, json=payload)
-
-    if r.status_code != 200:
-        logging.error(f"❌ Hostaway reply failed: {r.status_code} - {r.text}")
-        return False
     else:
-        logging.info("✅ Hostaway reply sent successfully.")
-        return True
+        logging.error(f"❌ Failed to send reply. Status: {response.status_code}, Response: {response.text}")
+        return False
