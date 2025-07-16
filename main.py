@@ -158,7 +158,7 @@ async def slack_action(request: Request):
 def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
     url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
     headers = {
-        "X-API-KEY": HOSTAWAY_ACCESS_TOKEN,
+        "Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}",
         "Cache-Control": "no-cache",
         "Content-Type": "application/json",
         "Accept": "application/json"
