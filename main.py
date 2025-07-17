@@ -11,17 +11,17 @@ from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 
-HOSTAWAY_ACCESS_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")
-if HOSTAWAY_ACCESS_TOKEN:
-    logging.info("Hostaway Access Token successfully loaded.")
-else:
-    logging.error("❌ HOSTAWAY_ACCESS_TOKEN is not set. Please check your environment variables.")
+HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
+HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
+HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
+
+if not HOSTAWAY_CLIENT_ID or not HOSTAWAY_CLIENT_SECRET:
+    logging.error("❌ HOSTAWAY_CLIENT_ID or HOSTAWAY_CLIENT_SECRET not set.")
 
 app = FastAPI()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 class HostawayUnifiedWebhook(BaseModel):
     object: str
@@ -155,10 +155,33 @@ async def slack_action(request: Request):
 
     return JSONResponse({"text": "⚠️ Unknown action"})
 
+def get_hostaway_access_token() -> Optional[str]:
+    url = f"{HOSTAWAY_API_BASE}/accessTokens"
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": HOSTAWAY_CLIENT_ID,
+        "client_secret": HOSTAWAY_CLIENT_SECRET,
+        "scope": "general"
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    try:
+        response = requests.post(url, data=payload, headers=headers)
+        response.raise_for_status()
+        token_data = response.json()
+        return token_data.get("access_token")
+    except Exception as e:
+        logging.error(f"❌ Failed to retrieve Hostaway access token: {e}")
+        return None
+
 def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
+    access_token = get_hostaway_access_token()
+    if not access_token:
+        return False
+
     url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
     headers = {
-        "Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {access_token}",
         "Cache-Control": "no-cache",
         "Content-Type": "application/json",
         "Accept": "application/json"
@@ -177,7 +200,6 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
     try:
         response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
-
         logging.info(f"✅ Successfully sent reply. Response: {response.text}")
         return True
 
@@ -198,9 +220,8 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
             logging.error("3. Missing required parameters in payload")
         elif e.response.status_code == 403:
             logging.error("🔒 403 Forbidden - Please verify:")
-            logging.error("1. Your API key has 'messages:write' permission")
-            logging.error("2. Your API key is valid and not expired")
-            logging.error("3. Your server IP is whitelisted if required")
+            logging.error("1. Token not valid or expired")
+            logging.error("2. Client credentials incorrect")
 
         return False
 
