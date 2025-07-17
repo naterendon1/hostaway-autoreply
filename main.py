@@ -15,9 +15,6 @@ HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
-if not HOSTAWAY_CLIENT_ID or not HOSTAWAY_CLIENT_SECRET:
-    logging.error("❌ HOSTAWAY_CLIENT_ID or HOSTAWAY_CLIENT_SECRET not set.")
-
 app = FastAPI()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -42,28 +39,37 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     if payload.event == "message.received" and payload.object == "conversationMessage":
         guest_message = payload.data.get("body", "")
-        listing_name = payload.data.get("listingName", "Unknown")
         conversation_id = payload.data.get("conversationId")
         message_id = payload.data.get("id")
         communication_type = payload.data.get("communicationType") or "channel"
+        reservation_id = payload.data.get("reservationId")
+        listing_map_id = payload.data.get("listingMapId")
 
-        # Extract reservation info
+        guest_name = "Guest"
+        check_in = "N/A"
+        check_out = "N/A"
+        guest_count = "N/A"
+        listing_name = "Unknown"
         reservation_status = payload.data.get("status", "Unknown").capitalize()
-        guest_name = payload.data.get("guestName", "Guest")
-        check_in = payload.data.get("startDate", "N/A")
-        check_out = payload.data.get("endDate", "N/A")
-        guest_count = payload.data.get("numberOfGuests", "N/A")
 
-        # Optional: Map communication type to label
-        readable_communication = {
-            "channel": "Channel Message",
-            "email": "Email",
-            "sms": "SMS",
-            "whatsapp": "WhatsApp",
-            "airbnb": "Airbnb",
-        }.get(communication_type, communication_type.capitalize())
+        if reservation_id:
+            res = fetch_reservation_details(reservation_id)
+            if res:
+                logging.info(f"📦 Reservation API response: {json.dumps(res, indent=2)}")
+                res_data = res.get("result", res)
+                guest_name = res_data.get("guestName", guest_name)
+                check_in = res_data.get("startDate", check_in)
+                check_out = res_data.get("endDate", check_out)
+                guest_count = res_data.get("numberOfGuests", guest_count)
+                if not listing_map_id:
+                    listing_map_id = res_data.get("listingId")
 
-        logging.info(f"📩 New guest message received: {guest_message}")
+        if listing_map_id:
+            listing = fetch_listing_details(listing_map_id)
+            if listing:
+                logging.info(f"📦 Listing API response: {json.dumps(listing, indent=2)}")
+                listing_data = listing.get("result", listing)
+                listing_name = listing_data.get("name", listing_name)
 
         prompt = f"""You are a professional short-term rental manager. A guest sent this message:
 {guest_message}
@@ -83,7 +89,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-        header_text = f"*New {readable_communication}* from *{guest_name}* at *{listing_name}*  \nDates: *{check_in} → {check_out}*  \nGuests: *{guest_count}* | Status: *{reservation_status}*"
+        header_text = f"*New {communication_type.capitalize()}* from *{guest_name}* at *{listing_name}*  \nDates: *{check_in} → {check_out}*  \nGuests: *{guest_count}* | Status: *{reservation_status}*"
 
         slack_message = {
             "text": header_text + f"\n\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
@@ -121,61 +127,6 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
 
     return {"status": "ok"}
 
-@app.post("/slack-interactivity")
-async def slack_action(request: Request):
-    form_data = await request.form()
-    payload = json.loads(form_data["payload"])
-
-    logging.info(f"Received Slack payload: {json.dumps(payload, indent=2)}")
-
-    action = payload["actions"][0]
-    action_type = action["name"]
-    conversation_id = payload.get("callback_id")
-
-    if action_type == "approve" and conversation_id:
-        value_data = json.loads(action["value"])
-        reply = value_data.get("reply")
-        communication_type = value_data.get("type", "channel")
-        success = send_reply_to_hostaway(conversation_id, reply, communication_type)
-
-        if success:
-            return JSONResponse({
-                "text": f"✅ Reply sent to guest:\n\n>{reply}",
-                "replace_original": True
-            })
-        else:
-            return JSONResponse({
-                "text": "❌ Failed to send reply to Hostaway. Please check:\n1. API key permissions\n2. Conversation still exists\n3. Correct endpoint URL",
-                "replace_original": True
-            })
-
-    elif action_type == "write_own":
-        return JSONResponse({
-            "text": "📝 Please compose your message below.",
-            "attachments": [
-                {
-                    "callback_id": str(conversation_id),
-                    "fallback": "Compose your reply",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {"name": "back", "text": "🔙 Back", "type": "button", "value": "back"},
-                        {"name": "improve", "text": "✏️ Improve with AI", "type": "button", "value": "improve"},
-                        {"name": "send", "text": "📨 Send", "type": "button", "value": "send", "style": "primary"}
-                    ]
-                }
-            ]
-        })
-
-    elif action_type == "back":
-        return JSONResponse({"text": "🔙 Returning to original options. (Feature coming soon)"})
-    elif action_type == "improve":
-        return JSONResponse({"text": "✏️ Improve with AI feature coming soon."})
-    elif action_type == "send":
-        return JSONResponse({"text": "📨 Send functionality coming soon."})
-
-    return JSONResponse({"text": "⚠️ Unknown action"})
-
 def get_hostaway_access_token() -> Optional[str]:
     url = f"{HOSTAWAY_API_BASE}/accessTokens"
     payload = {
@@ -195,57 +146,40 @@ def get_hostaway_access_token() -> Optional[str]:
         logging.error(f"❌ Failed to retrieve Hostaway access token: {e}")
         return None
 
-def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_type: str = "email") -> bool:
+def fetch_reservation_details(reservation_id: int) -> Optional[dict]:
     access_token = get_hostaway_access_token()
     if not access_token:
-        return False
+        return None
 
-    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
+    url = f"{HOSTAWAY_API_BASE}/reservations/{reservation_id}"
     headers = {
         "Authorization": f"Bearer {access_token}",
-        "Cache-Control": "no-cache",
-        "Content-Type": "application/json",
         "Accept": "application/json"
     }
-    payload = {
-        "body": reply_text,
-        "isIncoming": 0,
-        "communicationType": communication_type
-    }
-
-    logging.info(f"🕒 Attempting to send reply to Hostaway for conversation {conversation_id}")
-    logging.debug(f"Full request URL: {url}")
-    logging.debug(f"Request headers: {headers}")
-    logging.debug(f"Request payload: {payload}")
 
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.get(url, headers=headers)
         response.raise_for_status()
-        logging.info(f"✅ Successfully sent reply. Response: {response.text}")
-        return True
-
-    except requests.exceptions.HTTPError as e:
-        error_detail = {
-            "status_code": e.response.status_code,
-            "response_text": e.response.text,
-            "request_url": url,
-            "request_headers": headers,
-            "request_payload": payload
-        }
-        logging.error(f"❌ HTTP error sending reply: {json.dumps(error_detail, indent=2)}")
-
-        if e.response.status_code == 404:
-            logging.error("🔍 404 Not Found - Possible issues:")
-            logging.error(f"1. Invalid conversation ID: {conversation_id}")
-            logging.error(f"2. Incorrect endpoint URL: {url}")
-            logging.error("3. Missing required parameters in payload")
-        elif e.response.status_code == 403:
-            logging.error("🔒 403 Forbidden - Please verify:")
-            logging.error("1. Token not valid or expired")
-            logging.error("2. Client credentials incorrect")
-
-        return False
-
+        return response.json()
     except Exception as e:
-        logging.error(f"❌ Unexpected error sending reply: {str(e)}")
-        return False
+        logging.error(f"❌ Failed to fetch reservation details: {e}")
+        return None
+
+def fetch_listing_details(listing_id: int) -> Optional[dict]:
+    access_token = get_hostaway_access_token()
+    if not access_token:
+        return None
+
+    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json"
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"❌ Failed to fetch listing details: {e}")
+        return None
