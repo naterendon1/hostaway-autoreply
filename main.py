@@ -42,15 +42,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     if payload.event == "message.received" and payload.object == "conversationMessage":
         guest_message = payload.data.get("body", "")
-        listing_name = payload.data.get("listingName", "Unknown Listing")
         conversation_id = payload.data.get("conversationId")
 
-        reservation = payload.data
-        guest_name = reservation.get("guestName", "Guest")
-        start_date = reservation.get("startDate", "N/A")
-        end_date = reservation.get("endDate", "N/A")
-        num_guests = reservation.get("numberOfGuests", "N/A")
-        status = reservation.get("status", "N/A").capitalize()
+        guest_name = payload.data.get("firstName", "Guest")
+        listing_name = payload.data.get("listingName", "Listing")
+        check_in = payload.data.get("checkIn", "N/A")
+        check_out = payload.data.get("checkOut", "N/A")
+        guests = payload.data.get("numberOfGuests", "N/A")
+        reservation_status = payload.data.get("status", "N/A")
 
         logging.info(f"📩 New guest message received: {guest_message}")
 
@@ -72,21 +71,17 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
+        header_text = f"*New Guest Message*
+*Guest:* {guest_name}  |  *Listing:* {listing_name}  |  *Dates:* {check_in} → {check_out}  |  *Guests:* {guests}  |  *Status:* {reservation_status}"
+
         slack_message = {
-            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}",
+            "text": f"{header_text}\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
             "attachments": [
                 {
                     "callback_id": str(conversation_id),
                     "fallback": "You are unable to choose a response",
                     "color": "#3AA3E3",
                     "attachment_type": "default",
-                    "fields": [
-                        {"title": "Guest", "value": guest_name, "short": True},
-                        {"title": "Listing", "value": listing_name, "short": True},
-                        {"title": "Dates", "value": f"{start_date} → {end_date}", "short": True},
-                        {"title": "Guests", "value": str(num_guests), "short": True},
-                        {"title": "Status", "value": status, "short": True}
-                    ],
                     "actions": [
                         {
                             "name": "approve",
