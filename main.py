@@ -42,9 +42,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     if payload.event == "message.received" and payload.object == "conversationMessage":
         guest_message = payload.data.get("body", "")
-        listing_name = payload.data.get("listingName", "Guest")
+        listing_name = payload.data.get("listingName", "Unknown Listing")
         conversation_id = payload.data.get("conversationId")
-        communication_type = payload.data.get("communicationType", "email")
+
+        reservation = payload.data
+        guest_name = reservation.get("guestName", "Guest")
+        start_date = reservation.get("startDate", "N/A")
+        end_date = reservation.get("endDate", "N/A")
+        num_guests = reservation.get("numberOfGuests", "N/A")
+        status = reservation.get("status", "N/A").capitalize()
 
         logging.info(f"📩 New guest message received: {guest_message}")
 
@@ -67,19 +73,26 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             ai_reply = "(Error generating reply with OpenAI.)"
 
         slack_message = {
-            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+            "text": f"*New Guest Message for {listing_name}:*\n>{guest_message}",
             "attachments": [
                 {
                     "callback_id": str(conversation_id),
                     "fallback": "You are unable to choose a response",
                     "color": "#3AA3E3",
                     "attachment_type": "default",
+                    "fields": [
+                        {"title": "Guest", "value": guest_name, "short": True},
+                        {"title": "Listing", "value": listing_name, "short": True},
+                        {"title": "Dates", "value": f"{start_date} → {end_date}", "short": True},
+                        {"title": "Guests", "value": str(num_guests), "short": True},
+                        {"title": "Status", "value": status, "short": True}
+                    ],
                     "actions": [
                         {
                             "name": "approve",
                             "text": "✅ Approve",
                             "type": "button",
-                            "value": json.dumps({"reply": ai_reply, "type": communication_type}),
+                            "value": ai_reply,
                             "style": "primary"
                         },
                         {
@@ -114,10 +127,8 @@ async def slack_action(request: Request):
     conversation_id = payload.get("callback_id")
 
     if action_type == "approve" and conversation_id:
-        action_value = json.loads(action["value"])
-        reply = action_value.get("reply")
-        communication_type = action_value.get("type", "email")
-        success = send_reply_to_hostaway(conversation_id, reply, communication_type)
+        reply = action["value"]
+        success = send_reply_to_hostaway(conversation_id, reply)
 
         if success:
             return JSONResponse({
@@ -176,7 +187,7 @@ def get_hostaway_access_token() -> Optional[str]:
         logging.error(f"❌ Failed to retrieve Hostaway access token: {e}")
         return None
 
-def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_type: str) -> bool:
+def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
     access_token = get_hostaway_access_token()
     if not access_token:
         return False
@@ -191,8 +202,7 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_
     payload = {
         "body": reply_text,
         "isIncoming": 0,
-        "communicationType": communication_type,
-        "sentUsingHostaway": 1
+        "communicationType": "email"
     }
 
     logging.info(f"🕒 Attempting to send reply to Hostaway for conversation {conversation_id}")
