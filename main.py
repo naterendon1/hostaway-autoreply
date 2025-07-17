@@ -42,14 +42,16 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     if payload.event == "message.received" and payload.object == "conversationMessage":
         guest_message = payload.data.get("body", "")
+        listing_name = payload.data.get("listingName", "Unknown")
         conversation_id = payload.data.get("conversationId")
+        message_id = payload.data.get("id")
 
-        guest_name = payload.data.get("firstName", "Guest")
-        listing_name = payload.data.get("listingName", "Listing")
-        check_in = payload.data.get("checkIn", "N/A")
-        check_out = payload.data.get("checkOut", "N/A")
-        guests = payload.data.get("numberOfGuests", "N/A")
-        reservation_status = payload.data.get("status", "N/A")
+        # Extract reservation info
+        reservation_status = payload.data.get("status", "Unknown").capitalize()
+        guest_name = payload.data.get("guestName", "Guest")
+        check_in = payload.data.get("startDate", "N/A")
+        check_out = payload.data.get("endDate", "N/A")
+        guest_count = payload.data.get("numberOfGuests", "N/A")
 
         logging.info(f"📩 New guest message received: {guest_message}")
 
@@ -71,11 +73,12 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-        header_text = f"*New Guest Message*
-*Guest:* {guest_name}  |  *Listing:* {listing_name}  |  *Dates:* {check_in} → {check_out}  |  *Guests:* {guests}  |  *Status:* {reservation_status}"
+        header_text = f"*New Guest Message* from *{guest_name}* at *{listing_name}*  
+Dates: *{check_in} → {check_out}*  
+Guests: *{guest_count}* | Status: *{reservation_status}*"
 
         slack_message = {
-            "text": f"{header_text}\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+            "text": header_text + f"\n\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
             "attachments": [
                 {
                     "callback_id": str(conversation_id),
