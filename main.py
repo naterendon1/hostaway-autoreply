@@ -73,9 +73,7 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
             logging.error(f"❌ OpenAI error: {str(e)}")
             ai_reply = "(Error generating reply with OpenAI.)"
 
-        header_text = f"*New Guest Message* from *{guest_name}* at *{listing_name}*  
-Dates: *{check_in} → {check_out}*  
-Guests: *{guest_count}* | Status: *{reservation_status}*"
+        header_text = f"*New Guest Message* from *{guest_name}* at *{listing_name}*  \nDates: *{check_in} → {check_out}*  \nGuests: *{guest_count}* | Status: *{reservation_status}*"
 
         slack_message = {
             "text": header_text + f"\n\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
