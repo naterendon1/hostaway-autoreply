@@ -1,3 +1,5 @@
+# slack_interactivity.py
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import os
@@ -14,7 +16,7 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 client = WebClient(token=SLACK_BOT_TOKEN)
 signature_verifier = SignatureVerifier(SLACK_SIGNING_SECRET)
 
-# In-memory state; for production use, switch to Redis or DB
+# In-memory state; for production, use Redis or DB
 waiting_threads = {}
 
 @router.post("/slack/events")
@@ -50,10 +52,15 @@ async def slack_events(request: Request):
         text = event.get("text", "")
 
         logging.info(f"User message detected in channel={channel}, thread_ts={thread_ts}, message_ts={user_message_ts}")
+        logging.info(f"waiting_threads: {waiting_threads}")
 
         # Only respond if thread is flagged as waiting
         if thread_ts in waiting_threads:
             mode = waiting_threads.pop(thread_ts)
+            conv_id, comm_type = None, "channel"
+            if isinstance(mode, dict):
+                conv_id = mode.get("conv_id")
+                comm_type = mode.get("type", "channel")
             logging.info(f"Posting action buttons in response to user reply in thread {thread_ts}, mode={mode}")
 
             blocks = [
@@ -63,19 +70,36 @@ async def slack_events(request: Request):
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "📨 Send"},
-                            "value": json.dumps({"draft": text, "thread_ts": thread_ts, "channel": channel}),
+                            "value": json.dumps({
+                                "draft": text,
+                                "thread_ts": thread_ts,
+                                "channel": channel,
+                                "conv_id": conv_id,
+                                "type": comm_type
+                            }),
                             "action_id": "send"
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "✏️ Improve with AI"},
-                            "value": json.dumps({"draft": text, "thread_ts": thread_ts, "channel": channel}),
+                            "value": json.dumps({
+                                "draft": text,
+                                "thread_ts": thread_ts,
+                                "channel": channel,
+                                "conv_id": conv_id,
+                                "type": comm_type
+                            }),
                             "action_id": "improve"
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "✏️ Edit"},
-                            "value": json.dumps({"thread_ts": thread_ts, "channel": channel}),
+                            "value": json.dumps({
+                                "thread_ts": thread_ts,
+                                "channel": channel,
+                                "conv_id": conv_id,
+                                "type": comm_type
+                            }),
                             "action_id": "edit"
                         }
                     ]
@@ -108,12 +132,6 @@ async def slack_actions(request: Request):
         logging.error(f"Could not parse action payload: {e}")
         return JSONResponse(status_code=400, content={"error": "Invalid action payload"})
 
-    # Signature verification (optional here, already checked on /slack/events)
-    # If you want, you can re-enable below:
-    # if not signature_verifier.is_valid_request(await request.body(), request.headers):
-    #     logging.error("Slack signature verification failed on /slack/actions.")
-    #     return JSONResponse(status_code=403, content={"status": "invalid signature"})
-
     user = payload.get("user", {}).get("id")
     action = payload["actions"][0]
     action_id = action.get("action_id")
@@ -127,8 +145,12 @@ async def slack_actions(request: Request):
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
     if action_id in ["write_own", "edit"]:
-        # Mark thread as waiting for user input
-        waiting_threads[thread_ts] = action_id
+        # Mark thread as waiting for user input, including any conv_id/type info
+        waiting_threads[thread_ts] = {
+            "action_id": action_id,
+            "conv_id": value.get("conv_id"),
+            "type": value.get("type", "channel"),
+        }
         try:
             client.chat_postMessage(
                 channel=channel,
@@ -142,9 +164,14 @@ async def slack_actions(request: Request):
 
     elif action_id == "send":
         reply = value.get("reply") or value.get("draft")
-        conv_id = value.get("conv_id", None)
+        conv_id = value.get("conv_id")
         comm_type = value.get("type", "channel")
-        success = send_reply_to_hostaway(conv_id, reply, comm_type)
+        success = False
+        if conv_id:
+            success = send_reply_to_hostaway(conv_id, reply, comm_type)
+        else:
+            logging.error("No conv_id present for sending reply to Hostaway.")
+
         try:
             client.chat_postMessage(
                 channel=channel,
@@ -158,6 +185,8 @@ async def slack_actions(request: Request):
 
     elif action_id == "improve":
         draft = value.get("reply") or value.get("draft")
+        conv_id = value.get("conv_id")  # carry forward
+        comm_type = value.get("type", "channel")
         try:
             response = openai_client.chat.completions.create(
                 model="gpt-4",
@@ -177,13 +206,24 @@ async def slack_actions(request: Request):
                     {
                         "type": "button",
                         "text": {"type": "plain_text", "text": "✅ Send"},
-                        "value": json.dumps({"reply": improved, "thread_ts": thread_ts, "channel": channel}),
+                        "value": json.dumps({
+                            "reply": improved,
+                            "thread_ts": thread_ts,
+                            "channel": channel,
+                            "conv_id": conv_id,
+                            "type": comm_type
+                        }),
                         "action_id": "send"
                     },
                     {
                         "type": "button",
                         "text": {"type": "plain_text", "text": "✏️ Edit"},
-                        "value": json.dumps({"thread_ts": thread_ts, "channel": channel}),
+                        "value": json.dumps({
+                            "thread_ts": thread_ts,
+                            "channel": channel,
+                            "conv_id": conv_id,
+                            "type": comm_type
+                        }),
                         "action_id": "edit"
                     }
                 ]
