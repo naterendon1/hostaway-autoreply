@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -16,9 +16,6 @@ HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-if not HOSTAWAY_CLIENT_ID or not HOSTAWAY_CLIENT_SECRET:
-    logging.error("❌ Missing Hostaway credentials")
 
 app = FastAPI()
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -147,6 +144,17 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
 
     return {"status": "ok"}
 
+@app.post("/slack/events")
+async def slack_events(request: Request):
+    # This endpoint is needed for Slack Events API challenge verification
+    body = await request.body()
+    payload = json.loads(body)
+    if payload.get("type") == "url_verification":
+        # Reply with just the challenge string for Slack verification
+        return {"challenge": payload["challenge"]}
+    # For now, do nothing with other events
+    return {"status": "ok"}
+
 def get_hostaway_access_token() -> Optional[str]:
     url = f"{HOSTAWAY_API_BASE}/accessTokens"
     data = {
@@ -198,4 +206,3 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_
     except Exception as e:
         logging.error(f"❌ Send error: {e}")
         return False
-
