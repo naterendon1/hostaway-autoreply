@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -99,7 +99,11 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         logging.error(f"❌ OpenAI error: {e}")
         ai_reply = "(Error generating reply.)"
 
-    header = f"*New {readable_communication}* from *{guest_name}* at *{listing_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{reservation_status}*"
+    header = (
+        f"*New {readable_communication}* from *{guest_name}* at *{listing_name}*\n"
+        f"Dates: *{check_in} → {check_out}*\n"
+        f"Guests: *{guest_count}* | Status: *{reservation_status}*"
+    )
 
     slack_message = {
         "text": header + f"\n\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
@@ -118,10 +122,16 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
                         "style": "primary"
                     },
                     {
+                        "name": "edit",
+                        "text": "✏️ Edit",
+                        "type": "button",
+                        "value": json.dumps({"mode": "edit"})
+                    },
+                    {
                         "name": "write_own",
                         "text": "📝 Write Your Own",
                         "type": "button",
-                        "value": str(conversation_id)
+                        "value": json.dumps({"mode": "write_own"})
                     }
                 ]
             }
@@ -136,47 +146,6 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         logging.error(f"❌ Slack send error: {e}")
 
     return {"status": "ok"}
-
-@app.post("/slack-interactivity")
-async def slack_action(request: Request):
-    logging.info("📩 Slack interactivity received")
-    form_data = await request.form()
-    payload = json.loads(form_data["payload"])
-    logging.info(f"📦 Slack Payload: {json.dumps(payload, indent=2)}")
-
-    action = payload["actions"][0]
-    action_type = action["name"]
-    conversation_id = payload.get("callback_id")
-
-    if action_type == "approve" and conversation_id:
-        value_data = json.loads(action["value"])
-        reply = value_data.get("reply")
-        communication_type = value_data.get("type", "channel")
-        success = send_reply_to_hostaway(conversation_id, reply, communication_type)
-        return JSONResponse({
-            "text": f"✅ Sent to guest:\n>{reply}" if success else "❌ Failed to send reply.",
-            "replace_original": True
-        })
-
-    elif action_type == "write_own":
-        return JSONResponse({
-            "text": "📝 Please compose your message below.",
-            "attachments": [
-                {
-                    "callback_id": str(conversation_id),
-                    "fallback": "Write custom message",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {"name": "back", "text": "🔙 Back", "type": "button", "value": "back"},
-                        {"name": "improve", "text": "✏️ Improve with AI", "type": "button", "value": "improve"},
-                        {"name": "send", "text": "📨 Send", "type": "button", "value": "send", "style": "primary"}
-                    ]
-                }
-            ]
-        })
-
-    return JSONResponse({"text": "⚠️ Unknown Slack action."})
 
 def get_hostaway_access_token() -> Optional[str]:
     url = f"{HOSTAWAY_API_BASE}/accessTokens"
@@ -229,3 +198,4 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_
     except Exception as e:
         logging.error(f"❌ Send error: {e}")
         return False
+
