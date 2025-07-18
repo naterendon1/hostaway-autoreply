@@ -1,6 +1,7 @@
 # slack_interactivity.py
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 import os
 import json
 import logging
@@ -21,11 +22,14 @@ waiting_threads = {}
 async def slack_events(request: Request):
     body = await request.body()
     if not signature_verifier.is_valid_request(body, request.headers):
-        return {"status": "invalid signature"}
-
-    payload = json.loads(body)
+        return JSONResponse(status_code=403, content={"status": "invalid signature"})
+    try:
+        payload = json.loads(body)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON", "details": str(e)})
     if "challenge" in payload:
-        return payload
+        # Slack URL verification
+        return JSONResponse(content={"challenge": payload["challenge"]})
 
     event = payload.get("event", {})
     event_type = event.get("type")
@@ -78,10 +82,13 @@ async def slack_events(request: Request):
 
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
+    body = await request.body()
+    if not signature_verifier.is_valid_request(body, request.headers):
+        logging.error("Slack signature verification failed.")
+        return JSONResponse(status_code=403, content={"status": "invalid signature"})
     form = await request.form()
     payload = json.loads(form["payload"])
-    if not signature_verifier.is_valid_request(request._body, request.headers):
-        return {"status": "invalid signature"}
+    logging.info(f"Slack action payload: {json.dumps(payload, indent=2)}")
 
     user = payload.get("user", {}).get("id")
     action = payload["actions"][0]
@@ -164,4 +171,5 @@ async def slack_actions(request: Request):
         return {}
 
     else:
+        logging.warning(f"Unhandled Slack action_id: {action_id}")
         return {}
