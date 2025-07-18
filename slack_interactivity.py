@@ -1,5 +1,3 @@
-# slack_interactivity.py
-
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import os
@@ -28,22 +26,24 @@ async def slack_events(request: Request):
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON", "details": str(e)})
     if "challenge" in payload:
-        # Slack URL verification
         return JSONResponse(content={"challenge": payload["challenge"]})
 
     event = payload.get("event", {})
     event_type = event.get("type")
 
     if event_type == "message" and not event.get("bot_id"):
-        thread_ts = event.get("thread_ts") or event.get("ts")
-        user_id = event.get("user")
-        text = event.get("text", "")
+        # User message in a thread (after "Write Your Own" or "Edit")
+        thread_ts = event.get("thread_ts")    # Parent/root thread's ts
+        user_message_ts = event.get("ts")     # This user's message ts
         channel = event.get("channel")
+        text = event.get("text", "")
 
+        # Only respond if the thread is flagged as waiting
         if thread_ts in waiting_threads:
             mode = waiting_threads.pop(thread_ts)
             logging.info(f"Detected user message in thread {thread_ts}, mode: {mode}")
 
+            # Post the buttons as a reply to the user's message!
             blocks = [
                 {
                     "type": "actions",
@@ -71,7 +71,7 @@ async def slack_events(request: Request):
             ]
             client.chat_postMessage(
                 channel=channel,
-                thread_ts=thread_ts,
+                thread_ts=user_message_ts,  # <- reply directly to the user's message!
                 text="Choose what to do with your draft reply:",
                 blocks=blocks
             )
@@ -79,6 +79,7 @@ async def slack_events(request: Request):
             logging.info("User message received in thread with no waiting state; ignoring.")
 
     return {"status": "ok"}
+
 
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
@@ -95,13 +96,15 @@ async def slack_actions(request: Request):
     action_id = action.get("action_id")
     value = json.loads(action["value"])
     channel = payload.get("channel", {}).get("id")
-    thread_ts = payload.get("message", {}).get("ts") or payload.get("container", {}).get("thread_ts")
+    # For button clicks, thread_ts refers to parent thread; use container/message ts for context
+    thread_ts = value.get("thread_ts") or payload.get("message", {}).get("ts") or payload.get("container", {}).get("thread_ts")
 
     from openai import OpenAI
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
     if action_id in ["write_own", "edit"]:
+        # Mark thread as waiting for user's input (flag root thread_ts)
         waiting_threads[thread_ts] = action_id
         client.chat_postMessage(
             channel=channel,
