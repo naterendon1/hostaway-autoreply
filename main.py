@@ -1,12 +1,11 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+# main.py
+from fastapi import FastAPI
+from slack_interactivity import router as slack_router
 from pydantic import BaseModel
-from typing import Optional
 import os
 import requests
-import json
 import logging
-from slack_sdk.webhook import WebhookClient
+import json
 from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
@@ -14,29 +13,26 @@ logging.basicConfig(level=logging.INFO)
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI()
-client = OpenAI(api_key=OPENAI_API_KEY)
+app.include_router(slack_router)
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 class HostawayUnifiedWebhook(BaseModel):
     object: str
     event: str
     accountId: int
     data: dict
-    body: Optional[str] = None
-    listingName: Optional[str] = None
-    date: Optional[str] = None
-
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
+    body: str = None
+    listingName: str = None
+    date: str = None
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
-
     if payload.event != "message.received" or payload.object != "conversationMessage":
         return {"status": "ignored"}
 
@@ -55,7 +51,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     if reservation_id:
         res = fetch_hostaway_resource("reservations", reservation_id)
-        logging.info(f"📦 Reservation: {json.dumps(res, indent=2)}")
         result = res.get("result", {}) if res else {}
         guest_name = result.get("guestName", guest_name)
         check_in = result.get("startDate", check_in)
@@ -66,7 +61,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     if listing_map_id:
         listing = fetch_hostaway_resource("listings", listing_map_id)
-        logging.info(f"📦 Listing: {json.dumps(listing, indent=2)}")
         result = listing.get("result", {}) if listing else {}
         listing_name = result.get("name", listing_name)
 
@@ -84,7 +78,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don't include a signoff."""
 
     try:
-        response = client.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
@@ -102,60 +96,53 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
         f"Guests: *{guest_count}* | Status: *{reservation_status}*"
     )
 
-    slack_message = {
-        "text": header + f"\n\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
-        "attachments": [
-            {
-                "callback_id": str(conversation_id),
-                "fallback": "Choose a response",
-                "color": "#3AA3E3",
-                "attachment_type": "default",
-                "actions": [
-                    {
-                        "name": "approve",
-                        "text": "✅ Approve",
-                        "type": "button",
-                        "value": json.dumps({"reply": ai_reply, "type": communication_type}),
-                        "style": "primary"
-                    },
-                    {
-                        "name": "edit",
-                        "text": "✏️ Edit",
-                        "type": "button",
-                        "value": json.dumps({"mode": "edit"})
-                    },
-                    {
-                        "name": "write_own",
-                        "text": "📝 Write Your Own",
-                        "type": "button",
-                        "value": json.dumps({"mode": "write_own"})
-                    }
-                ]
-            }
-        ]
-    }
-
+    # Slack Block Kit with 3 actions (buttons)
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_message}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Send"},
+                    "value": json.dumps({"reply": ai_reply, "conv_id": conversation_id, "type": communication_type}),
+                    "action_id": "send"
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✏️ Improve with AI"},
+                    "value": json.dumps({"reply": ai_reply, "conv_id": conversation_id, "type": communication_type}),
+                    "action_id": "improve"
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "📝 Write Your Own"},
+                    "value": json.dumps({"conv_id": conversation_id, "type": communication_type}),
+                    "action_id": "write_own"
+                }
+            ]
+        }
+    ]
+    from slack_sdk.web import WebClient
+    slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     try:
-        webhook = WebhookClient(SLACK_WEBHOOK_URL)
-        webhook.send(**slack_message)
-        logging.info("✅ Slack message sent.")
+        slack_client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            blocks=blocks,
+            text="New message from guest"
+        )
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
 
     return {"status": "ok"}
 
-@app.post("/slack/events")
-async def slack_events(request: Request):
-    # This endpoint is needed for Slack Events API challenge verification
-    body = await request.body()
-    payload = json.loads(body)
-    if payload.get("type") == "url_verification":
-        # Reply with just the challenge string for Slack verification
-        return {"challenge": payload["challenge"]}
-    # For now, do nothing with other events
+@app.get("/ping")
+def ping():
     return {"status": "ok"}
 
-def get_hostaway_access_token() -> Optional[str]:
+def get_hostaway_access_token() -> str:
     url = f"{HOSTAWAY_API_BASE}/accessTokens"
     data = {
         "grant_type": "client_credentials",
@@ -171,7 +158,7 @@ def get_hostaway_access_token() -> Optional[str]:
         logging.error(f"❌ Token error: {e}")
         return None
 
-def fetch_hostaway_resource(resource: str, resource_id: int) -> Optional[dict]:
+def fetch_hostaway_resource(resource: str, resource_id: int):
     token = get_hostaway_access_token()
     if not token:
         return None
