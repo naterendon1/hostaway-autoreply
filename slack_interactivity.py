@@ -1,47 +1,91 @@
-from fastapi import APIRouter, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
+import os
+import requests
 import json
 import logging
-import requests
-import os
+from slack_sdk.webhook import WebhookClient
 from openai import OpenAI
 
-router = APIRouter()
+logging.basicConfig(level=logging.INFO)
 
-HOSTAWAY_API_KEY = os.getenv("HOSTAWAY_ACCESS_TOKEN")
+HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
+HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not HOSTAWAY_CLIENT_ID or not HOSTAWAY_CLIENT_SECRET:
+    logging.error("❌ Missing Hostaway credentials")
+
+app = FastAPI()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Utility to send to Hostaway
-def send_reply_to_hostaway(conversation_id: str, reply_text: str) -> bool:
-    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {HOSTAWAY_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Cache-Control": "no-cache"
-    }
-    payload = {
-        "body": reply_text,
-        "isIncoming": 0,
-        "communicationType": "email"
-    }
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        logging.info(f"✅ Successfully sent reply. Response: {response.text}")
-        return True
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"❌ HTTPError sending reply: {e.response.status_code} - {e.response.text}")
-        return False
-    except Exception as e:
-        logging.error(f"❌ Unexpected error: {str(e)}")
-        return False
+class HostawayUnifiedWebhook(BaseModel):
+    object: str
+    event: str
+    accountId: int
+    data: dict
+    body: Optional[str] = None
+    listingName: Optional[str] = None
+    date: Optional[str] = None
 
-# Utility to improve with OpenAI
-def improve_with_gpt(draft_text: str) -> str:
-    prompt = f"""Rewrite this guest message reply to be friendly, concise, clear, and informal. Do NOT include a signoff:\n\n{draft_text}"""
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
+@app.post("/unified-webhook")
+async def unified_webhook(payload: HostawayUnifiedWebhook):
+    logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
+
+    if payload.event != "message.received" or payload.object != "conversationMessage":
+        return {"status": "ignored"}
+
+    guest_message = payload.data.get("body", "")
+    conversation_id = payload.data.get("conversationId")
+    communication_type = payload.data.get("communicationType", "channel")
+    reservation_id = payload.data.get("reservationId")
+    listing_map_id = payload.data.get("listingMapId")
+
+    guest_name = "Guest"
+    check_in = "N/A"
+    check_out = "N/A"
+    guest_count = "N/A"
+    listing_name = "Unknown"
+    reservation_status = payload.data.get("status", "Unknown").capitalize()
+
+    if reservation_id:
+        res = fetch_hostaway_resource("reservations", reservation_id)
+        logging.info(f"📦 Reservation: {json.dumps(res, indent=2)}")
+        result = res.get("result", {}) if res else {}
+        guest_name = result.get("guestName", guest_name)
+        check_in = result.get("startDate", check_in)
+        check_out = result.get("endDate", check_out)
+        guest_count = result.get("numberOfGuests", guest_count)
+        if not listing_map_id:
+            listing_map_id = result.get("listingId")
+
+    if listing_map_id:
+        listing = fetch_hostaway_resource("listings", listing_map_id)
+        logging.info(f"📦 Listing: {json.dumps(listing, indent=2)}")
+        result = listing.get("result", {}) if listing else {}
+        listing_name = result.get("name", listing_name)
+
+    readable_communication = {
+        "channel": "Channel Message",
+        "email": "Email",
+        "sms": "SMS",
+        "whatsapp": "WhatsApp",
+        "airbnb": "Airbnb",
+    }.get(communication_type, communication_type.capitalize())
+
+    prompt = f"""You are a professional short-term rental manager. A guest sent this message:
+{guest_message}
+
+Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don't include a signoff."""
+
     try:
         response = client.chat.completions.create(
             model="gpt-4",
@@ -50,150 +94,110 @@ def improve_with_gpt(draft_text: str) -> str:
                 {"role": "user", "content": prompt}
             ]
         )
-        improved = response.choices[0].message.content.strip()
-        return improved
+        ai_reply = response.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
-        return draft_text
+        ai_reply = "(Error generating reply.)"
 
-@router.post("/slack-interactivity")
-async def slack_action(request: Request):
-    form_data = await request.form()
-    payload = json.loads(form_data["payload"])
-    action = payload["actions"][0]
-    action_type = action["name"]
-    callback_id = payload.get("callback_id")
-    value_data = {}
+    header = (
+        f"*New {readable_communication}* from *{guest_name}* at *{listing_name}*\n"
+        f"Dates: *{check_in} → {check_out}*\n"
+        f"Guests: *{guest_count}* | Status: *{reservation_status}*"
+    )
 
-    # Unpack value as JSON if present
-    if "value" in action:
-        try:
-            value_data = json.loads(action["value"])
-        except Exception:
-            value_data = {"draft": action["value"]}
+    slack_message = {
+        "text": header + f"\n\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
+        "attachments": [
+            {
+                "callback_id": str(conversation_id),
+                "fallback": "Choose a response",
+                "color": "#3AA3E3",
+                "attachment_type": "default",
+                "actions": [
+                    {
+                        "name": "approve",
+                        "text": "✅ Approve",
+                        "type": "button",
+                        "value": json.dumps({"reply": ai_reply, "type": communication_type}),
+                        "style": "primary"
+                    },
+                    {
+                        "name": "edit",
+                        "text": "✏️ Edit",
+                        "type": "button",
+                        "value": json.dumps({"draft": ai_reply})
+                    },
+                    {
+                        "name": "write_own",
+                        "text": "📝 Write Your Own",
+                        "type": "button",
+                        "value": str(conversation_id)
+                    }
+                ]
+            }
+        ]
+    }
 
-    # Handle actions
-    # 1. Approve (send suggested reply as-is)
-    if action_type == "approve":
-        reply = value_data.get("reply", "")
-        success = send_reply_to_hostaway(callback_id, reply)
-        if success:
-            return JSONResponse({"text": f"✅ Sent to guest:\n>{reply}", "replace_original": True})
-        else:
-            return JSONResponse({"text": "❌ Failed to send reply to Hostaway."})
+    try:
+        webhook = WebhookClient(SLACK_WEBHOOK_URL)
+        webhook.send(**slack_message)
+        logging.info("✅ Slack message sent.")
+    except Exception as e:
+        logging.error(f"❌ Slack send error: {e}")
 
-    # 2. Write Your Own
-    elif action_type == "write_own":
-        return JSONResponse({
-            "text": "📝 Please compose your reply as a message in this thread.\n\n*Once you've typed it, click an option below:*",
-            "attachments": [
-                {
-                    "callback_id": callback_id,
-                    "fallback": "Compose your reply",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {"name": "send", "text": "📨 Send", "type": "button", "value": json.dumps({"draft": ""})},
-                        {"name": "improve", "text": "✏️ Improve with AI", "type": "button", "value": json.dumps({"draft": ""})},
-                        {"name": "back", "text": "🔙 Back", "type": "button", "value": json.dumps({})}
-                    ]
-                }
-            ]
-        })
+    return {"status": "ok"}
 
-    # 3. Edit (edit the AI suggestion)
-    elif action_type == "edit":
-        # Provide the AI draft in a block for editing
-        draft = value_data.get("draft", "")
-        return JSONResponse({
-            "text": f"✏️ *Edit the AI suggestion below (copy, edit, then use a button):*\n\n>{draft}\n\n*Type your changes, then click an option below:*",
-            "attachments": [
-                {
-                    "callback_id": callback_id,
-                    "fallback": "Edit reply",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {"name": "send", "text": "📨 Send", "type": "button", "value": json.dumps({"draft": draft})},
-                        {"name": "improve", "text": "✏️ Improve with AI", "type": "button", "value": json.dumps({"draft": draft})},
-                        {"name": "back", "text": "🔙 Back", "type": "button", "value": json.dumps({})}
-                    ]
-                }
-            ]
-        })
+def get_hostaway_access_token() -> Optional[str]:
+    url = f"{HOSTAWAY_API_BASE}/accessTokens"
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": HOSTAWAY_CLIENT_ID,
+        "client_secret": HOSTAWAY_CLIENT_SECRET,
+        "scope": "general"
+    }
+    try:
+        r = requests.post(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        r.raise_for_status()
+        return r.json().get("access_token")
+    except Exception as e:
+        logging.error(f"❌ Token error: {e}")
+        return None
 
-    # 4. Improve with AI
-    elif action_type == "improve":
-        draft = value_data.get("draft", "")
-        improved = improve_with_gpt(draft)
-        return JSONResponse({
-            "text": f"🤖 *Improved version:*\n\n>{improved}\n\n*You can now send, edit, or rewrite again:*",
-            "attachments": [
-                {
-                    "callback_id": callback_id,
-                    "fallback": "Improve or send",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {"name": "send", "text": "📨 Send", "type": "button", "value": json.dumps({"draft": improved})},
-                        {"name": "edit", "text": "✏️ Edit", "type": "button", "value": json.dumps({"draft": improved})},
-                        {"name": "rewrite_again", "text": "🔁 Rewrite Again", "type": "button", "value": json.dumps({"draft": improved})},
-                        {"name": "back", "text": "🔙 Back", "type": "button", "value": json.dumps({})}
-                    ]
-                }
-            ]
-        })
+def fetch_hostaway_resource(resource: str, resource_id: int) -> Optional[dict]:
+    token = get_hostaway_access_token()
+    if not token:
+        return None
+    url = f"{HOSTAWAY_API_BASE}/{resource}/{resource_id}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logging.error(f"❌ Fetch {resource} error: {e}")
+        return None
 
-    # 5. Rewrite Again (repeat improvement on current draft)
-    elif action_type == "rewrite_again":
-        draft = value_data.get("draft", "")
-        improved = improve_with_gpt(draft)
-        return JSONResponse({
-            "text": f"🔁 *Another improved version:*\n\n>{improved}\n\n*You can now send, edit, or rewrite again:*",
-            "attachments": [
-                {
-                    "callback_id": callback_id,
-                    "fallback": "Rewrite, edit or send",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {"name": "send", "text": "📨 Send", "type": "button", "value": json.dumps({"draft": improved})},
-                        {"name": "edit", "text": "✏️ Edit", "type": "button", "value": json.dumps({"draft": improved})},
-                        {"name": "rewrite_again", "text": "🔁 Rewrite Again", "type": "button", "value": json.dumps({"draft": improved})},
-                        {"name": "back", "text": "🔙 Back", "type": "button", "value": json.dumps({})}
-                    ]
-                }
-            ]
-        })
+def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_type: str = "email") -> bool:
+    token = get_hostaway_access_token()
+    if not token:
+        return False
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
+    payload = {
+        "body": reply_text,
+        "isIncoming": 0,
+        "communicationType": communication_type
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        logging.info(f"✅ Sent to Hostaway: {r.text}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Send error: {e}")
+        return False
 
-    # 6. Send (send current draft to Hostaway)
-    elif action_type == "send":
-        draft = value_data.get("draft", "")
-        success = send_reply_to_hostaway(callback_id, draft)
-        if success:
-            return JSONResponse({"text": f"✅ Sent to guest:\n>{draft}", "replace_original": True})
-        else:
-            return JSONResponse({"text": "❌ Failed to send reply to Hostaway."})
-
-    # 7. Back (could restore to original choices, or simply show a message)
-    elif action_type == "back":
-        return JSONResponse({
-            "text": "🔙 Back to main options. Please choose how to reply:",
-            "attachments": [
-                {
-                    "callback_id": callback_id,
-                    "fallback": "Back to options",
-                    "color": "#3AA3E3",
-                    "attachment_type": "default",
-                    "actions": [
-                        {"name": "approve", "text": "✅ Approve", "type": "button", "value": json.dumps({"reply": ""})},
-                        {"name": "edit", "text": "✏️ Edit", "type": "button", "value": json.dumps({"draft": ""})},
-                        {"name": "write_own", "text": "📝 Write Your Own", "type": "button", "value": json.dumps({})}
-                    ]
-                }
-            ]
-        })
-
-    # Unknown action fallback
-    return JSONResponse({"text": "⚠️ Unknown Slack action."})
+# (Optional: add your router for /slack-interactivity here if not in another file)
 
