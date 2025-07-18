@@ -1,11 +1,12 @@
 # slack_interactivity.py
+
 from fastapi import APIRouter, Request
 import os
 import json
 import logging
 from slack_sdk.web import WebClient
 from slack_sdk.signature import SignatureVerifier
-from main import send_reply_to_hostaway  # import from main
+from utils import send_reply_to_hostaway
 
 router = APIRouter()
 
@@ -14,7 +15,6 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 client = WebClient(token=SLACK_BOT_TOKEN)
 signature_verifier = SignatureVerifier(SLACK_SIGNING_SECRET)
 
-# Use a simple in-memory dict for demo, replace with Redis in prod!
 waiting_threads = {}
 
 @router.post("/slack/events")
@@ -165,4 +165,3 @@ async def slack_actions(request: Request):
 
     else:
         return {}
-
