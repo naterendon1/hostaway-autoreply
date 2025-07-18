@@ -1,203 +1,110 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Optional
+from fastapi import APIRouter, Request
 import os
-import requests
 import json
 import logging
-from slack_sdk.webhook import WebhookClient
-from openai import OpenAI
+from slack_sdk.web import WebClient
+from slack_sdk.signature import SignatureVerifier
 
-logging.basicConfig(level=logging.INFO)
+router = APIRouter()
 
-HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
-HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
-HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+client = WebClient(token=SLACK_BOT_TOKEN)
+signature_verifier = SignatureVerifier(SLACK_SIGNING_SECRET)
 
-if not HOSTAWAY_CLIENT_ID or not HOSTAWAY_CLIENT_SECRET:
-    logging.error("❌ Missing Hostaway credentials")
+# Track which threads are expecting a user message for a reply or edit
+# You should use a more persistent store (like Redis) for production
+waiting_threads = {}
 
-app = FastAPI()
-client = OpenAI(api_key=OPENAI_API_KEY)
+@router.post("/slack/events")
+async def slack_events(request: Request):
+    body = await request.body()
+    if not signature_verifier.is_valid_request(body, request.headers):
+        return {"status": "invalid signature"}
 
-class HostawayUnifiedWebhook(BaseModel):
-    object: str
-    event: str
-    accountId: int
-    data: dict
-    body: Optional[str] = None
-    listingName: Optional[str] = None
-    date: Optional[str] = None
+    payload = json.loads(body)
 
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
+    # Slack URL Verification (challenge)
+    if "challenge" in payload:
+        return payload
 
-@app.post("/unified-webhook")
-async def unified_webhook(payload: HostawayUnifiedWebhook):
-    logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
+    # Handle events
+    event = payload.get("event", {})
+    event_type = event.get("type")
 
-    if payload.event != "message.received" or payload.object != "conversationMessage":
-        return {"status": "ignored"}
+    # Only handle user messages (not bot messages, not message_changed, etc.)
+    if event_type == "message" and not event.get("bot_id"):
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        user_id = event.get("user")
+        text = event.get("text", "")
+        channel = event.get("channel")
 
-    guest_message = payload.data.get("body", "")
-    conversation_id = payload.data.get("conversationId")
-    communication_type = payload.data.get("communicationType", "channel")
-    reservation_id = payload.data.get("reservationId")
-    listing_map_id = payload.data.get("listingMapId")
+        # Only proceed if this thread was flagged as waiting for user input
+        if thread_ts in waiting_threads:
+            mode = waiting_threads.pop(thread_ts)
+            logging.info(f"Detected user message in thread {thread_ts}, mode: {mode}")
 
-    guest_name = "Guest"
-    check_in = "N/A"
-    check_out = "N/A"
-    guest_count = "N/A"
-    listing_name = "Unknown"
-    reservation_status = payload.data.get("status", "Unknown").capitalize()
-
-    if reservation_id:
-        res = fetch_hostaway_resource("reservations", reservation_id)
-        logging.info(f"📦 Reservation: {json.dumps(res, indent=2)}")
-        result = res.get("result", {}) if res else {}
-        guest_name = result.get("guestName", guest_name)
-        check_in = result.get("startDate", check_in)
-        check_out = result.get("endDate", check_out)
-        guest_count = result.get("numberOfGuests", guest_count)
-        if not listing_map_id:
-            listing_map_id = result.get("listingId")
-
-    if listing_map_id:
-        listing = fetch_hostaway_resource("listings", listing_map_id)
-        logging.info(f"📦 Listing: {json.dumps(listing, indent=2)}")
-        result = listing.get("result", {}) if listing else {}
-        listing_name = result.get("name", listing_name)
-
-    readable_communication = {
-        "channel": "Channel Message",
-        "email": "Email",
-        "sms": "SMS",
-        "whatsapp": "WhatsApp",
-        "airbnb": "Airbnb",
-    }.get(communication_type, communication_type.capitalize())
-
-    prompt = f"""You are a professional short-term rental manager. A guest sent this message:
-{guest_message}
-
-Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don't include a signoff."""
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
-                {"role": "user", "content": prompt}
+            # Reply under user's message with buttons
+            actions = [
+                {
+                    "name": "send",
+                    "text": "📨 Send",
+                    "type": "button",
+                    "value": json.dumps({"draft": text})
+                },
+                {
+                    "name": "improve",
+                    "text": "✏️ Improve with AI",
+                    "type": "button",
+                    "value": json.dumps({"draft": text})
+                }
             ]
-        )
-        ai_reply = response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"❌ OpenAI error: {e}")
-        ai_reply = "(Error generating reply.)"
+            blocks = [
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "📨 Send"},
+                            "value": json.dumps({"draft": text}),
+                            "action_id": "send"
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✏️ Improve with AI"},
+                            "value": json.dumps({"draft": text}),
+                            "action_id": "improve"
+                        }
+                    ]
+                }
+            ]
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=event.get("ts"),
+                text="Choose what to do with your draft reply:",
+                attachments=[{
+                    "callback_id": thread_ts,
+                    "color": "#3AA3E3",
+                    "attachment_type": "default",
+                    "actions": actions
+                }]
+            )
+        else:
+            logging.info("User message received in thread with no waiting state; ignoring.")
 
-    header = (
-        f"*New {readable_communication}* from *{guest_name}* at *{listing_name}*\n"
-        f"Dates: *{check_in} → {check_out}*\n"
-        f"Guests: *{guest_count}* | Status: *{reservation_status}*"
-    )
-
-    slack_message = {
-        "text": header + f"\n\n>{guest_message}\n\n*Suggested Reply:*\n>{ai_reply}",
-        "attachments": [
-            {
-                "callback_id": str(conversation_id),
-                "fallback": "Choose a response",
-                "color": "#3AA3E3",
-                "attachment_type": "default",
-                "actions": [
-                    {
-                        "name": "approve",
-                        "text": "✅ Approve",
-                        "type": "button",
-                        "value": json.dumps({"reply": ai_reply, "type": communication_type}),
-                        "style": "primary"
-                    },
-                    {
-                        "name": "edit",
-                        "text": "✏️ Edit",
-                        "type": "button",
-                        "value": json.dumps({"draft": ai_reply})
-                    },
-                    {
-                        "name": "write_own",
-                        "text": "📝 Write Your Own",
-                        "type": "button",
-                        "value": str(conversation_id)
-                    }
-                ]
-            }
-        ]
-    }
-
-    try:
-        webhook = WebhookClient(SLACK_WEBHOOK_URL)
-        webhook.send(**slack_message)
-        logging.info("✅ Slack message sent.")
-    except Exception as e:
-        logging.error(f"❌ Slack send error: {e}")
-
+    # Listen for "write_own" or "edit" button clicks and flag the thread as waiting
+    if payload.get("type") == "interactive_message":
+        actions = payload.get("actions", [])
+        if actions:
+            action = actions[0]
+            action_name = action.get("name")
+            thread_ts = payload.get("thread_ts") or payload.get("message_ts")
+            if action_name in ["write_own", "edit"]:
+                waiting_threads[thread_ts] = action_name
+                channel = payload.get("channel", {}).get("id")
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text="📝 Please type your reply as a message in this thread.\n\n(Once sent, buttons will appear below your message.)"
+                )
     return {"status": "ok"}
-
-def get_hostaway_access_token() -> Optional[str]:
-    url = f"{HOSTAWAY_API_BASE}/accessTokens"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": HOSTAWAY_CLIENT_ID,
-        "client_secret": HOSTAWAY_CLIENT_SECRET,
-        "scope": "general"
-    }
-    try:
-        r = requests.post(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-        r.raise_for_status()
-        return r.json().get("access_token")
-    except Exception as e:
-        logging.error(f"❌ Token error: {e}")
-        return None
-
-def fetch_hostaway_resource(resource: str, resource_id: int) -> Optional[dict]:
-    token = get_hostaway_access_token()
-    if not token:
-        return None
-    url = f"{HOSTAWAY_API_BASE}/{resource}/{resource_id}"
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logging.error(f"❌ Fetch {resource} error: {e}")
-        return None
-
-def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_type: str = "email") -> bool:
-    token = get_hostaway_access_token()
-    if not token:
-        return False
-    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
-    payload = {
-        "body": reply_text,
-        "isIncoming": 0,
-        "communicationType": communication_type
-    }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    try:
-        r = requests.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        logging.info(f"✅ Sent to Hostaway: {r.text}")
-        return True
-    except Exception as e:
-        logging.error(f"❌ Send error: {e}")
-        return False
-
-# (Optional: add your router for /slack-interactivity here if not in another file)
-
