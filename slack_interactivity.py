@@ -1,3 +1,5 @@
+# slack_interactivity.py
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import os
@@ -88,6 +90,7 @@ async def slack_events(request: Request):
                             "type": "button",
                             "text": {"type": "plain_text", "text": "✏️ Edit"},
                             "value": json.dumps({
+                                "draft": text,
                                 "thread_ts": thread_ts,
                                 "channel": channel,
                                 "conv_id": conv_id,
@@ -125,42 +128,109 @@ async def slack_actions(request: Request):
         logging.error(f"Could not parse action payload: {e}")
         return JSONResponse(status_code=400, content={"error": "Invalid action payload"})
 
-    user = payload.get("user", {}).get("id")
-    action = payload["actions"][0]
-    action_id = action.get("action_id")
-    value = json.loads(action["value"])
-    channel = payload.get("channel", {}).get("id")
+    # Modal or block action
+    action = payload["actions"][0] if "actions" in payload else None
+    action_id = action.get("action_id") if action else None
+    value = json.loads(action["value"]) if action else {}
+    channel = payload.get("channel", {}).get("id") or value.get("channel")
     thread_ts = value.get("thread_ts") or payload.get("message", {}).get("ts") or payload.get("container", {}).get("thread_ts")
 
+    # Modal trigger
+    trigger_id = payload.get("trigger_id")
+
+    # Import here to avoid circular import issues
     from openai import OpenAI
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-    if action_id in ["write_own", "edit"]:
+    # --- Modal for Edit ---
+    if action_id == "edit":
         draft = value.get("draft")
+        conv_id = value.get("conv_id")
+        comm_type = value.get("type", "channel")
+        # Open a modal for editing
+        modal_view = {
+            "type": "modal",
+            "callback_id": "edit_modal_submit",
+            "private_metadata": json.dumps({
+                "conv_id": conv_id,
+                "type": comm_type,
+                "channel": channel,
+                "thread_ts": thread_ts
+            }),
+            "title": {"type": "plain_text", "text": "Edit Reply"},
+            "submit": {"type": "plain_text", "text": "Send"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "edit_block",
+                    "label": {"type": "plain_text", "text": "Edit the reply below before sending:"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "edit_action",
+                        "multiline": True,
+                        "initial_value": draft or ""
+                    }
+                }
+            ]
+        }
+        try:
+            client.views_open(trigger_id=trigger_id, view=modal_view)
+            logging.info("Modal opened for editing.")
+        except Exception as e:
+            logging.error(f"Error opening modal: {e}")
+        return {}
+
+    # --- Modal submission handler ---
+    if payload.get("type") == "view_submission" and payload.get("view", {}).get("callback_id") == "edit_modal_submit":
+        view = payload["view"]
+        state = view["state"]["values"]
+        edit_block = state["edit_block"]["edit_action"]["value"]
+        metadata = json.loads(view["private_metadata"])
+        conv_id = metadata["conv_id"]
+        comm_type = metadata.get("type", "channel")
+        channel = metadata.get("channel")
+        thread_ts = metadata.get("thread_ts")
+
+        # Send reply to Hostaway
+        success = False
+        if conv_id:
+            success = send_reply_to_hostaway(conv_id, edit_block, comm_type)
+        else:
+            logging.error("No conv_id in modal submit for Hostaway.")
+        try:
+            # Post confirmation in Slack thread
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text="✅ Edited reply sent to Hostaway!" if success else "❌ Error sending reply to Hostaway."
+            )
+            logging.info("Modal submission: reply sent to Hostaway.")
+        except Exception as e:
+            logging.error(f"Error posting modal confirmation: {e}")
+        # Acknowledge modal submission (empty body)
+        return JSONResponse(content={})
+
+    # --- Write Own (same as before, no modal) ---
+    if action_id == "write_own":
         waiting_threads[thread_ts] = {
             "action_id": action_id,
             "conv_id": value.get("conv_id"),
             "type": value.get("type", "channel"),
         }
         try:
-            if draft:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=f"✏️ *Edit the reply below:* \n\n```\n{draft}\n```\n*Copy, edit, and send your updated reply as a message in this thread. Once you send, action buttons will appear below your message.*"
-                )
-            else:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text="📝 Please type your reply as a message in this thread.\n\n(Once sent, buttons will appear below your message.)"
-                )
-            logging.info(f"Prompted user to type (edit) reply in thread {thread_ts}")
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text="📝 Please type your reply as a message in this thread.\n\n(Once sent, buttons will appear below your message.)"
+            )
+            logging.info(f"Prompted user to type reply in thread {thread_ts}")
         except Exception as e:
-            logging.error(f"Error prompting user to edit reply: {e}")
+            logging.error(f"Error prompting user to type reply: {e}")
         return {}
 
+    # --- Send & Improve (same as before) ---
     elif action_id == "send":
         reply = value.get("reply") or value.get("draft")
         conv_id = value.get("conv_id")
@@ -218,6 +288,7 @@ async def slack_actions(request: Request):
                         "type": "button",
                         "text": {"type": "plain_text", "text": "✏️ Edit"},
                         "value": json.dumps({
+                            "draft": improved,
                             "thread_ts": thread_ts,
                             "channel": channel,
                             "conv_id": conv_id,
