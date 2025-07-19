@@ -21,7 +21,7 @@ app.include_router(slack_router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- NEW SYSTEM PROMPT ---
+# --- SYSTEM PROMPT, as before ---
 system_prompt = (
     "You are a highly knowledgeable, super-friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
     "You know these Texas towns and their attractions inside and out. "
@@ -71,6 +71,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_name = "Unknown"
     reservation_status = payload.data.get("status", "Unknown").capitalize()
 
+    # --- Fetch Hostaway reservation (for guest name, dates, etc) ---
     if reservation_id:
         res = fetch_hostaway_resource("reservations", reservation_id)
         result = res.get("result", {}) if res else {}
@@ -81,10 +82,31 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if not listing_map_id:
             listing_map_id = result.get("listingId")
 
+    # --- Fetch listing and build property info for AI prompt ---
+    property_info = ""
     if listing_map_id:
         listing = fetch_hostaway_resource("listings", listing_map_id)
         result = listing.get("result", {}) if listing else {}
         listing_name = result.get("name", listing_name)
+        address = result.get("address", "")
+        city = result.get("city", "")
+        zipcode = result.get("zip", "")
+        summary = result.get("summary", "")
+        # amenities may be a list, dict, or string. Adjust as needed.
+        amenities = result.get("amenities", "")
+        # Format amenities for AI (list or string)
+        if isinstance(amenities, list):
+            amenities_str = ", ".join(amenities)
+        elif isinstance(amenities, dict):
+            amenities_str = ", ".join([k for k, v in amenities.items() if v])
+        else:
+            amenities_str = str(amenities)
+
+        property_info = (
+            f"Property Address: {address}, {city} {zipcode}\n"
+            f"Summary: {summary}\n"
+            f"Amenities: {amenities_str}\n"
+        )
 
     readable_communication = {
         "channel": "Channel Message",
@@ -94,7 +116,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "airbnb": "Airbnb",
     }.get(communication_type, communication_type.capitalize())
 
-    prompt = f"A guest sent this message:\n{guest_message}\n\nRespond according to your latest rules and tone."
+    # --- Compose AI prompt with property info ---
+    prompt = (
+        f"A guest sent this message:\n{guest_message}\n\n"
+        f"Property info:\n{property_info}\n"
+        "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate."
+    )
 
     try:
         response = openai_client.chat.completions.create(
