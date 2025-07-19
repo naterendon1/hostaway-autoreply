@@ -1,5 +1,3 @@
-# main.py
-
 from fastapi import FastAPI
 from slack_interactivity import router as slack_router
 from pydantic import BaseModel
@@ -113,9 +111,10 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✏️ Improve with AI"},
-                    "value": json.dumps({"reply": ai_reply, "conv_id": conversation_id, "type": communication_type}),
-                    "action_id": "improve"
+                    "text": {"type": "plain_text", "text": "✏️ Edit"},
+                    # Pass AI reply so user can copy/paste/edit it
+                    "value": json.dumps({"draft": ai_reply, "conv_id": conversation_id, "type": communication_type}),
+                    "action_id": "edit"
                 },
                 {
                     "type": "button",
