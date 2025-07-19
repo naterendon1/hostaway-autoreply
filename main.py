@@ -112,8 +112,12 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "✏️ Edit"},
-                    # Pass AI reply so user can copy/paste/edit it
-                    "value": json.dumps({"draft": ai_reply, "conv_id": conversation_id, "type": communication_type}),
+                    "value": json.dumps({
+                        "draft": ai_reply,
+                        "conv_id": conversation_id,
+                        "type": communication_type,
+                        # Add thread_ts later for modals if needed
+                    }),
                     "action_id": "edit"
                 },
                 {
