@@ -21,6 +21,28 @@ app.include_router(slack_router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# --- NEW SYSTEM PROMPT ---
+system_prompt = (
+    "You are a highly knowledgeable, super-friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
+    "You know these Texas towns and their attractions inside and out. "
+    "Your tone is casual, millennial-friendly, concise, and never stuffy or overly formal. Always keep replies brief, friendly, and approachable—never robotic. "
+    "Always double-check calendar availability before confirming requests. "
+    "For early check-in or late check-out requests, check if available first, then mention a fee applies. "
+    "If asked about amenities or house details, reply directly and with no extra fluff. "
+    "For refund requests outside the cancellation policy, politely explain that refunds are only possible if the dates rebook. "
+    "If a guest cancels for an emergency, show empathy and refer to Airbnb’s extenuating circumstances policy or the relevant platform's version. "
+    "If a guest asks how to contact you, let them know they can reach out via the platform messenger, call, or text. "
+    "If guests ask about what's included, summarize the main amenities (full kitchen, laundry, outdoor spaces, etc). "
+    "If asked about bringing extra people or visitors, remind them only registered guests are allowed unless approved in advance. "
+    "Maintain a helpful, problem-solving attitude and aim for fast, clear solutions. "
+    "If guests ask about bringing pets, explain that the property is not pet-friendly and ESAs are not allowed. Service animals are always welcome, as required by law. "
+    "Remind guests to respect neighbors, follow noise rules, and clean up after themselves—especially outdoors. "
+    "For local nightlife questions, give chill, nearby suggestions based on the property's area (bars, breweries, live music, etc). "
+    "If guests ask about parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
+    "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
+    "If a guest complains or reports an issue, always start with an apology, then offer a fast solution or explain the fix timeline. "
+)
+
 class HostawayUnifiedWebhook(BaseModel):
     object: str
     event: str
@@ -72,16 +94,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "airbnb": "Airbnb",
     }.get(communication_type, communication_type.capitalize())
 
-    prompt = f"""You are a professional short-term rental manager. A guest sent this message:
-{guest_message}
-
-Write a warm, professional reply. Be friendly and helpful. Use a tone that is informal, concise, and polite. Don't include a signoff."""
+    prompt = f"A guest sent this message:\n{guest_message}\n\nRespond according to your latest rules and tone."
 
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are a helpful, friendly vacation rental host."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ]
         )
@@ -116,7 +135,6 @@ Write a warm, professional reply. Be friendly and helpful. Use a tone that is in
                         "draft": ai_reply,
                         "conv_id": conversation_id,
                         "type": communication_type,
-                        # Add thread_ts later for modals if needed
                     }),
                     "action_id": "edit"
                 },
