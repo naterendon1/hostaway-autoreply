@@ -21,7 +21,6 @@ app.include_router(slack_router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- SYSTEM PROMPT, as before ---
 system_prompt = (
     "You are a highly knowledgeable, super-friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
     "Use an informal tone. Start the message by greeting the guest in the same sentence as the rest of the text—don’t break it into a separate line. Don’t include any sign-off at the end. "
@@ -44,6 +43,7 @@ system_prompt = (
     "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
     "If a guest complains or reports an issue, always start with an apology, then offer a fast solution or explain the fix timeline. "
 )
+
 class HostawayUnifiedWebhook(BaseModel):
     object: str
     event: str
@@ -76,6 +76,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if reservation_id:
         res = fetch_hostaway_resource("reservations", reservation_id)
         result = res.get("result", {}) if res else {}
+        logging.info(f"Reservation data: {json.dumps(result, indent=2)}")  # <-- Added line
         guest_name = result.get("guestName", guest_name)
         check_in = result.get("startDate", check_in)
         check_out = result.get("endDate", check_out)
@@ -93,9 +94,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         city = result.get("city", "")
         zipcode = result.get("zip", "")
         summary = result.get("summary", "")
-        # amenities may be a list, dict, or string. Adjust as needed.
         amenities = result.get("amenities", "")
-        # Format amenities for AI (list or string)
         if isinstance(amenities, list):
             amenities_str = ", ".join(amenities)
         elif isinstance(amenities, dict):
@@ -117,7 +116,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "airbnb": "Airbnb",
     }.get(communication_type, communication_type.capitalize())
 
-    # --- Compose AI prompt with property info ---
     prompt = (
         f"A guest sent this message:\n{guest_message}\n\n"
         f"Property info:\n{property_info}\n"
