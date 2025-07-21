@@ -1,194 +1,183 @@
+# slack_interactivity.py
+
 from fastapi import APIRouter, Request
-import os
-import logging
+from fastapi.responses import JSONResponse
 import json
-from slack_sdk.web import WebClient
+import logging
+import os
+
 from utils import send_reply_to_hostaway, store_learning_example
 
-router = APIRouter()
+from slack_sdk.web import WebClient
+
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
+
+router = APIRouter()
 
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
     payload = await request.form()
-    payload = json.loads(payload["payload"])
+    data = json.loads(payload["payload"])
 
-    # All action payloads should contain channel and thread_ts (from button value or modal metadata)
-    payload_type = payload.get("type")
-    user_id = payload.get("user", {}).get("id")
-    team_id = payload.get("team", {}).get("id")
-    logging.info(f"Slack action payload: {json.dumps(payload, indent=2)}")
+    # Distinguish between block_actions and view_submission
+    action_type = data.get("type")
 
-    # --- Handle BUTTON CLICKS ---
-    if payload_type == "block_actions":
-        action = payload["actions"][0]
-        action_id = action.get("action_id")
-        value = json.loads(action.get("value", "{}"))
-        channel = payload["channel"]["id"]
-        thread_ts = payload.get("message", {}).get("ts")
-        guest_message = None
+    # --- Button Clicks ---
+    if action_type == "block_actions":
+        action = data["actions"][0]
+        action_id = action["action_id"]
 
-        # Try to get guest message for learning or context (if available)
-        for block in payload["message"].get("blocks", []):
-            if block.get("block_id", "").startswith("guest_msg") or "> " in block.get("text", {}).get("text", ""):
-                guest_message = block.get("text", {}).get("text", "").replace("> ", "")
+        # Extract channel and thread_ts if you want to use threads
+        channel_id = data.get("channel", {}).get("id")
+        thread_ts = data.get("message", {}).get("ts")
 
-        # --- SEND Button: send to Hostaway, confirm in Slack thread ---
         if action_id == "send":
-            reply = value["reply"]
-            conv_id = value.get("conv_id")
-            comm_type = value.get("type")
-            guest_id = value.get("guest_id")
-            listing_id = value.get("listing_id")
-            send_success = send_reply_to_hostaway(conv_id, reply, comm_type)
-            # You could also log this as a "learning" event here
-            if send_success:
-                slack_client.chat_postMessage(
-                    channel=channel,
-                    text=":white_check_mark: Reply sent to guest.",
-                    thread_ts=thread_ts
-                )
-            else:
-                slack_client.chat_postMessage(
-                    channel=channel,
-                    text=":x: Failed to send reply to guest.",
-                    thread_ts=thread_ts
-                )
-            return {"ok": True}
+            val = json.loads(action["value"])
+            reply = val["reply"]
+            conv_id = val["conv_id"]
+            comm_type = val.get("type", "email")
 
-        # --- EDIT Button: open a modal with the draft for editing ---
+            success = send_reply_to_hostaway(conv_id, reply, comm_type)
+            # Update Slack message with feedback
+            slack_client.chat_postMessage(
+                channel=channel_id,
+                text="✅ Reply sent to guest!",
+                thread_ts=thread_ts
+            )
+            return JSONResponse({"ok": True})
+
         elif action_id == "edit":
-            draft = value.get("draft", "")
-            conv_id = value.get("conv_id")
-            comm_type = value.get("type")
-            guest_id = value.get("guest_id")
-            listing_id = value.get("listing_id")
+            val = json.loads(action["value"])
+            draft = val["draft"]
+            conv_id = val["conv_id"]
+            comm_type = val.get("type", "email")
+            listing_id = val.get("listing_id")
+            guest_message = val.get("guest_message")
+            ai_suggestion = draft  # The suggestion is the draft here
+            guest_id = val.get("guest_id")
+
+            # Open a Slack modal for editing
             slack_client.views_open(
-                trigger_id=payload["trigger_id"],
+                trigger_id=data["trigger_id"],
                 view={
                     "type": "modal",
                     "callback_id": "edit_reply_modal",
+                    "private_metadata": json.dumps({
+                        "conv_id": conv_id,
+                        "listing_id": listing_id,
+                        "guest_message": guest_message,
+                        "ai_suggestion": ai_suggestion,
+                        "comm_type": comm_type,
+                        "guest_id": guest_id,
+                        "thread_ts": thread_ts
+                    }),
                     "title": {"type": "plain_text", "text": "Edit Reply"},
                     "submit": {"type": "plain_text", "text": "Send"},
                     "close": {"type": "plain_text", "text": "Cancel"},
-                    "private_metadata": json.dumps({
-                        "conv_id": conv_id,
-                        "type": comm_type,
-                        "channel": channel,
-                        "thread_ts": thread_ts,
-                        "guest_message": guest_message,
-                        "guest_id": guest_id,
-                        "listing_id": listing_id,
-                    }),
                     "blocks": [
                         {
                             "type": "input",
                             "block_id": "reply_input",
+                            "label": {"type": "plain_text", "text": "Your reply:"},
                             "element": {
                                 "type": "plain_text_input",
                                 "action_id": "reply",
                                 "initial_value": draft,
                                 "multiline": True
-                            },
-                            "label": {"type": "plain_text", "text": "Your reply:"}
+                            }
                         }
                     ]
                 }
             )
-            return {"ok": True}
+            return JSONResponse({"ok": True})
 
-        # --- WRITE OWN: open a blank modal for writing custom reply ---
         elif action_id == "write_own":
-            conv_id = value.get("conv_id")
-            comm_type = value.get("type")
-            guest_id = value.get("guest_id")
-            listing_id = value.get("listing_id")
+            val = json.loads(action["value"])
+            conv_id = val["conv_id"]
+            comm_type = val.get("type", "email")
+            listing_id = val.get("listing_id")
+            guest_message = val.get("guest_message")
+            ai_suggestion = val.get("ai_suggestion", "")
+            guest_id = val.get("guest_id")
+
+            # Open a Slack modal for writing your own reply
             slack_client.views_open(
-                trigger_id=payload["trigger_id"],
+                trigger_id=data["trigger_id"],
                 view={
                     "type": "modal",
                     "callback_id": "write_own_modal",
+                    "private_metadata": json.dumps({
+                        "conv_id": conv_id,
+                        "listing_id": listing_id,
+                        "guest_message": guest_message,
+                        "ai_suggestion": ai_suggestion,
+                        "comm_type": comm_type,
+                        "guest_id": guest_id,
+                        "thread_ts": thread_ts
+                    }),
                     "title": {"type": "plain_text", "text": "Write Your Own Reply"},
                     "submit": {"type": "plain_text", "text": "Send"},
                     "close": {"type": "plain_text", "text": "Cancel"},
-                    "private_metadata": json.dumps({
-                        "conv_id": conv_id,
-                        "type": comm_type,
-                        "channel": channel,
-                        "thread_ts": thread_ts,
-                        "guest_message": guest_message,
-                        "guest_id": guest_id,
-                        "listing_id": listing_id,
-                    }),
                     "blocks": [
                         {
                             "type": "input",
                             "block_id": "reply_input",
+                            "label": {"type": "plain_text", "text": "Your reply:"},
                             "element": {
                                 "type": "plain_text_input",
                                 "action_id": "reply",
+                                "initial_value": "",
                                 "multiline": True
-                            },
-                            "label": {"type": "plain_text", "text": "Your reply:"}
+                            }
                         }
                     ]
                 }
             )
-            return {"ok": True}
+            return JSONResponse({"ok": True})
 
-    # --- Handle MODAL SUBMISSIONS ---
-    elif payload_type == "view_submission":
-        view = payload["view"]
-        callback_id = view["callback_id"]
-        state_values = view["state"]["values"]
-        reply = ""
-        for block in state_values.values():
-            reply = block.get("reply", {}).get("value", "")
+    # --- Modal Submissions (Edit or Write Your Own) ---
+    elif action_type == "view_submission":
+        view = data["view"]
+        private_metadata = json.loads(view.get("private_metadata", "{}"))
+        user_reply = view["state"]["values"]["reply_input"]["reply"]["value"]
 
-        metadata = json.loads(view.get("private_metadata", "{}"))
-        conv_id = metadata.get("conv_id")
-        comm_type = metadata.get("type")
-        channel = metadata.get("channel")
-        thread_ts = metadata.get("thread_ts")
-        guest_message = metadata.get("guest_message")
-        guest_id = metadata.get("guest_id")
-        listing_id = metadata.get("listing_id")
+        conv_id = private_metadata.get("conv_id")
+        listing_id = private_metadata.get("listing_id")
+        guest_message = private_metadata.get("guest_message", "")
+        ai_suggestion = private_metadata.get("ai_suggestion", "")
+        comm_type = private_metadata.get("comm_type", "email")
+        guest_id = private_metadata.get("guest_id")
+        thread_ts = private_metadata.get("thread_ts")
+        channel_id = data.get("user", {}).get("id")  # Fallback, you might want to get actual channel elsewhere
 
-        # Send reply to Hostaway
-        send_success = send_reply_to_hostaway(conv_id, reply, comm_type)
+        # Send to Hostaway
+        send_reply_to_hostaway(conv_id, user_reply, comm_type)
 
-        # Learn from user's custom reply (write_own or edit)
-        store_learning_example(
-            guest_message=guest_message,
-            ai_suggestion=None,
-            user_reply=reply,
-            listing_id=listing_id,
-            guest_id=guest_id,
-        )
-
-        if send_success:
-            slack_client.chat_postMessage(
-                channel=channel,
-                text=":white_check_mark: Reply sent to guest.",
-                thread_ts=thread_ts
+        # Store for learning
+        try:
+            store_learning_example(
+                guest_message=guest_message,
+                ai_suggestion=ai_suggestion,
+                user_reply=user_reply,
+                listing_id=listing_id,
+                guest_id=guest_id
             )
-        else:
-            slack_client.chat_postMessage(
-                channel=channel,
-                text=":x: Failed to send reply to guest.",
-                thread_ts=thread_ts
-            )
-        return {"response_action": "clear"}  # Closes modal
+            logging.info("✅ Learning example stored")
+        except Exception as e:
+            logging.error(f"❌ Error storing learning example: {e}")
 
-    return {"ok": True}
+        # Optionally update Slack thread or send confirmation
+        if thread_ts and channel_id:
+            try:
+                slack_client.chat_postMessage(
+                    channel=channel_id,
+                    text="✅ Your reply was sent and saved for future learning!",
+                    thread_ts=thread_ts
+                )
+            except Exception as e:
+                logging.error(f"❌ Slack message update error: {e}")
 
-# --- Slack Events (noop or challenge handler) ---
-@router.post("/slack/events")
-async def slack_events(request: Request):
-    payload = await request.json()
-    # If this is a Slack URL verification (first time config), reply with the challenge
-    if payload.get("type") == "url_verification":
-        return {"challenge": payload.get("challenge")}
-    # Optionally process events here, or just return ok
-    return {"ok": True}
+        return JSONResponse({"response_action": "clear"})
+
+    return JSONResponse({"ok": True})
