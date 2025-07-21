@@ -5,8 +5,10 @@ import os
 import logging
 import json
 from openai import OpenAI
-from utils import fetch_hostaway_resource
-from db import init_db, save_custom_response, get_similar_response
+from utils import (
+    fetch_hostaway_resource,
+    retrieve_learned_answer,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -20,31 +22,30 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 app = FastAPI()
 app.include_router(slack_router)
 
-init_db()
-
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 system_prompt = (
-    "You are a highly knowledgeable, friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
-    "Use an informal, chill tone. Always greet the guest using their first name at the beginning of your reply, unless you are already in an active back-and-forth. "
-    "Never invent information. If you do not know the answer from the listing, house manual, or available info, say something like 'Let me get back to you on that!' "
-    "If the guest asks about restaurants or attractions, use the property address for context and suggest nearby options. "
-    "You know these Texas towns and their attractions inside and out, but don't make up specific house rules, amenities, or details you can't confirm. "
-    "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
-    "For early check-in or late check-out, check availability first, then mention a fee. "
-    "Answer amenity or house detail questions directly, with no fluff. "
-    "Refund requests outside the cancellation policy: explain refunds are only possible if the dates rebook. "
-    "If a guest cancels for an emergency, show empathy and refer to Airbnb’s or the platform's extenuating circumstances policy. "
-    "Contact instructions: guests can reach out via platform messenger, call, or text. "
-    "Summarize amenities if asked what's included. "
-    "For extra guests/visitors: only registered guests are allowed unless pre-approved. "
-    "Maintain a helpful, problem-solving, fast, clear attitude. "
-    "For pets: the property is not pet-friendly, ESAs are not allowed, but service animals are welcome by law. "
+    "You are a highly knowledgeable, super-friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
+    "Always use a laid-back greeting that includes the guest's first name, and never make the greeting loud or over-the-top. "
+    "If you receive an immediate message from the guest after sending one, skip the greeting and just answer. "
+    "You know these Texas towns and their attractions inside and out. "
+    "Your tone is casual, millennial-friendly, concise, and never stuffy or overly formal. Always keep replies brief, friendly, and approachable—never robotic. "
+    "If a guest is inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions as they are already booked. "
+    "For early check-in or late check-out requests, check if available first, then mention a fee applies. "
+    "If asked about amenities or house details, reply directly and with no extra fluff. "
+    "If you don't know the answer to a guest's question, reply that you need to check and will get back to them—never make up an answer. "
+    "For refund requests outside the cancellation policy, politely explain that refunds are only possible if the dates rebook. "
+    "If a guest cancels for an emergency, show empathy and refer to Airbnb’s extenuating circumstances policy or the relevant platform's version. "
+    "If a guest asks how to contact you, let them know they can reach out via the platform messenger, call, or text. "
+    "If guests ask about what's included, summarize the main amenities (full kitchen, laundry, outdoor spaces, etc). "
+    "If asked about bringing extra people or visitors, remind them only registered guests are allowed unless approved in advance. "
+    "Maintain a helpful, problem-solving attitude and aim for fast, clear solutions. "
+    "If guests ask about bringing pets, explain that the property is not pet-friendly and ESAs are not allowed. Service animals are always welcome, as required by law. "
     "Remind guests to respect neighbors, follow noise rules, and clean up after themselves—especially outdoors. "
-    "For local nightlife, give relaxed, nearby suggestions based on the address. "
-    "For parking: specify vehicles allowed and where to park (driveways, etc.). "
+    "For local nightlife questions, give chill, nearby suggestions based on the property's area (bars, breweries, live music, etc). "
+    "If guests ask about parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
     "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
-    "For complaints/issues, apologize first, then offer a fast solution or fix timeline. "
+    "If a guest complains or reports an issue, always start with an apology, then offer a fast solution or explain the fix timeline. "
 )
 
 class HostawayUnifiedWebhook(BaseModel):
@@ -70,19 +71,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     guest_name = "Guest"
     guest_first_name = "Guest"
+    guest_id = None
     check_in = "N/A"
     check_out = "N/A"
     guest_count = "N/A"
     listing_name = "Unknown"
     reservation_status = payload.data.get("status", "Unknown").capitalize()
 
-    # --- Fetch Hostaway reservation (for guest name, dates, etc) ---
+    # --- Fetch Hostaway reservation (for guest name, dates, guest id, etc) ---
     if reservation_id:
         res = fetch_hostaway_resource("reservations", reservation_id)
         result = res.get("result", {}) if res else {}
-        logging.info(f"Reservation data: {json.dumps(result, indent=2)}")
         guest_name = result.get("guestName", guest_name)
-        guest_first_name = result.get("guestFirstName", guest_first_name)
+        guest_first_name = result.get("guestFirstName", guest_name.split(" ")[0] if guest_name else "Guest")
+        guest_id = result.get("guestExternalAccountId") or result.get("guestEmail") or result.get("guestName")
         check_in = result.get("arrivalDate", check_in)
         check_out = result.get("departureDate", check_out)
         guest_count = result.get("numberOfGuests", guest_count)
@@ -91,19 +93,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # --- Fetch listing and build property info for AI prompt ---
     property_info = ""
-    address = city = zipcode = summary = amenities_str = ""
     house_manual = ""
     if listing_map_id:
         listing = fetch_hostaway_resource("listings", listing_map_id)
         result = listing.get("result", {}) if listing else {}
-        logging.info(f"Listing full data: {json.dumps(result, indent=2)}")
         listing_name = result.get("name", listing_name)
         address = result.get("address", "")
         city = result.get("city", "")
         zipcode = result.get("zip", "")
         summary = result.get("summary", "")
-        house_manual = result.get("houseManual", "")
         amenities = result.get("amenities", "")
+        house_manual = result.get("houseManual", "")
         if isinstance(amenities, list):
             amenities_str = ", ".join(amenities)
         elif isinstance(amenities, dict):
@@ -114,15 +114,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         property_info = (
             f"Property Address: {address}, {city} {zipcode}\n"
             f"Summary: {summary}\n"
-            f"House Manual: {house_manual}\n"
             f"Amenities: {amenities_str}\n"
+            f"House Manual: {house_manual[:500]}{'...' if len(house_manual) > 500 else ''}\n"  # Only send first 500 chars to avoid too long prompt
         )
-
-    # **NEW: Try to find a custom response**
-    custom_response = get_similar_response(listing_map_id, guest_message)
-    extra_custom = ""
-    if custom_response:
-        extra_custom = f"\n---\nPast answer for this listing to a similar guest question:\n{custom_response}"
 
     readable_communication = {
         "channel": "Channel Message",
@@ -131,30 +125,38 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "whatsapp": "WhatsApp",
         "airbnb": "Airbnb",
         "vrbo": "VRBO",
-        "bookingcom": "Booking.com",
     }.get(communication_type, communication_type.capitalize())
 
-    prompt = (
-        f"Guest first name: {guest_first_name}\n"
-        f"A guest sent this message:\n{guest_message}\n\n"
-        f"Property info:\n{property_info}\n"
-        f"{extra_custom}\n"
-        "If you do not know the answer to a question from the above info, DO NOT make up an answer. Instead, reply that you'll follow up with more info."
-        "If the guest asks about the local area, you can use the address above for context and suggest nearby restaurants, shops, or attractions."
-    )
+    # --- Try to retrieve a learned answer first ---
+    ai_reply = None
+    used_learning = False
+    learned = retrieve_learned_answer(guest_message, listing_map_id, guest_id)
+    if learned:
+        ai_reply = learned
+        used_learning = True
+        logging.info("[LEARNING] Used learned answer for guest_message: %s", guest_message)
 
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
+    # --- Compose AI prompt and call OpenAI if no learned answer ---
+    if not ai_reply:
+        prompt = (
+            f"A guest sent this message:\n{guest_message}\n\n"
+            f"Guest first name: {guest_first_name}\n"
+            f"Property info:\n{property_info}\n"
+            "Respond according to your latest rules and tone, and use property info or house manual to make answers detailed and specific if appropriate. "
+            "If you don't know the answer from the details provided, say you will check and get back to them. "
         )
-        ai_reply = response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"❌ OpenAI error: {e}")
-        ai_reply = "(Error generating reply.)"
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            ai_reply = response.choices[0].message.content.strip()
+        except Exception as e:
+            logging.error(f"❌ OpenAI error: {e}")
+            ai_reply = "(Error generating reply.)"
 
     header = (
         f"*New {readable_communication}* from *{guest_name}* at *{listing_name}*\n"
@@ -171,13 +173,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Send"},
+                    "text": {"type": "plain_text", "text": ":white_check_mark: Send", "emoji": True},
                     "value": json.dumps({"reply": ai_reply, "conv_id": conversation_id, "type": communication_type}),
                     "action_id": "send"
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✏️ Edit"},
+                    "text": {"type": "plain_text", "text": ":pencil2: Edit", "emoji": True},
                     "value": json.dumps({
                         "draft": ai_reply,
                         "conv_id": conversation_id,
@@ -187,7 +189,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "📝 Write Your Own"},
+                    "text": {"type": "plain_text", "text": ":memo: Write Your Own", "emoji": True},
                     "value": json.dumps({"conv_id": conversation_id, "type": communication_type}),
                     "action_id": "write_own"
                 }
