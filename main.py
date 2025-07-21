@@ -23,11 +23,14 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 system_prompt = (
     "You are a highly knowledgeable, super-friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
-    "Use an informal tone. Start the message by greeting the guest in the same sentence as the rest of the text—don’t break it into a separate line. Don’t include any sign-off at the end. "
-    "If you receive an immediate message from the guest after sending one, don't use the greeting. "
-    "You know these Texas towns and their attractions inside and out. "
-    "Your tone is casual, millennial-friendly, concise, and never stuffy or overly formal. Always keep replies brief, friendly, and approachable—never robotic. "
-    "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions as they are already booked. "
+    "Start each message with a relaxed, personal greeting using the guest’s first name, in the same sentence as your reply. "
+    "Never use loud or overly enthusiastic greetings like 'Hey!' or 'Hey there!'. "
+    "Instead, use softer, natural greetings like 'Hi [FirstName],', 'Hi [FirstName] –', or 'Hi [FirstName]! Thanks for reaching out –'. "
+    "Never use greetings like 'Hello guest' or just 'Hello', always personalize. "
+    "If you’ve already replied and this is a followup, you can skip the greeting. "
+    "Use an informal, millennial-friendly, concise, friendly and approachable tone. "
+    "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
+    "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions as they are already booked. "
     "For early check-in or late check-out requests, check if available first, then mention a fee applies. "
     "If asked about amenities or house details, reply directly and with no extra fluff. "
     "For refund requests outside the cancellation policy, politely explain that refunds are only possible if the dates rebook. "
@@ -61,12 +64,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     guest_message = payload.data.get("body", "")
     conversation_id = payload.data.get("conversationId")
-    communication_type = (payload.data.get("communicationType") or "").lower()
+    communication_type = payload.data.get("communicationType", "channel")
     reservation_id = payload.data.get("reservationId")
     listing_map_id = payload.data.get("listingMapId")
-    channel_name = (payload.data.get("channelName") or "").lower()
 
     guest_name = "Guest"
+    guest_first_name = "Guest"
     check_in = "N/A"
     check_out = "N/A"
     guest_count = "N/A"
@@ -79,6 +82,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         result = res.get("result", {}) if res else {}
         logging.info(f"Reservation data: {json.dumps(result, indent=2)}")
         guest_name = result.get("guestName", guest_name)
+        guest_first_name = guest_name.split()[0] if guest_name else "Guest"
         check_in = result.get("arrivalDate", check_in)
         check_out = result.get("departureDate", check_out)
         guest_count = result.get("numberOfGuests", guest_count)
@@ -109,27 +113,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             f"Amenities: {amenities_str}\n"
         )
 
-    # ---- CHANNEL FRIENDLY NAME LOGIC ----
-    channel_source_map = {
+    # --- Identify source/platform for the message ---
+    channel_name = payload.data.get("channelName", None)
+    readable_communication = {
+        "channel": "Channel Message",
+        "email": "Email",
+        "sms": "SMS",
+        "whatsapp": "WhatsApp",
         "airbnb": "Airbnb",
         "vrbo": "VRBO",
         "bookingcom": "Booking.com",
-        "expedia": "Expedia",
-        "direct": "Direct Booking",
-        # Add others as desired
-    }
-    friendly_source = None
-    if channel_name in channel_source_map:
-        friendly_source = channel_source_map[channel_name]
-    elif channel_name:
-        friendly_source = channel_name.capitalize()
-    elif communication_type in channel_source_map:
-        friendly_source = channel_source_map[communication_type]
-    else:
-        friendly_source = communication_type.capitalize() if communication_type else "Channel Message"
+        "bookingengine": "Direct Booking",
+    }.get(channel_name or communication_type, communication_type.capitalize())
 
     prompt = (
-        f"A guest sent this message:\n{guest_message}\n\n"
+        f"A guest named {guest_first_name} sent this message:\n{guest_message}\n\n"
         f"Property info:\n{property_info}\n"
         "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate."
     )
@@ -148,7 +146,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         ai_reply = "(Error generating reply.)"
 
     header = (
-        f"*New {friendly_source} Message* from *{guest_name}* at *{listing_name}*\n"
+        f"*New {readable_communication}* from *{guest_name}* at *{listing_name}*\n"
         f"Dates: *{check_in} → {check_out}*\n"
         f"Guests: *{guest_count}* | Status: *{reservation_status}*"
     )
