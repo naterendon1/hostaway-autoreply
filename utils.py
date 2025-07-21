@@ -3,10 +3,14 @@
 import os
 import requests
 import logging
+import sqlite3
+from datetime import datetime
 
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
+
+LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 
 def get_hostaway_access_token() -> str:
     url = f"{HOSTAWAY_API_BASE}/accessTokens"
@@ -59,3 +63,68 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_
     except Exception as e:
         logging.error(f"❌ Send error: {e}")
         return False
+
+# --- SQLite Learning Functions ---
+def _init_learning_db():
+    try:
+        conn = sqlite3.connect(LEARNING_DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS learning_examples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guest_message TEXT,
+                ai_suggestion TEXT,
+                user_reply TEXT,
+                listing_id TEXT,
+                guest_id TEXT,
+                created_at TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"❌ DB init error: {e}")
+
+def store_learning_example(guest_message, ai_suggestion, user_reply, listing_id, guest_id):
+    _init_learning_db()
+    try:
+        conn = sqlite3.connect(LEARNING_DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            '''INSERT INTO learning_examples (guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)''',
+            (
+                guest_message or "",
+                ai_suggestion or "",
+                user_reply or "",
+                str(listing_id) if listing_id else "",
+                str(guest_id) if guest_id else "",
+                datetime.utcnow().isoformat()
+            )
+        )
+        conn.commit()
+        conn.close()
+        logging.info("[LEARNING] Example saved to database.")
+    except Exception as e:
+        logging.error(f"❌ DB save error: {e}")
+
+def get_similar_learning_examples(guest_message, listing_id):
+    """ Retrieve previous replies for similar guest questions and listing. """
+    _init_learning_db()
+    try:
+        conn = sqlite3.connect(LEARNING_DB_PATH)
+        c = conn.cursor()
+        # This is a simple LIKE match. For real production, consider semantic search!
+        c.execute('''
+            SELECT guest_message, ai_suggestion, user_reply FROM learning_examples
+            WHERE listing_id = ? AND guest_message LIKE ?
+            ORDER BY created_at DESC
+            LIMIT 5
+        ''', (str(listing_id), f"%{guest_message[:10]}%"))
+        results = c.fetchall()
+        conn.close()
+        return results
+    except Exception as e:
+        logging.error(f"❌ DB fetch error: {e}")
+        return []
+
