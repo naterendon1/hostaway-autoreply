@@ -74,15 +74,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # --- Fetch Hostaway reservation (for guest name, dates, etc) ---
     if reservation_id:
-    res = fetch_hostaway_resource("reservations", reservation_id)
-    result = res.get("result", {}) if res else {}
-    logging.info(f"Reservation data: {json.dumps(result, indent=2)}")
-    guest_name = result.get("guestName", guest_name)
-    check_in = result.get("arrivalDate", check_in)
-    check_out = result.get("departureDate", check_out)
-    guest_count = result.get("numberOfGuests", guest_count)
-    if not listing_map_id:
-        listing_map_id = result.get("listingId")
+        res = fetch_hostaway_resource("reservations", reservation_id)
+        result = res.get("result", {}) if res else {}
+        logging.info(f"Reservation data: {json.dumps(result, indent=2)}")
+        guest_name = result.get("guestName", guest_name)
+        check_in = result.get("arrivalDate", check_in)
+        check_out = result.get("departureDate", check_out)
+        guest_count = result.get("numberOfGuests", guest_count)
+        if not listing_map_id:
+            listing_map_id = result.get("listingId")
 
     # --- Fetch listing and build property info for AI prompt ---
     property_info = ""
