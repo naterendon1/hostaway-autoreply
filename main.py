@@ -22,29 +22,26 @@ app.include_router(slack_router)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 system_prompt = (
-    "You are a highly knowledgeable, super-friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
-    "Start each message with a relaxed, personal greeting using the guest’s first name, in the same sentence as your reply. "
-    "Never use loud or overly enthusiastic greetings like 'Hey!' or 'Hey there!'. "
-    "Instead, use softer, natural greetings like 'Hi [FirstName],', 'Hi [FirstName] –', or 'Hi [FirstName]! Thanks for reaching out –'. "
-    "Never use greetings like 'Hello guest' or just 'Hello', always personalize. "
-    "If you’ve already replied and this is a followup, you can skip the greeting. "
-    "Use an informal, millennial-friendly, concise, friendly and approachable tone. "
+    "You are a highly knowledgeable, friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
+    "Use an informal, chill tone. Always greet the guest using their first name at the beginning of your reply, unless you are already in an active back-and-forth. "
+    "Never invent information. If you do not know the answer from the listing, house manual, or available info, say something like 'Let me get back to you on that!' "
+    "If the guest asks about restaurants or attractions, use the property address for context and suggest nearby options. "
+    "You know these Texas towns and their attractions inside and out, but don't make up specific house rules, amenities, or details you can't confirm. "
     "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
-    "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions as they are already booked. "
-    "For early check-in or late check-out requests, check if available first, then mention a fee applies. "
-    "If asked about amenities or house details, reply directly and with no extra fluff. "
-    "For refund requests outside the cancellation policy, politely explain that refunds are only possible if the dates rebook. "
-    "If a guest cancels for an emergency, show empathy and refer to Airbnb’s extenuating circumstances policy or the relevant platform's version. "
-    "If a guest asks how to contact you, let them know they can reach out via the platform messenger, call, or text. "
-    "If guests ask about what's included, summarize the main amenities (full kitchen, laundry, outdoor spaces, etc). "
-    "If asked about bringing extra people or visitors, remind them only registered guests are allowed unless approved in advance. "
-    "Maintain a helpful, problem-solving attitude and aim for fast, clear solutions. "
-    "If guests ask about bringing pets, explain that the property is not pet-friendly and ESAs are not allowed. Service animals are always welcome, as required by law. "
+    "For early check-in or late check-out, check availability first, then mention a fee. "
+    "Answer amenity or house detail questions directly, with no fluff. "
+    "Refund requests outside the cancellation policy: explain refunds are only possible if the dates rebook. "
+    "If a guest cancels for an emergency, show empathy and refer to Airbnb’s or the platform's extenuating circumstances policy. "
+    "Contact instructions: guests can reach out via platform messenger, call, or text. "
+    "Summarize amenities if asked what's included. "
+    "For extra guests/visitors: only registered guests are allowed unless pre-approved. "
+    "Maintain a helpful, problem-solving, fast, clear attitude. "
+    "For pets: the property is not pet-friendly, ESAs are not allowed, but service animals are welcome by law. "
     "Remind guests to respect neighbors, follow noise rules, and clean up after themselves—especially outdoors. "
-    "For local nightlife questions, give chill, nearby suggestions based on the property's area (bars, breweries, live music, etc). "
-    "If guests ask about parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
+    "For local nightlife, give relaxed, nearby suggestions based on the address. "
+    "For parking: specify vehicles allowed and where to park (driveways, etc.). "
     "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
-    "If a guest complains or reports an issue, always start with an apology, then offer a fast solution or explain the fix timeline. "
+    "For complaints/issues, apologize first, then offer a fast solution or fix timeline. "
 )
 
 class HostawayUnifiedWebhook(BaseModel):
@@ -82,7 +79,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         result = res.get("result", {}) if res else {}
         logging.info(f"Reservation data: {json.dumps(result, indent=2)}")
         guest_name = result.get("guestName", guest_name)
-        guest_first_name = guest_name.split()[0] if guest_name else "Guest"
+        guest_first_name = result.get("guestFirstName", guest_first_name)
         check_in = result.get("arrivalDate", check_in)
         check_out = result.get("departureDate", check_out)
         guest_count = result.get("numberOfGuests", guest_count)
@@ -91,14 +88,19 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # --- Fetch listing and build property info for AI prompt ---
     property_info = ""
+    address = city = zipcode = summary = amenities_str = ""
+    house_manual = ""
     if listing_map_id:
         listing = fetch_hostaway_resource("listings", listing_map_id)
         result = listing.get("result", {}) if listing else {}
+        logging.info(f"Listing full data: {json.dumps(result, indent=2)}")
         listing_name = result.get("name", listing_name)
         address = result.get("address", "")
         city = result.get("city", "")
         zipcode = result.get("zip", "")
         summary = result.get("summary", "")
+        # You may see the field as 'houseManual', 'manual', or similar; adjust if needed
+        house_manual = result.get("houseManual", "")
         amenities = result.get("amenities", "")
         if isinstance(amenities, list):
             amenities_str = ", ".join(amenities)
@@ -110,11 +112,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         property_info = (
             f"Property Address: {address}, {city} {zipcode}\n"
             f"Summary: {summary}\n"
+            f"House Manual: {house_manual}\n"
             f"Amenities: {amenities_str}\n"
         )
 
-    # --- Identify source/platform for the message ---
-    channel_name = payload.data.get("channelName", None)
     readable_communication = {
         "channel": "Channel Message",
         "email": "Email",
@@ -123,22 +124,25 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "airbnb": "Airbnb",
         "vrbo": "VRBO",
         "bookingcom": "Booking.com",
-        "bookingengine": "Direct Booking",
-    }.get(channel_name or communication_type, communication_type.capitalize())
+    }.get(communication_type, communication_type.capitalize())
 
     prompt = (
-        f"A guest named {guest_first_name} sent this message:\n{guest_message}\n\n"
+        f"Guest first name: {guest_first_name}\n"
+        f"A guest sent this message:\n{guest_message}\n\n"
         f"Property info:\n{property_info}\n"
-        "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate."
+        "If you do not know the answer to a question from the above info, DO NOT make up an answer. Instead, reply that you'll follow up with more info."
+        "If the guest asks about the local area, you can use the address above for context and suggest nearby restaurants, shops, or attractions."
     )
 
+    # Optionally enable web access (if using GPT-4o or GPT-4 Turbo with browsing); remove 'tools' if not supported
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4o",  # Use gpt-4o or gpt-4-turbo if you want web browsing
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            # tools=[{"type": "web_search"}],   # Enable if supported and you want web search (requires OpenAI platform w/ browsing)
         )
         ai_reply = response.choices[0].message.content.strip()
     except Exception as e:
