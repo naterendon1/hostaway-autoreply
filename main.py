@@ -6,6 +6,7 @@ import logging
 import json
 from openai import OpenAI
 from utils import fetch_hostaway_resource
+from db import init_db, save_custom_response, get_similar_response
 
 logging.basicConfig(level=logging.INFO)
 
@@ -18,6 +19,8 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 app = FastAPI()
 app.include_router(slack_router)
+
+init_db()
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -99,7 +102,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         city = result.get("city", "")
         zipcode = result.get("zip", "")
         summary = result.get("summary", "")
-        # You may see the field as 'houseManual', 'manual', or similar; adjust if needed
         house_manual = result.get("houseManual", "")
         amenities = result.get("amenities", "")
         if isinstance(amenities, list):
@@ -116,6 +118,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             f"Amenities: {amenities_str}\n"
         )
 
+    # **NEW: Try to find a custom response**
+    custom_response = get_similar_response(listing_map_id, guest_message)
+    extra_custom = ""
+    if custom_response:
+        extra_custom = f"\n---\nPast answer for this listing to a similar guest question:\n{custom_response}"
+
     readable_communication = {
         "channel": "Channel Message",
         "email": "Email",
@@ -130,19 +138,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         f"Guest first name: {guest_first_name}\n"
         f"A guest sent this message:\n{guest_message}\n\n"
         f"Property info:\n{property_info}\n"
+        f"{extra_custom}\n"
         "If you do not know the answer to a question from the above info, DO NOT make up an answer. Instead, reply that you'll follow up with more info."
         "If the guest asks about the local area, you can use the address above for context and suggest nearby restaurants, shops, or attractions."
     )
 
-    # Optionally enable web access (if using GPT-4o or GPT-4 Turbo with browsing); remove 'tools' if not supported
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o",  # Use gpt-4o or gpt-4-turbo if you want web browsing
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            # tools=[{"type": "web_search"}],   # Enable if supported and you want web search (requires OpenAI platform w/ browsing)
         )
         ai_reply = response.choices[0].message.content.strip()
     except Exception as e:
