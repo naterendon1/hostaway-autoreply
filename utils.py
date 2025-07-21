@@ -5,6 +5,7 @@ import requests
 import logging
 import sqlite3
 from datetime import datetime
+from difflib import get_close_matches
 
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
@@ -128,3 +129,36 @@ def get_similar_learning_examples(guest_message, listing_id):
         logging.error(f"❌ DB fetch error: {e}")
         return []
 
+def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8):
+    """
+    Look for a previously learned user_reply for similar guest questions and the same listing.
+    Returns the best match or None.
+    """
+    _init_learning_db()
+    try:
+        conn = sqlite3.connect(LEARNING_DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            SELECT guest_message, user_reply, guest_id
+            FROM learning_examples
+            WHERE listing_id = ?
+            ORDER BY created_at DESC
+        ''', (str(listing_id),))
+        rows = c.fetchall()
+        conn.close()
+        questions = [row[0] for row in rows]
+        # Simple fuzzy match with difflib
+        matches = get_close_matches(guest_message, questions, n=1, cutoff=cutoff)
+        if matches:
+            idx = questions.index(matches[0])
+            user_reply = rows[idx][1]
+            found_guest_id = rows[idx][2]
+            # Optionally prioritize same guest
+            if guest_id and found_guest_id == guest_id:
+                return user_reply
+            if not guest_id:
+                return user_reply
+        return None
+    except Exception as e:
+        logging.error(f"❌ Retrieval error: {e}")
+        return None
