@@ -1,332 +1,293 @@
 # slack_interactivity.py
 
 import os
-import json
 import logging
-from fastapi import APIRouter, Request, Response
-from slack_sdk.web import WebClient
-from utils import send_reply_to_hostaway, fetch_hostaway_resource
+import json
+from fastapi import APIRouter, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
+from utils import (
+    send_reply_to_hostaway,
+    fetch_hostaway_resource,
+    store_learning_example,
+    get_similar_learning_examples
+)
+from openai import OpenAI
 
-import sqlite3
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Database init (simple) ---
-DB_FILE = "learning_examples.db"
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS learning_examples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            question TEXT,
-            answer TEXT,
-            listing_id TEXT,
-            guest_id TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-init_db()
-
-def store_learning_example(question, answer, listing_id, guest_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO learning_examples (question, answer, listing_id, guest_id) VALUES (?, ?, ?, ?)",
-        (question, answer, listing_id, guest_id)
-    )
-    conn.commit()
-    conn.close()
-
-# --- Router ---
 router = APIRouter()
 
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
-slack_client = WebClient(token=SLACK_BOT_TOKEN)
+# Consistent system prompt!
+SYSTEM_PROMPT = (
+    "You are a highly knowledgeable, super-friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
+    "Greet the guest with their first name in a laid-back way—no loud or exaggerated greetings. Keep it casual, concise, and approachable. Never be formal. "
+    "Never guess if you don’t know the answer—say you’ll get back to them if you’re unsure. "
+    "For restaurant/local recs, use web search if possible and use the property address. "
+    "Reference the property details (address, summary, amenities, house manual, etc) for all answers if relevant. "
+    "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
+    "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions as they are already booked. "
+    "For early check-in or late check-out requests, check if available first, then mention a fee applies. "
+    "For refund requests outside the cancellation policy, politely explain that refunds are only possible if the dates rebook. "
+    "If a guest cancels for an emergency, show empathy and refer to Airbnb’s extenuating circumstances policy or the relevant platform's version. "
+    "For amenity/house details, answer directly with no extra fluff. "
+    "For parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
+    "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
+    "If you have a previously saved answer for this question and house, use that wording if appropriate. "
+    "Always be helpful and accurate."
+)
 
-# Helper to get values safely from Slack payloads
-def get_action_value(action, key, default=None):
-    try:
-        return json.loads(action.get("value", "{}")).get(key, default)
-    except Exception:
-        return default
+def get_property_info(listing_id):
+    """Fetch listing details, house manual, etc, for property context."""
+    property_info = ""
+    if not listing_id:
+        return property_info
+    listing = fetch_hostaway_resource("listings", listing_id)
+    result = listing.get("result", {}) if listing else {}
+    address = result.get("address", "")
+    city = result.get("city", "")
+    zipcode = result.get("zip", "")
+    summary = result.get("summary", "")
+    amenities = result.get("amenities", "")
+    house_manual = result.get("houseManual", "")
+    if isinstance(amenities, list):
+        amenities_str = ", ".join(amenities)
+    elif isinstance(amenities, dict):
+        amenities_str = ", ".join([k for k, v in amenities.items() if v])
+    else:
+        amenities_str = str(amenities)
+    property_info = (
+        f"Property Address: {address}, {city} {zipcode}\n"
+        f"Summary: {summary}\n"
+        f"Amenities: {amenities_str}\n"
+        f"House Manual: {house_manual[:800]}{'...' if len(house_manual) > 800 else ''}\n"
+    )
+    return property_info
 
 @router.post("/slack/actions")
-async def slack_actions(request: Request):
+async def slack_actions(request: Request, background_tasks: BackgroundTasks):
     payload = await request.form()
-    payload = json.loads(payload.get("payload", "{}"))
+    payload = json.loads(payload["payload"])
     logging.info(f"Slack action payload: {json.dumps(payload, indent=2)}")
+    response_url = payload.get("response_url")
+    user = payload.get("user", {})
+    guest_id = user.get("id") or ""
+    actions = payload.get("actions", [])
+    action = actions[0] if actions else {}
+    action_id = action.get("action_id")
+    value = action.get("value")
+    private_metadata = payload.get("view", {}).get("private_metadata", None)
 
-    # Modal submit (write your own / edit)
-    if payload.get("type") == "view_submission":
-        private_metadata = json.loads(payload["view"]["private_metadata"])
-        reply_text = payload["view"]["state"]["values"]["reply_input"]["reply"]["value"]
-        conv_id = private_metadata.get("conv_id")
-        listing_id = private_metadata.get("listing_id")
-        guest_message = private_metadata.get("guest_message")
-        guest_id = private_metadata.get("guest_id")
-        communication_type = private_metadata.get("type", "channel")
-        thread_ts = private_metadata.get("thread_ts")
+    # Unpack modal state if needed
+    def get_modal_state():
+        view = payload.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        reply_input = state.get("reply_input", {}).get("reply", {})
+        user_text = reply_input.get("value", "")
+        meta = json.loads(view.get("private_metadata", "{}"))
+        return user_text, meta
 
-        # Send to Hostaway
-        send_reply_to_hostaway(conv_id, reply_text, communication_type)
-        # Store as learning example
-        if guest_message:
-            store_learning_example(guest_message, reply_text, listing_id, guest_id)
-
-        # Post to Slack: Your Reply + Improve with AI + Edit
-        blocks = [
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Your Reply:*\n>{reply_text}"}
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✏️ Improve with AI"},
-                        "value": json.dumps({
-                            "reply": reply_text,
-                            "conv_id": conv_id,
-                            "type": communication_type,
-                            "listing_id": listing_id,
-                            "guest_id": guest_id,
-                            "thread_ts": thread_ts,
-                            "guest_message": guest_message,
-                        }),
-                        "action_id": "improve_with_ai"
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✏️ Edit"},
-                        "value": json.dumps({
-                            "draft": reply_text,
-                            "conv_id": conv_id,
-                            "type": communication_type,
-                            "listing_id": listing_id,
-                            "guest_id": guest_id,
-                            "thread_ts": thread_ts,
-                            "guest_message": guest_message,
-                        }),
-                        "action_id": "edit"
-                    }
-                ]
-            }
-        ]
-        slack_client.chat_postMessage(
-            channel=SLACK_CHANNEL,
-            thread_ts=thread_ts,
-            blocks=blocks,
-            text="Your custom reply"
-        )
-
-        # Respond to Slack (modal close)
-        return Response(status_code=200, content=json.dumps({
-            "response_action": "clear"
-        }), media_type="application/json")
-
-    # Interactive message actions
-    if payload.get("type") == "block_actions":
-        action = payload["actions"][0]
-        action_id = action.get("action_id")
-        value = json.loads(action.get("value", "{}"))
-        conv_id = value.get("conv_id")
-        reply = value.get("reply", "")
-        draft = value.get("draft", "")
-        communication_type = value.get("type", "channel")
-        listing_id = value.get("listing_id")
-        guest_id = value.get("guest_id")
-        guest_message = value.get("guest_message")
-        thread_ts = value.get("thread_ts")
-
-        # --- Improve with AI button ---
-        if action_id == "improve_with_ai":
-            # Fetch property info for AI context
-            prop_info = ""
-            if listing_id:
-                listing = fetch_hostaway_resource("listings", listing_id)
-                result = listing.get("result", {}) if listing else {}
-                address = result.get("address", "")
-                city = result.get("city", "")
-                zipcode = result.get("zip", "")
-                summary = result.get("summary", "")
-                amenities = result.get("amenities", "")
-                if isinstance(amenities, list):
-                    amenities_str = ", ".join(amenities)
-                elif isinstance(amenities, dict):
-                    amenities_str = ", ".join([k for k, v in amenities.items() if v])
-                else:
-                    amenities_str = str(amenities)
-                prop_info = (
-                    f"Address: {address}, {city} {zipcode}\n"
-                    f"Summary: {summary}\n"
-                    f"Amenities: {amenities_str}\n"
-                )
-
-            # System prompt (keep in sync with main.py!)
-            system_prompt = (
-                "You are a super-friendly, knowledgeable vacation rental host for homes in Texas. "
-                "Improve the draft reply below for clarity, tone, and accuracy. Make it informal and guest-focused, using the listing info. "
-                "Don't make up info. If you don't know, say you'll get back with an answer."
-            )
-
-            user_prompt = (
-                f"Guest's message:\n{guest_message}\n\n"
-                f"Property info:\n{prop_info}\n\n"
-                f"Draft reply:\n{reply}\n\n"
-                "Improve this reply for the guest."
-            )
-
-            # Call OpenAI
-            from openai import OpenAI
-            OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-            openai_client = OpenAI(api_key=OPENAI_API_KEY)
-            try:
-                ai_response = openai_client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ]
-                )
-                improved_reply = ai_response.choices[0].message.content.strip()
-            except Exception as e:
-                logging.error(f"OpenAI error: {e}")
-                improved_reply = "(Sorry, I couldn't improve the reply right now.)"
-
-            # Post improved reply with buttons (Send, Edit)
-            blocks = [
+    # --- WRITE YOUR OWN ---
+    if action_id == "write_own":
+        meta = json.loads(value)
+        conv_id = meta.get("conv_id")
+        listing_id = meta.get("listing_id", None)
+        guest_message = meta.get("guest_message", "")
+        type_ = meta.get("type")
+        # Open a modal to let user write their reply
+        modal = {
+            "type": "modal",
+            "callback_id": "write_own_modal",
+            "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
+            "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+            "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+            "private_metadata": json.dumps({
+                "conv_id": conv_id,
+                "listing_id": listing_id,
+                "guest_message": guest_message,
+                "type": type_,
+                "thread_ts": payload.get("message", {}).get("ts"),
+                "guest_id": guest_id
+            }),
+            "blocks": [
                 {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*AI Improved Reply:*\n>{improved_reply}"}
+                    "type": "input",
+                    "block_id": "reply_input",
+                    "label": {"type": "plain_text", "text": "Your reply:", "emoji": True},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "reply",
+                        "multiline": True
+                    }
                 },
                 {
                     "type": "actions",
+                    "block_id": "improve_ai_block",
                     "elements": [
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "✅ Send"},
-                            "value": json.dumps({
-                                "reply": improved_reply,
-                                "conv_id": conv_id,
-                                "type": communication_type,
-                                "listing_id": listing_id,
-                                "guest_id": guest_id,
-                                "thread_ts": thread_ts,
-                                "guest_message": guest_message,
-                            }),
-                            "action_id": "send"
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "✏️ Edit"},
-                            "value": json.dumps({
-                                "draft": improved_reply,
-                                "conv_id": conv_id,
-                                "type": communication_type,
-                                "listing_id": listing_id,
-                                "guest_id": guest_id,
-                                "thread_ts": thread_ts,
-                                "guest_message": guest_message,
-                            }),
-                            "action_id": "edit"
+                            "action_id": "improve_with_ai",
+                            "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
                         }
                     ]
                 }
             ]
-            slack_client.chat_postMessage(
-                channel=SLACK_CHANNEL,
-                thread_ts=thread_ts,
-                blocks=blocks,
-                text="AI improved reply"
-            )
-            return Response(status_code=200)
+        }
+        return JSONResponse({"response_action": "push", "view": modal})
 
-        # --- Edit button: open modal with text pre-filled ---
-        if action_id == "edit":
-            modal = {
+    # --- EDIT BUTTON ---
+    if action_id == "edit":
+        meta = json.loads(value)
+        conv_id = meta.get("conv_id")
+        listing_id = meta.get("listing_id", None)
+        guest_message = meta.get("guest_message", "")
+        draft = meta.get("draft", "")
+        type_ = meta.get("type")
+        modal = {
+            "type": "modal",
+            "callback_id": "edit_reply_modal",
+            "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
+            "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+            "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+            "private_metadata": json.dumps({
+                "conv_id": conv_id,
+                "listing_id": listing_id,
+                "guest_message": guest_message,
+                "type": type_,
+                "thread_ts": payload.get("message", {}).get("ts"),
+                "guest_id": guest_id
+            }),
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "reply_input",
+                    "label": {"type": "plain_text", "text": "Edit your reply:", "emoji": True},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "reply",
+                        "multiline": True,
+                        "initial_value": draft
+                    }
+                },
+                {
+                    "type": "actions",
+                    "block_id": "improve_ai_block",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "improve_with_ai",
+                            "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                        }
+                    ]
+                }
+            ]
+        }
+        return JSONResponse({"response_action": "push", "view": modal})
+
+    # --- VIEW SUBMISSION (WRITE OWN OR EDIT) ---
+    if payload.get("type") == "view_submission":
+        user_reply, meta = get_modal_state()
+        conv_id = meta.get("conv_id")
+        listing_id = meta.get("listing_id")
+        guest_message = meta.get("guest_message", "")
+        type_ = meta.get("type")
+        guest_id = meta.get("guest_id")
+        ai_suggestion = meta.get("ai_suggestion", "")
+        # Save to learning
+        store_learning_example(guest_message, ai_suggestion, user_reply, listing_id, guest_id)
+        # Send reply to Hostaway
+        send_ok = send_reply_to_hostaway(conv_id, user_reply, type_)
+        msg = ":white_check_mark: Your reply was sent and saved for future learning!" if send_ok else ":warning: Failed to send."
+        return JSONResponse({
+            "response_action": "clear",
+            "view": {
                 "type": "modal",
-                "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
-                "callback_id": "edit_modal",
-                "private_metadata": json.dumps({
-                    "conv_id": conv_id,
-                    "listing_id": listing_id,
-                    "guest_message": guest_message,
-                    "guest_id": guest_id,
-                    "type": communication_type,
-                    "thread_ts": thread_ts
-                }),
-                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "title": {"type": "plain_text", "text": "Done!", "emoji": True},
+                "close": {"type": "plain_text", "text": "Close", "emoji": True},
                 "blocks": [
                     {
-                        "type": "input",
-                        "block_id": "reply_input",
-                        "label": {"type": "plain_text", "text": "Edit your reply:", "emoji": True},
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "reply",
-                            "initial_value": draft,
-                            "multiline": True
-                        }
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": msg}
                     }
                 ]
             }
-            trigger_id = payload.get("trigger_id")
-            slack_client.views_open(trigger_id=trigger_id, view=modal)
-            return Response(status_code=200)
+        })
 
-        # --- Write Your Own button: open modal with empty ---
-        if action_id == "write_own":
-            modal = {
-                "type": "modal",
-                "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
-                "callback_id": "write_own_modal",
-                "private_metadata": json.dumps({
-                    "conv_id": conv_id,
-                    "listing_id": listing_id,
-                    "guest_message": guest_message,
-                    "guest_id": guest_id,
-                    "type": communication_type,
-                    "thread_ts": thread_ts
-                }),
-                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                "blocks": [
-                    {
-                        "type": "input",
-                        "block_id": "reply_input",
-                        "label": {"type": "plain_text", "text": "Your reply:", "emoji": True},
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "reply",
-                            "initial_value": "",
-                            "multiline": True
-                        }
-                    }
+    # --- IMPROVE WITH AI BUTTON ---
+    if action_id == "improve_with_ai":
+        # Grab the modal's state so far
+        view = payload.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        reply_block = state.get("reply_input", {})
+        edited_text = None
+        for v in reply_block.values():
+            edited_text = v.get("value")
+        meta = json.loads(view.get("private_metadata", "{}"))
+        guest_message = meta.get("guest_message", "")
+        listing_id = meta.get("listing_id", None)
+        guest_id = meta.get("guest_id", None)
+        ai_suggestion = meta.get("ai_suggestion", "")
+
+        # Retrieve property info for this listing
+        property_info = get_property_info(listing_id)
+
+        # Find previous similar learning examples for this house/question
+        similar_examples = get_similar_learning_examples(guest_message, listing_id)
+        prev_answer = ""
+        if similar_examples:
+            prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
+
+        # Compose prompt using the same method as /unified-webhook
+        prompt = (
+            f"{prev_answer}"
+            f"A guest sent this message:\n{guest_message}\n\n"
+            f"Property info:\n{property_info}\n"
+            "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
+            "If you don't know the answer from the details provided, say you will check and get back to them. "
+            f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
+            f"{edited_text}"
+        )
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
                 ]
-            }
-            trigger_id = payload.get("trigger_id")
-            slack_client.views_open(trigger_id=trigger_id, view=modal)
-            return Response(status_code=200)
-
-        # --- Send button: send reply to Hostaway & store learning example ---
-        if action_id == "send":
-            send_reply_to_hostaway(conv_id, reply, communication_type)
-            if guest_message:
-                store_learning_example(guest_message, reply, listing_id, guest_id)
-            # Confirmation ephemeral message
-            return Response(
-                status_code=200,
-                content=json.dumps({
-                    "response_type": "ephemeral",
-                    "text": ":white_check_mark: Your reply was sent and saved for future learning!"
-                }),
-                media_type="application/json"
             )
+            improved = response.choices[0].message.content.strip()
+        except Exception as e:
+            logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+            improved = "(Error generating improved reply.)"
 
-    # Default: just 200 OK
-    return Response(status_code=200)
+        # Return new modal with improved answer in the text box (replace input)
+        new_modal = view.copy()
+        # Overwrite the reply value in blocks for improved text
+        new_blocks = []
+        for block in new_modal["blocks"]:
+            if block["type"] == "input" and block["block_id"] == "reply_input":
+                block["element"]["initial_value"] = improved
+            new_blocks.append(block)
+        new_modal["blocks"] = new_blocks
 
+        return JSONResponse({"response_action": "update", "view": new_modal})
+
+    # --- SEND BUTTON (from main message, not modal) ---
+    if action_id == "send":
+        meta = json.loads(value)
+        conv_id = meta.get("conv_id")
+        reply = meta.get("reply")
+        type_ = meta.get("type")
+        listing_id = meta.get("listing_id", None)
+        guest_message = meta.get("guest_message", "")
+        guest_id = meta.get("guest_id", None)
+        ai_suggestion = reply
+        # Store as learning (AI suggestion, not user-modified)
+        store_learning_example(guest_message, ai_suggestion, reply, listing_id, guest_id)
+        send_ok = send_reply_to_hostaway(conv_id, reply, type_)
+        msg = ":white_check_mark: AI reply sent and saved!" if send_ok else ":warning: Failed to send."
+        # Optionally, update the Slack message here to show "Sent!"
+        return JSONResponse({"text": msg})
+
+    # Default: just acknowledge
+    return JSONResponse({"text": "Action received."})
