@@ -21,12 +21,14 @@ app.include_router(slack_router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# --- Updated SYSTEM PROMPT ---
 SYSTEM_PROMPT = (
     "You are a vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
     "Answer guest questions in a concise, informal, and polite way, always to-the-point. "
     "Never add extra information, suggestions, or local tips unless the guest asks for it. "
-    "Do not include fluff, chit-chat, or upsell. "
-    "Never use sign-offs like 'Best' or your name. Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
+    "Do not include fluff, chit-chat, upsell, or overly friendly phrases. "
+    "Never use sign-offs like 'Enjoy your meal', 'Enjoy your meals', 'Enjoy!', 'Best', or your name. Only use a simple closing like 'Let me know if you need anything else' or 'Let me know if you need more recommendations' if it’s natural for the situation, and leave it off entirely if the message already feels complete. "
+    "Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
     "Greet the guest casually using their first name if known, then answer their question immediately. "
     "If you don’t know the answer, say you’ll check and get back to them. "
     "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
@@ -40,6 +42,7 @@ SYSTEM_PROMPT = (
     "If you have a previously saved answer for this question and house, use that wording if appropriate. "
     "Always be helpful and accurate, but always brief."
 )
+
 class HostawayUnifiedWebhook(BaseModel):
     object: str
     event: str
@@ -75,6 +78,31 @@ def get_property_info(listing_id):
     )
     return property_info
 
+# --- AI Reply Cleaner ---
+def clean_ai_reply(reply: str) -> str:
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    # Remove unwanted sign-offs
+    for signoff in bad_signoffs:
+        if signoff in reply:
+            reply = reply.replace(signoff, "")
+    # Remove sign-off lines that start with common patterns
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # If line is just a sign-off, skip it
+        if any(stripped.startswith(s.replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        # Skip placeholder for your name
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+    reply = ' '.join(filtered_lines)
+    # Remove extra spaces, trailing commas, double spaces
+    return reply.strip().replace("  ", " ").rstrip(",. ")
+
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
@@ -86,7 +114,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     communication_type = payload.data.get("communicationType", "channel")
     reservation_id = payload.data.get("reservationId")
     listing_map_id = payload.data.get("listingMapId")
-    guest_id = payload.data.get("userId", "")  # If available
+    guest_id = payload.data.get("userId", "")
 
     guest_name = "Guest"
     guest_first_name = "Guest"
@@ -96,7 +124,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_name = "Unknown"
     reservation_status = payload.data.get("status", "Unknown").capitalize()
 
-    # --- Fetch Hostaway reservation (for guest name, dates, etc) ---
     if reservation_id:
         res = fetch_hostaway_resource("reservations", reservation_id)
         result = res.get("result", {}) if res else {}
@@ -110,13 +137,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if not guest_id:
             guest_id = result.get("guestId", "")
 
-    # --- Fetch listing and build property info for AI prompt ---
     property_info = get_property_info(listing_map_id)
     listing = fetch_hostaway_resource("listings", listing_map_id) if listing_map_id else {}
     listing_result = listing.get("result", {}) if listing else {}
     listing_name = listing_result.get("name", listing_name)
 
-    # --- Find similar past learning examples for this property and guest message
     similar_examples = get_similar_learning_examples(guest_message, listing_map_id)
     prev_answer = ""
     if similar_examples:
@@ -132,7 +157,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "bookingcom": "Booking.com",
     }.get(communication_type, communication_type.capitalize())
 
-    # --- Compose AI prompt with property info and learning example ---
     prompt = (
         f"{prev_answer}"
         f"A guest sent this message:\n{guest_message}\n\n"
@@ -149,6 +173,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             ]
         )
         ai_reply = response.choices[0].message.content.strip()
+        ai_reply = clean_ai_reply(ai_reply)
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
         ai_reply = "(Error generating reply.)"
@@ -159,7 +184,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         f"Guests: *{guest_count}* | Status: *{reservation_status}*"
     )
 
-    # --- Pass all needed context to the interactive buttons ---
     slack_button_payload = {
         "conv_id": conversation_id,
         "listing_id": listing_map_id,
