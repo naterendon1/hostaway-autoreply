@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import re
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
@@ -24,9 +25,10 @@ def clean_ai_reply(reply: str) -> str:
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
     ]
+    # Remove unwanted sign-offs
     for signoff in bad_signoffs:
-        if signoff in reply:
-            reply = reply.replace(signoff, "")
+        reply = reply.replace(signoff, "")
+    # Remove sign-off lines that start with common patterns
     lines = reply.split('\n')
     filtered_lines = []
     for line in lines:
@@ -37,7 +39,18 @@ def clean_ai_reply(reply: str) -> str:
             continue
         filtered_lines.append(line)
     reply = ' '.join(filtered_lines)
-    return reply.strip().replace("  ", " ").rstrip(",. ")
+    # Remove any address/city if not explicitly asked
+    # Replace phrases like "the house at 601 West 4th Street, Georgetown" with "the house"
+    address_patterns = [
+        r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
+        r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
+        r"at [\d]+ [\w .]+, [\w ]+"
+    ]
+    for pattern in address_patterns:
+        reply = re.sub(pattern, "the house", reply, flags=re.IGNORECASE)
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    return reply.rstrip(",. ")
 
 SYSTEM_PROMPT = (
     "You are a vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
@@ -47,6 +60,7 @@ SYSTEM_PROMPT = (
     "Never use sign-offs like 'Enjoy your meal', 'Enjoy your meals', 'Enjoy!', 'Best', or your name. Only use a simple closing like 'Let me know if you need anything else' or 'Let me know if you need more recommendations' if it’s natural for the situation, and leave it off entirely if the message already feels complete. "
     "Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
     "Greet the guest casually using their first name if known, then answer their question immediately. "
+    "Never include the property’s address, city, or zip in your answer unless the guest specifically asks for it. "
     "If you don’t know the answer, say you’ll check and get back to them. "
     "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
     "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions directly. "
