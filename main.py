@@ -6,6 +6,7 @@ import logging
 import json
 from openai import OpenAI
 from utils import fetch_hostaway_resource, get_similar_learning_examples
+import re
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,6 +31,7 @@ SYSTEM_PROMPT = (
     "Never use sign-offs like 'Enjoy your meal', 'Enjoy your meals', 'Enjoy!', 'Best', or your name. Only use a simple closing like 'Let me know if you need anything else' or 'Let me know if you need more recommendations' if it’s natural for the situation, and leave it off entirely if the message already feels complete. "
     "Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
     "Greet the guest casually using their first name if known, then answer their question immediately. "
+    "Never include the property’s address, city, or zip in your answer unless the guest specifically asks for it. "
     "If you don’t know the answer, say you’ll check and get back to them. "
     "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
     "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions directly. "
@@ -85,23 +87,31 @@ def clean_ai_reply(reply: str) -> str:
     ]
     # Remove unwanted sign-offs
     for signoff in bad_signoffs:
-        if signoff in reply:
-            reply = reply.replace(signoff, "")
+        reply = reply.replace(signoff, "")
     # Remove sign-off lines that start with common patterns
     lines = reply.split('\n')
     filtered_lines = []
     for line in lines:
         stripped = line.strip()
-        # If line is just a sign-off, skip it
         if any(stripped.startswith(s.replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
             continue
-        # Skip placeholder for your name
         if "[Your Name]" in stripped:
             continue
         filtered_lines.append(line)
     reply = ' '.join(filtered_lines)
-    # Remove extra spaces, trailing commas, double spaces
-    return reply.strip().replace("  ", " ").rstrip(",. ")
+    # Remove any address/city if not explicitly asked
+    # Replace phrases like "the house at 601 West 4th Street, Georgetown" with "the house"
+    address_patterns = [
+        r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
+        r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
+        r"at [\d]+ [\w .]+, [\w ]+"
+    ]
+    for pattern in address_patterns:
+        reply = re.sub(pattern, "the house", reply, flags=re.IGNORECASE)
+    # Final cleanup: remove extra spaces, trailing commas, double spaces
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    return reply.rstrip(",. ")
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
