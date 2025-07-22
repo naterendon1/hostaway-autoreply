@@ -18,23 +18,46 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 router = APIRouter()
 
-# Consistent system prompt!
+# --- Cleaner for AI replies (removes sign-offs, extra line breaks, etc) ---
+def clean_ai_reply(reply: str) -> str:
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    for signoff in bad_signoffs:
+        if signoff in reply:
+            reply = reply.replace(signoff, "")
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(s.replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+    reply = ' '.join(filtered_lines)
+    return reply.strip().replace("  ", " ").rstrip(",. ")
+
+# --- Updated SYSTEM PROMPT (strictly concise, casual, no sign-off) ---
 SYSTEM_PROMPT = (
-    "You are a highly knowledgeable, super-friendly vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
-    "Greet the guest with their first name in a laid-back way—no loud or exaggerated greetings. Keep it casual, concise, and approachable. Never be formal. "
-    "Never guess if you don’t know the answer—say you’ll get back to them if you’re unsure. "
-    "For restaurant/local recs, use web search if possible and use the property address. "
-    "Reference the property details (address, summary, amenities, house manual, etc) for all answers if relevant. "
+    "You are a vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
+    "Answer guest questions in a concise, informal, and polite way, always to-the-point. "
+    "Never add extra information, suggestions, or local tips unless the guest asks for it. "
+    "Do not include fluff, chit-chat, upsell, or overly friendly phrases. "
+    "Never use sign-offs like 'Enjoy your meal', 'Enjoy your meals', 'Enjoy!', 'Best', or your name. Only use a simple closing like 'Let me know if you need anything else' or 'Let me know if you need more recommendations' if it’s natural for the situation, and leave it off entirely if the message already feels complete. "
+    "Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
+    "Greet the guest casually using their first name if known, then answer their question immediately. "
+    "If you don’t know the answer, say you’ll check and get back to them. "
     "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
-    "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions as they are already booked. "
+    "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions directly. "
     "For early check-in or late check-out requests, check if available first, then mention a fee applies. "
     "For refund requests outside the cancellation policy, politely explain that refunds are only possible if the dates rebook. "
     "If a guest cancels for an emergency, show empathy and refer to Airbnb’s extenuating circumstances policy or the relevant platform's version. "
-    "For amenity/house details, answer directly with no extra fluff. "
+    "For amenity/house details, answer directly with no extra commentary. "
     "For parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
     "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
     "If you have a previously saved answer for this question and house, use that wording if appropriate. "
-    "Always be helpful and accurate."
+    "Always be helpful and accurate, but always brief."
 )
 
 def get_property_info(listing_id):
@@ -94,7 +117,6 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
         listing_id = meta.get("listing_id", None)
         guest_message = meta.get("guest_message", "")
         type_ = meta.get("type")
-        # Open a modal to let user write their reply
         modal = {
             "type": "modal",
             "callback_id": "write_own_modal",
@@ -166,7 +188,7 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
                         "type": "plain_text_input",
                         "action_id": "reply",
                         "multiline": True,
-                        "initial_value": draft
+                        "initial_value": clean_ai_reply(draft)
                     }
                 },
                 {
@@ -215,7 +237,6 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
 
     # --- IMPROVE WITH AI BUTTON ---
     if action_id == "improve_with_ai":
-        # Grab the modal's state so far
         view = payload.get("view", {})
         state = view.get("state", {}).get("values", {})
         reply_block = state.get("reply_input", {})
@@ -228,16 +249,12 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
         guest_id = meta.get("guest_id", None)
         ai_suggestion = meta.get("ai_suggestion", "")
 
-        # Retrieve property info for this listing
         property_info = get_property_info(listing_id)
-
-        # Find previous similar learning examples for this house/question
         similar_examples = get_similar_learning_examples(guest_message, listing_id)
         prev_answer = ""
         if similar_examples:
             prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
 
-        # Compose prompt using the same method as /unified-webhook
         prompt = (
             f"{prev_answer}"
             f"A guest sent this message:\n{guest_message}\n\n"
@@ -255,14 +272,12 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
                     {"role": "user", "content": prompt}
                 ]
             )
-            improved = response.choices[0].message.content.strip()
+            improved = clean_ai_reply(response.choices[0].message.content.strip())
         except Exception as e:
             logging.error(f"OpenAI error in 'improve_with_ai': {e}")
             improved = "(Error generating improved reply.)"
 
-        # Return new modal with improved answer in the text box (replace input)
         new_modal = view.copy()
-        # Overwrite the reply value in blocks for improved text
         new_blocks = []
         for block in new_modal["blocks"]:
             if block["type"] == "input" and block["block_id"] == "reply_input":
@@ -276,7 +291,7 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
     if action_id == "send":
         meta = json.loads(value)
         conv_id = meta.get("conv_id")
-        reply = meta.get("reply")
+        reply = clean_ai_reply(meta.get("reply", ""))
         type_ = meta.get("type")
         listing_id = meta.get("listing_id", None)
         guest_message = meta.get("guest_message", "")
@@ -286,7 +301,6 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
         store_learning_example(guest_message, ai_suggestion, reply, listing_id, guest_id)
         send_ok = send_reply_to_hostaway(conv_id, reply, type_)
         msg = ":white_check_mark: AI reply sent and saved!" if send_ok else ":warning: Failed to send."
-        # Optionally, update the Slack message here to show "Sent!"
         return JSONResponse({"text": msg})
 
     # Default: just acknowledge
