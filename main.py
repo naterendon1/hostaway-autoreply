@@ -6,7 +6,6 @@ import logging
 import json
 from openai import OpenAI
 from utils import fetch_hostaway_resource, get_similar_learning_examples
-import re
 
 logging.basicConfig(level=logging.INFO)
 
@@ -31,7 +30,6 @@ SYSTEM_PROMPT = (
     "Never use sign-offs like 'Enjoy your meal', 'Enjoy your meals', 'Enjoy!', 'Best', or your name. Only use a simple closing like 'Let me know if you need anything else' or 'Let me know if you need more recommendations' if it’s natural for the situation, and leave it off entirely if the message already feels complete. "
     "Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
     "Greet the guest casually using their first name if known, then answer their question immediately. "
-    "Never include the property’s address, city, or zip in your answer unless the guest specifically asks for it. "
     "If you don’t know the answer, say you’ll check and get back to them. "
     "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
     "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions directly. "
@@ -42,7 +40,8 @@ SYSTEM_PROMPT = (
     "For parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
     "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
     "If you have a previously saved answer for this question and house, use that wording if appropriate. "
-    "Always be helpful and accurate, but always brief."
+    "Always be helpful and accurate, but always brief. "
+    "Do NOT refer to the property by name or address, unless the guest uses them first. Refer to it by property type, like 'house', 'condo', or 'home'. If type is unknown, use 'home'."
 )
 
 class HostawayUnifiedWebhook(BaseModel):
@@ -56,8 +55,9 @@ class HostawayUnifiedWebhook(BaseModel):
 
 def get_property_info(listing_id):
     property_info = ""
+    property_type = "home"
     if not listing_id:
-        return property_info
+        return property_info, property_type
     listing = fetch_hostaway_resource("listings", listing_id)
     result = listing.get("result", {}) if listing else {}
     address = result.get("address", "")
@@ -66,6 +66,19 @@ def get_property_info(listing_id):
     summary = result.get("summary", "")
     amenities = result.get("amenities", "")
     house_manual = result.get("houseManual", "")
+
+    # Property type (avoid using name in AI reply)
+    property_type = (
+        result.get("type") or
+        result.get("propertyType") or
+        result.get("property_type") or
+        result.get("roomType") or
+        "home"
+    )
+    if isinstance(property_type, dict):
+        property_type = property_type.get("name", "home")
+    property_type = str(property_type).lower()
+
     if isinstance(amenities, list):
         amenities_str = ", ".join(amenities)
     elif isinstance(amenities, dict):
@@ -73,12 +86,11 @@ def get_property_info(listing_id):
     else:
         amenities_str = str(amenities)
     property_info = (
-        f"Property Address: {address}, {city} {zipcode}\n"
         f"Summary: {summary}\n"
         f"Amenities: {amenities_str}\n"
         f"House Manual: {house_manual[:800]}{'...' if len(house_manual) > 800 else ''}\n"
     )
-    return property_info
+    return property_info, property_type
 
 # --- AI Reply Cleaner ---
 def clean_ai_reply(reply: str) -> str:
@@ -87,31 +99,23 @@ def clean_ai_reply(reply: str) -> str:
     ]
     # Remove unwanted sign-offs
     for signoff in bad_signoffs:
-        reply = reply.replace(signoff, "")
+        if signoff in reply:
+            reply = reply.replace(signoff, "")
     # Remove sign-off lines that start with common patterns
     lines = reply.split('\n')
     filtered_lines = []
     for line in lines:
         stripped = line.strip()
+        # If line is just a sign-off, skip it
         if any(stripped.startswith(s.replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
             continue
+        # Skip placeholder for your name
         if "[Your Name]" in stripped:
             continue
         filtered_lines.append(line)
     reply = ' '.join(filtered_lines)
-    # Remove any address/city if not explicitly asked
-    # Replace phrases like "the house at 601 West 4th Street, Georgetown" with "the house"
-    address_patterns = [
-        r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
-        r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
-        r"at [\d]+ [\w .]+, [\w ]+"
-    ]
-    for pattern in address_patterns:
-        reply = re.sub(pattern, "the house", reply, flags=re.IGNORECASE)
-    # Final cleanup: remove extra spaces, trailing commas, double spaces
-    reply = ' '.join(reply.split())
-    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
-    return reply.rstrip(",. ")
+    # Remove extra spaces, trailing commas, double spaces
+    return reply.strip().replace("  ", " ").rstrip(",. ")
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -147,15 +151,16 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if not guest_id:
             guest_id = result.get("guestId", "")
 
-    property_info = get_property_info(listing_map_id)
+    property_info, property_type = get_property_info(listing_map_id)
     listing = fetch_hostaway_resource("listings", listing_map_id) if listing_map_id else {}
     listing_result = listing.get("result", {}) if listing else {}
+    # Property name is not used in reply, but used in Slack header
     listing_name = listing_result.get("name", listing_name)
 
     similar_examples = get_similar_learning_examples(guest_message, listing_map_id)
     prev_answer = ""
     if similar_examples:
-        prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
+        prev_answer = f"Previously, you (the host) replied to a similar guest question about this {property_type}: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
 
     readable_communication = {
         "channel": "Channel Message",
@@ -170,8 +175,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     prompt = (
         f"{prev_answer}"
         f"A guest sent this message:\n{guest_message}\n\n"
-        f"Property info:\n{property_info}\n"
-        "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate."
+        f"Details:\n"
+        f"Property type: {property_type}\n"
+        f"Dates: {check_in} to {check_out}\n"
+        f"Guests: {guest_count}\n"
+        f"Reservation status: {reservation_status}\n"
+        f"{property_info}\n"
+        "Do NOT use the property name or address unless the guest uses it. Refer to it by property type (house, condo, etc.). "
+        "Do NOT ask for information that's already provided. Reply concisely, informally, and helpfully, all in one line if possible."
     )
 
     try:
