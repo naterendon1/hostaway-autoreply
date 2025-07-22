@@ -21,14 +21,24 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-def clean_ai_reply(reply: str) -> str:
+def get_property_type(listing_result):
+    prop_type = (listing_result.get("type") or "").lower()
+    name = (listing_result.get("name") or "").lower()
+    # Add/adjust types here as needed
+    for t in ["house", "cabin", "condo", "apartment", "villa", "bungalow", "cottage", "suite"]:
+        if t in prop_type:
+            return t
+        if t in name:
+            return t
+    return "home"
+
+def clean_ai_reply(reply: str, property_type="home"):
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
     ]
     # Remove unwanted sign-offs
     for signoff in bad_signoffs:
         reply = reply.replace(signoff, "")
-    # Remove sign-off lines that start with common patterns
     lines = reply.split('\n')
     filtered_lines = []
     for line in lines:
@@ -39,15 +49,17 @@ def clean_ai_reply(reply: str) -> str:
             continue
         filtered_lines.append(line)
     reply = ' '.join(filtered_lines)
-    # Remove any address/city if not explicitly asked
-    # Replace phrases like "the house at 601 West 4th Street, Georgetown" with "the house"
+    # Remove address/city (unless guest asked for it)
     address_patterns = [
         r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
         r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
         r"at [\d]+ [\w .]+, [\w ]+"
     ]
     for pattern in address_patterns:
-        reply = re.sub(pattern, "the house", reply, flags=re.IGNORECASE)
+        reply = re.sub(pattern, f"the {property_type}", reply, flags=re.IGNORECASE)
+    # Remove property name references like "at Cozy 2BR..." or "at Remodeled 4BR/2BA"
+    reply = re.sub(r"at [A-Za-z0-9 ,/\-\(\)\']+", f"at the {property_type}", reply, flags=re.IGNORECASE)
+    # Remove leading/trailing or double spaces, trailing commas/periods
     reply = ' '.join(reply.split())
     reply = reply.strip().replace(" ,", ",").replace(" .", ".")
     return reply.rstrip(",. ")
@@ -60,7 +72,7 @@ SYSTEM_PROMPT = (
     "Never use sign-offs like 'Enjoy your meal', 'Enjoy your meals', 'Enjoy!', 'Best', or your name. Only use a simple closing like 'Let me know if you need anything else' or 'Let me know if you need more recommendations' if it’s natural for the situation, and leave it off entirely if the message already feels complete. "
     "Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
     "Greet the guest casually using their first name if known, then answer their question immediately. "
-    "Never include the property’s address, city, or zip in your answer unless the guest specifically asks for it. "
+    "Never include the property’s address, city, zip, or property name in your answer unless the guest specifically asks for it. Instead, refer to it as 'the house', 'the condo', or the appropriate property type. "
     "If you don’t know the answer, say you’ll check and get back to them. "
     "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
     "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions directly. "
@@ -77,7 +89,7 @@ SYSTEM_PROMPT = (
 def get_property_info(listing_id):
     property_info = ""
     if not listing_id:
-        return property_info
+        return property_info, {}
     listing = fetch_hostaway_resource("listings", listing_id)
     result = listing.get("result", {}) if listing else {}
     address = result.get("address", "")
@@ -98,7 +110,7 @@ def get_property_info(listing_id):
         f"Amenities: {amenities_str}\n"
         f"House Manual: {house_manual[:800]}{'...' if len(house_manual) > 800 else ''}\n"
     )
-    return property_info
+    return property_info, result
 
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
@@ -120,6 +132,9 @@ async def slack_actions(request: Request):
 
         if action_id == "write_own":
             meta = get_meta_from_action(action)
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = get_property_info(listing_id)
+            property_type = get_property_type(listing_result)
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
@@ -155,7 +170,10 @@ async def slack_actions(request: Request):
 
         if action_id == "edit":
             meta = get_meta_from_action(action)
-            draft = clean_ai_reply(meta.get("draft", ""))
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = get_property_info(listing_id)
+            property_type = get_property_type(listing_result)
+            draft = clean_ai_reply(meta.get("draft", ""), property_type)
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
@@ -203,89 +221,13 @@ async def slack_actions(request: Request):
             guest_id = meta.get("guest_id", None)
             ai_suggestion = meta.get("ai_suggestion", "")
 
-            property_info = get_property_info(listing_id)
+            property_info, listing_result = get_property_info(listing_id)
+            property_type = get_property_type(listing_result)
             similar_examples = get_similar_learning_examples(guest_message, listing_id)
             prev_answer = ""
             if similar_examples:
                 prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
 
-            prompt = (
-                f"{prev_answer}"
-                f"A guest sent this message:\n{guest_message}\n\n"
-                f"Property info:\n{property_info}\n"
-                "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
-                "If you don't know the answer from the details provided, say you will check and get back to them. "
-                f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
-                f"{edited_text}"
-            )
-            try:
-                response = openai_client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                improved = clean_ai_reply(response.choices[0].message.content.strip())
-            except Exception as e:
-                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
-                improved = "(Error generating improved reply.)"
-
-            new_modal = view.copy()
-            new_blocks = []
-            for block in new_modal["blocks"]:
-                if block["type"] == "input" and block["block_id"] == "reply_input":
-                    block["element"]["initial_value"] = improved
-                new_blocks.append(block)
-            new_modal["blocks"] = new_blocks
-
-            return JSONResponse({"response_action": "update", "view": new_modal})
-
-        if action_id == "send":
-            meta = get_meta_from_action(action)
-            conv_id = meta.get("conv_id")
-            reply = clean_ai_reply(meta.get("reply", ""))
-            type_ = meta.get("type")
-            listing_id = meta.get("listing_id", None)
-            guest_message = meta.get("guest_message", "")
-            guest_id = meta.get("guest_id", None)
-            ai_suggestion = reply
-            store_learning_example(guest_message, ai_suggestion, reply, listing_id, guest_id)
-            send_ok = send_reply_to_hostaway(conv_id, reply, type_)
-            msg = ":white_check_mark: AI reply sent and saved!" if send_ok else ":warning: Failed to send."
-            return JSONResponse({"text": msg})
-
-        return JSONResponse({"text": "Action received."})
-
-    # --- Handle view_submission (modal submission) ---
-    if payload.get("type") == "view_submission":
-        view = payload.get("view", {})
-        state = view.get("state", {}).get("values", {})
-        reply_block = state.get("reply_input", {})
-        user_text = None
-        for v in reply_block.values():
-            user_text = v.get("value")
-        meta = json.loads(view.get("private_metadata", "{}"))
-        conv_id = meta.get("conv_id")
-        listing_id = meta.get("listing_id")
-        guest_message = meta.get("guest_message", "")
-        type_ = meta.get("type")
-        guest_id = meta.get("guest_id")
-        ai_suggestion = meta.get("ai_suggestion", "")
-
-        clean_reply = clean_ai_reply(user_text)
-        store_learning_example(guest_message, ai_suggestion, clean_reply, listing_id, guest_id)
-        send_ok = send_reply_to_hostaway(conv_id, clean_reply, type_)
-        msg = ":white_check_mark: Your reply was sent and saved for future learning!" if send_ok else ":warning: Failed to send."
-        done_modal = {
-            "type": "modal",
-            "title": {"type": "plain_text", "text": "Done!", "emoji": True},
-            "close": {"type": "plain_text", "text": "Close", "emoji": True},
-            "blocks": [
-                {"type": "section", "text": {"type": "mrkdwn", "text": msg}}
-            ]
-        }
-        return JSONResponse({"response_action": "update", "view": done_modal})
-
-    # Fallback for unknown interactivity types
-    return JSONResponse({"text": "Action received."})
+            # Pass all info available (from message payload if needed)
+            extra_meta = "\n".join([f"{k}: {v}" for k, v in meta.items() if k not in [
+                "guest
