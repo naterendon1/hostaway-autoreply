@@ -24,7 +24,6 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 def get_property_type(listing_result):
     prop_type = (listing_result.get("type") or "").lower()
     name = (listing_result.get("name") or "").lower()
-    # Add/adjust types here as needed
     for t in ["house", "cabin", "condo", "apartment", "villa", "bungalow", "cottage", "suite"]:
         if t in prop_type:
             return t
@@ -36,7 +35,6 @@ def clean_ai_reply(reply: str, property_type="home"):
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
     ]
-    # Remove unwanted sign-offs
     for signoff in bad_signoffs:
         reply = reply.replace(signoff, "")
     lines = reply.split('\n')
@@ -49,7 +47,6 @@ def clean_ai_reply(reply: str, property_type="home"):
             continue
         filtered_lines.append(line)
     reply = ' '.join(filtered_lines)
-    # Remove address/city (unless guest asked for it)
     address_patterns = [
         r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
         r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
@@ -57,9 +54,7 @@ def clean_ai_reply(reply: str, property_type="home"):
     ]
     for pattern in address_patterns:
         reply = re.sub(pattern, f"the {property_type}", reply, flags=re.IGNORECASE)
-    # Remove property name references like "at Cozy 2BR..." or "at Remodeled 4BR/2BA"
     reply = re.sub(r"at [A-Za-z0-9 ,/\-\(\)\']+", f"at the {property_type}", reply, flags=re.IGNORECASE)
-    # Remove leading/trailing or double spaces, trailing commas/periods
     reply = ' '.join(reply.split())
     reply = reply.strip().replace(" ,", ",").replace(" .", ".")
     return reply.rstrip(",. ")
@@ -118,7 +113,6 @@ async def slack_actions(request: Request):
     payload = json.loads(form.get("payload"))
     logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
-    # --- Handle block_actions (button clicks) ---
     if payload.get("type") == "block_actions":
         action = payload["actions"][0]
         action_id = action.get("action_id")
@@ -228,6 +222,90 @@ async def slack_actions(request: Request):
             if similar_examples:
                 prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
 
-            # Pass all info available (from message payload if needed)
-            extra_meta = "\n".join([f"{k}: {v}" for k, v in meta.items() if k not in [
-                "guest
+            meta_lines = "\n".join([f"{k}: {v}" for k, v in meta.items() if k not in [
+                "guest_message", "listing_id", "ai_suggestion", "draft", "reply", "conv_id"
+            ]])
+
+            prompt = (
+                f"{prev_answer}"
+                f"A guest sent this message:\n{guest_message}\n\n"
+                f"Other data:\n{meta_lines}\n"
+                f"Property info:\n{property_info}\n"
+                "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
+                "If you don't know the answer from the details provided, say you will check and get back to them. "
+                f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
+                f"{edited_text}"
+            )
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                improved = clean_ai_reply(response.choices[0].message.content.strip(), property_type)
+            except Exception as e:
+                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+                improved = "(Error generating improved reply.)"
+
+            new_modal = view.copy()
+            new_blocks = []
+            for block in new_modal["blocks"]:
+                if block["type"] == "input" and block["block_id"] == "reply_input":
+                    block["element"]["initial_value"] = improved
+                new_blocks.append(block)
+            new_modal["blocks"] = new_blocks
+
+            return JSONResponse({"response_action": "update", "view": new_modal})
+
+        if action_id == "send":
+            meta = get_meta_from_action(action)
+            conv_id = meta.get("conv_id")
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = get_property_info(listing_id)
+            property_type = get_property_type(listing_result)
+            reply = clean_ai_reply(meta.get("reply", ""), property_type)
+            type_ = meta.get("type")
+            guest_message = meta.get("guest_message", "")
+            guest_id = meta.get("guest_id", None)
+            ai_suggestion = reply
+            store_learning_example(guest_message, ai_suggestion, reply, listing_id, guest_id)
+            send_ok = send_reply_to_hostaway(conv_id, reply, type_)
+            msg = ":white_check_mark: AI reply sent and saved!" if send_ok else ":warning: Failed to send."
+            return JSONResponse({"text": msg})
+
+        return JSONResponse({"text": "Action received."})
+
+    if payload.get("type") == "view_submission":
+        view = payload.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        reply_block = state.get("reply_input", {})
+        user_text = None
+        for v in reply_block.values():
+            user_text = v.get("value")
+        meta = json.loads(view.get("private_metadata", "{}"))
+        conv_id = meta.get("conv_id")
+        listing_id = meta.get("listing_id")
+        _, listing_result = get_property_info(listing_id)
+        property_type = get_property_type(listing_result)
+        guest_message = meta.get("guest_message", "")
+        type_ = meta.get("type")
+        guest_id = meta.get("guest_id")
+        ai_suggestion = meta.get("ai_suggestion", "")
+
+        clean_reply = clean_ai_reply(user_text, property_type)
+        store_learning_example(guest_message, ai_suggestion, clean_reply, listing_id, guest_id)
+        send_ok = send_reply_to_hostaway(conv_id, clean_reply, type_)
+        msg = ":white_check_mark: Your reply was sent and saved for future learning!" if send_ok else ":warning: Failed to send."
+        done_modal = {
+            "type": "modal",
+            "title": {"type": "plain_text", "text": "Done!", "emoji": True},
+            "close": {"type": "plain_text", "text": "Close", "emoji": True},
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": msg}}
+            ]
+        }
+        return JSONResponse({"response_action": "update", "view": done_modal})
+
+    return JSONResponse({"text": "Action received."})
