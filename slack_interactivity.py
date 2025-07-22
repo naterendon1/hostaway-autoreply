@@ -1,8 +1,9 @@
 import os
 import logging
 import json
-from fastapi import APIRouter, Request, BackgroundTasks
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from slack_sdk import WebClient
 from utils import (
     send_reply_to_hostaway,
     fetch_hostaway_resource,
@@ -11,14 +12,15 @@ from utils import (
 )
 from openai import OpenAI
 
-# Setup logging if not already configured
 logging.basicConfig(level=logging.INFO)
+router = APIRouter()
 
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-router = APIRouter()
-
+# --- Cleaner for AI replies ---
 def clean_ai_reply(reply: str) -> str:
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
@@ -38,6 +40,7 @@ def clean_ai_reply(reply: str) -> str:
     reply = ' '.join(filtered_lines)
     return reply.strip().replace("  ", " ").rstrip(",. ")
 
+# --- AI system prompt ---
 SYSTEM_PROMPT = (
     "You are a vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
     "Answer guest questions in a concise, informal, and polite way, always to-the-point. "
@@ -86,58 +89,195 @@ def get_property_info(listing_id):
     return property_info
 
 @router.post("/slack/actions")
-async def slack_actions(request: Request, background_tasks: BackgroundTasks):
-    logging.info("slack_actions endpoint called.")
-    try:
-        form = await request.form()
-        logging.info(f"Form received: {form}")
-        payload_raw = form.get("payload")
-        logging.info(f"Payload raw: {payload_raw}")
-        payload = json.loads(payload_raw)
-        logging.info(f"Parsed payload: {json.dumps(payload, indent=2)}")
-    except Exception as e:
-        logging.error(f"Error parsing Slack payload: {e}")
-        return JSONResponse({"text": f"Error parsing Slack payload: {e}"})
-
-    actions = payload.get("actions", [])
-    action = actions[0] if actions else {}
+async def slack_actions(request: Request):
+    form = await request.form()
+    payload = json.loads(form.get("payload"))
+    action = payload["actions"][0]
     action_id = action.get("action_id")
-    logging.info(f"Action ID: {action_id}")
+    trigger_id = payload.get("trigger_id")
+    user = payload["user"]
+    user_id = user.get("id")
+    logging.info(f"Slack action: {action_id} by {user_id}")
 
+    # Helper to build private_metadata for modals
+    def get_meta_from_action(action):
+        return json.loads(action["value"]) if "value" in action else {}
+
+    # --- WRITE YOUR OWN ---
     if action_id == "write_own":
-        logging.info("Handling 'write_own' button click.")
-        # -- Test modal for diagnostics --
+        meta = get_meta_from_action(action)
         modal = {
             "type": "modal",
-            "title": {"type": "plain_text", "text": "Write Your Own (Test Modal)", "emoji": True},
+            "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
             "submit": {"type": "plain_text", "text": "Send", "emoji": True},
             "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+            "private_metadata": json.dumps(meta),
             "blocks": [
                 {
-                    "type": "section",
-                    "text": {"type": "plain_text", "text": "If you see this, your modal opened! (real modal logic can go here)"}
+                    "type": "input",
+                    "block_id": "reply_input",
+                    "label": {"type": "plain_text", "text": "Your reply:", "emoji": True},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "reply",
+                        "multiline": True
+                    }
+                },
+                {
+                    "type": "actions",
+                    "block_id": "improve_ai_block",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "improve_with_ai",
+                            "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                        }
+                    ]
                 }
             ]
         }
-        return JSONResponse({"response_action": "push", "view": modal})
+        slack_client.views_open(trigger_id=trigger_id, view=modal)
+        return JSONResponse({})
 
+    # --- EDIT BUTTON ---
     if action_id == "edit":
-        logging.info("Handling 'edit' button click.")
-        # -- Test modal for diagnostics --
+        meta = get_meta_from_action(action)
+        draft = clean_ai_reply(meta.get("draft", ""))
         modal = {
             "type": "modal",
-            "title": {"type": "plain_text", "text": "Edit (Test Modal)", "emoji": True},
+            "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
             "submit": {"type": "plain_text", "text": "Send", "emoji": True},
             "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+            "private_metadata": json.dumps(meta),
             "blocks": [
                 {
-                    "type": "section",
-                    "text": {"type": "plain_text", "text": "If you see this, your edit modal opened! (real modal logic can go here)"}
+                    "type": "input",
+                    "block_id": "reply_input",
+                    "label": {"type": "plain_text", "text": "Edit your reply:", "emoji": True},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "reply",
+                        "multiline": True,
+                        "initial_value": draft
+                    }
+                },
+                {
+                    "type": "actions",
+                    "block_id": "improve_ai_block",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "improve_with_ai",
+                            "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                        }
+                    ]
                 }
             ]
         }
-        return JSONResponse({"response_action": "push", "view": modal})
+        slack_client.views_open(trigger_id=trigger_id, view=modal)
+        return JSONResponse({})
 
-    # -- Optional: log other actions for further debugging --
-    logging.info(f"Unhandled action_id: {action_id}. Full payload: {json.dumps(payload, indent=2)}")
-    return JSONResponse({"text": f"Action received: {action_id}"})
+    # --- IMPROVE WITH AI BUTTON IN MODAL ---
+    if action_id == "improve_with_ai":
+        view = payload.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        reply_block = state.get("reply_input", {})
+        edited_text = None
+        for v in reply_block.values():
+            edited_text = v.get("value")
+        meta = json.loads(view.get("private_metadata", "{}"))
+        guest_message = meta.get("guest_message", "")
+        listing_id = meta.get("listing_id", None)
+        guest_id = meta.get("guest_id", None)
+        ai_suggestion = meta.get("ai_suggestion", "")
+
+        property_info = get_property_info(listing_id)
+        similar_examples = get_similar_learning_examples(guest_message, listing_id)
+        prev_answer = ""
+        if similar_examples:
+            prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
+
+        prompt = (
+            f"{prev_answer}"
+            f"A guest sent this message:\n{guest_message}\n\n"
+            f"Property info:\n{property_info}\n"
+            "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
+            "If you don't know the answer from the details provided, say you will check and get back to them. "
+            f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
+            f"{edited_text}"
+        )
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            improved = clean_ai_reply(response.choices[0].message.content.strip())
+        except Exception as e:
+            logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+            improved = "(Error generating improved reply.)"
+
+        # Return new modal with improved answer in the text box (replace input)
+        new_modal = view.copy()
+        new_blocks = []
+        for block in new_modal["blocks"]:
+            if block["type"] == "input" and block["block_id"] == "reply_input":
+                block["element"]["initial_value"] = improved
+            new_blocks.append(block)
+        new_modal["blocks"] = new_blocks
+
+        return JSONResponse({"response_action": "update", "view": new_modal})
+
+    # --- VIEW SUBMISSION (Write Own or Edit Modal) ---
+    if payload.get("type") == "view_submission":
+        view = payload.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        reply_block = state.get("reply_input", {})
+        user_text = None
+        for v in reply_block.values():
+            user_text = v.get("value")
+        meta = json.loads(view.get("private_metadata", "{}"))
+        conv_id = meta.get("conv_id")
+        listing_id = meta.get("listing_id")
+        guest_message = meta.get("guest_message", "")
+        type_ = meta.get("type")
+        guest_id = meta.get("guest_id")
+        ai_suggestion = meta.get("ai_suggestion", "")
+
+        clean_reply = clean_ai_reply(user_text)
+        # Save to learning
+        store_learning_example(guest_message, ai_suggestion, clean_reply, listing_id, guest_id)
+        # Send reply to Hostaway
+        send_ok = send_reply_to_hostaway(conv_id, clean_reply, type_)
+        msg = ":white_check_mark: Your reply was sent and saved for future learning!" if send_ok else ":warning: Failed to send."
+        # Optionally, show a "done" modal
+        done_modal = {
+            "type": "modal",
+            "title": {"type": "plain_text", "text": "Done!", "emoji": True},
+            "close": {"type": "plain_text", "text": "Close", "emoji": True},
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": msg}}
+            ]
+        }
+        return JSONResponse({"response_action": "update", "view": done_modal})
+
+    # --- SEND BUTTON (from main message, not modal) ---
+    if action_id == "send":
+        meta = get_meta_from_action(action)
+        conv_id = meta.get("conv_id")
+        reply = clean_ai_reply(meta.get("reply", ""))
+        type_ = meta.get("type")
+        listing_id = meta.get("listing_id", None)
+        guest_message = meta.get("guest_message", "")
+        guest_id = meta.get("guest_id", None)
+        ai_suggestion = reply
+        # Store as learning (AI suggestion, not user-modified)
+        store_learning_example(guest_message, ai_suggestion, reply, listing_id, guest_id)
+        send_ok = send_reply_to_hostaway(conv_id, reply, type_)
+        msg = ":white_check_mark: AI reply sent and saved!" if send_ok else ":warning: Failed to send."
+        return JSONResponse({"text": msg})
+
+    # Default: just acknowledge
+    return JSONResponse({"text": "Action received."})
