@@ -2,7 +2,6 @@ import os
 import logging
 import json
 import re
-import pprint
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
@@ -102,7 +101,6 @@ async def slack_actions(request: Request):
         if action_id == "write_own":
             meta = get_meta_from_action(action)
             listing_id = meta.get("listing_id", None)
-            _, listing_result = {}, {}
             property_type = "home"
             modal = {
                 "type": "modal",
@@ -140,7 +138,6 @@ async def slack_actions(request: Request):
         if action_id == "edit":
             meta = get_meta_from_action(action)
             listing_id = meta.get("listing_id", None)
-            _, listing_result = {}, {}
             property_type = "home"
             draft = clean_ai_reply(meta.get("draft", ""), property_type)
             modal = {
@@ -177,11 +174,10 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
-        # ----- Improved "improve_with_ai" handler -----
+        # ------------------- FIXED improve_with_ai -------------------
         if action_id == "improve_with_ai":
             logging.info("🚀 Improve with AI clicked.")
             view = payload.get("view", {})
-            view_id = view.get("id")
             state = view.get("state", {}).get("values", {})
             reply_block = state.get("reply_input", {})
             edited_text = None
@@ -225,8 +221,12 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved reply.)"
 
-            # Defensive: update input block with improved reply via views_update
-            modal_view = {
+            view_id = view.get("id")
+            if not view_id:
+                logging.error("No view_id found in payload; cannot update modal!")
+                return JSONResponse({"text": "Could not update modal, missing view_id."})
+
+            new_modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
@@ -257,17 +257,14 @@ async def slack_actions(request: Request):
                     }
                 ]
             }
+            logging.info(f"Modal to send to Slack:\n{json.dumps(new_modal, indent=2)}")
 
-            logging.info("Modal to send to Slack:\n%s", pprint.pformat(modal_view))
-
-            # Use views_update to update the same modal (not views_open)
             slack_client.views_update(
                 view_id=view_id,
-                view=modal_view
+                view=new_modal
             )
             return JSONResponse({})
-
-        # ----- End improve_with_ai handler -----
+        # ----------------- END improve_with_ai ----------------------
 
         if action_id == "send":
             meta = get_meta_from_action(action)
