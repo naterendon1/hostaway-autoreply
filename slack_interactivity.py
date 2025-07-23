@@ -237,7 +237,41 @@ async def slack_actions(request: Request):
                 logging.error("No reply_input block found in modal for update!")
 
             logging.info("Returning modal update to Slack: %s", json.dumps(new_modal))
-            return JSONResponse({"response_action": "update", "view": new_modal})
+            slack_client.views_open(
+    trigger_id=trigger_id,
+    view={
+        "type": "modal",
+        "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+        "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+        "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+        "private_metadata": view.get("private_metadata"),
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "reply_input",
+                "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "reply",
+                    "multiline": True,
+                    "initial_value": improved
+                }
+            },
+            {
+                "type": "actions",
+                "block_id": "improve_ai_block",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "improve_with_ai",
+                        "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                    }
+                ]
+            }
+        ]
+    }
+)
+return JSONResponse({})
 
         # ----- End improve_with_ai handler -----
 
