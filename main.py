@@ -3,31 +3,93 @@ import logging
 import json
 import re
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
-
-from slack_interactivity import router as slack_router
 from utils import (
     fetch_hostaway_resource,
-    fetch_hostaway_fields,
-    get_similar_learning_examples
+    fetch_hostaway_listing,
+    fetch_hostaway_reservation,
+    fetch_hostaway_conversation,
+    get_cancellation_policy_summary,
+    get_similar_learning_examples,
 )
 
 logging.basicConfig(level=logging.INFO)
 
+HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
+HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
+HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 app.include_router(slack_router)
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+def determine_needed_fields(guest_message: str):
+    core_listing_fields = {"summary", "amenities", "houseManual", "type", "name"}
+    extra_fields = set()
+    text = guest_message.lower()
+    if any(keyword in text for keyword in [
+        "how far", "distance", "close", "how close", "near", "nearest", "proximity", "from", "to", "airport", "downtown", "center", "stadium"
+    ]):
+        extra_fields.update({"address", "city", "zipcode", "state"})
+    if "parking" in text or "car" in text or "vehicle" in text:
+        extra_fields.update({"parking", "amenities", "houseManual"})
+    if "price" in text or "cost" in text or "fee" in text or "rate" in text:
+        extra_fields.update({"price", "cleaningFee", "securityDepositFee", "currencyCode"})
+    if "cancel" in text or "refund" in text:
+        extra_fields.update({"cancellationPolicy", "cancellationPolicyId"})
+    if any(x in text for x in ["wifi", "internet", "tv", "cable", "smart", "stream", "netflix"]):
+        extra_fields.update({"amenities", "houseManual", "wifiUsername", "wifiPassword"})
+    if any(x in text for x in ["bed", "sofa", "couch", "sleep", "bedroom"]):
+        extra_fields.update({"bedroomsNumber", "bedsNumber", "guestBathroomsNumber"})
+    if "guest" in text or "person" in text or "max" in text or "limit" in text or "occupancy" in text:
+        extra_fields.update({"personCapacity", "maxChildrenAllowed", "maxInfantsAllowed", "maxPetsAllowed", "guestsIncluded"})
+    if "pet" in text or "dog" in text or "cat" in text or "animal" in text:
+        extra_fields.update({"maxPetsAllowed", "amenities", "houseRules"})
+    return core_listing_fields.union(extra_fields)
+
+def get_property_type(listing_result):
+    prop_type = (listing_result.get("type") or "").lower()
+    name = (listing_result.get("name") or "").lower()
+    for t in ["house", "cabin", "condo", "apartment", "villa", "bungalow", "cottage", "suite"]:
+        if t in prop_type:
+            return t
+        if t in name:
+            return t
+    return "home"
+
+def clean_ai_reply(reply: str, property_type="home"):
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    for signoff in bad_signoffs:
+        reply = reply.replace(signoff, "")
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(s.replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+    reply = ' '.join(filtered_lines)
+    address_patterns = [
+        r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
+        r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
+        r"at [\d]+ [\w .]+, [\w ]+"
+    ]
+    for pattern in address_patterns:
+        reply = re.sub(pattern, f"the {property_type}", reply, flags=re.IGNORECASE)
+    reply = re.sub(r"at [A-Za-z0-9 ,/\-\(\)\']+", f"at the {property_type}", reply, flags=re.IGNORECASE)
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    return reply.rstrip(",. ")
 
 SYSTEM_PROMPT = (
     "You are a vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
@@ -60,37 +122,17 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-# ---- STEP 1: Determine needed fields via AI ---
-def get_fields_needed(guest_message):
-    probe_prompt = (
-        "A guest sent this message:\n"
-        f"{guest_message}\n"
-        "What specific property or reservation fields do you need to answer this question? "
-        "Respond ONLY with a comma-separated list of field names (e.g. wifiPassword, checkInTime, petsAllowed, amenities, houseManual, etc.). "
-        "If no fields are needed, reply with 'none'."
-    )
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "system", "content": "You are an assistant helping to determine what data is needed for short guest questions."},
-                      {"role": "user", "content": probe_prompt}]
-        )
-        fields_line = resp.choices[0].message.content.strip()
-        fields = [f.strip() for f in re.split("[,\\n]", fields_line) if f.strip() and f.strip().lower() != "none"]
-        return fields
-    except Exception as e:
-        logging.error(f"❌ OpenAI fields-needed error: {e}")
-        return []
-
-def clean_ai_reply(reply: str, property_type="home"):
-    bad_signoffs = [
-        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
-    ]
-    for signoff in bad_signoffs:
-        reply = reply.replace(signoff, "")
-    reply = ' '.join(reply.split())
-    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
-    return reply.rstrip(",. ")
+def get_property_info(listing_result, fields_needed):
+    """Return property info string for prompt. Only includes needed fields."""
+    lines = []
+    for field in fields_needed:
+        val = listing_result.get(field, "")
+        if not val:
+            continue
+        if isinstance(val, (list, dict)):
+            val = json.dumps(val)
+        lines.append(f"{field}: {val}")
+    return "\n".join(lines)
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -105,59 +147,71 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_map_id = payload.data.get("listingMapId")
     guest_id = payload.data.get("userId", "")
 
+    guest_name = "Guest"
     guest_first_name = "Guest"
     check_in = "N/A"
     check_out = "N/A"
     guest_count = "N/A"
     reservation_status = payload.data.get("status", "Unknown").capitalize()
 
-    if reservation_id:
-        res = fetch_hostaway_resource("reservations", reservation_id)
-        result = res.get("result", {}) if res else {}
-        guest_first_name = result.get("guestFirstName", guest_first_name)
-        check_in = result.get("arrivalDate", check_in)
-        check_out = result.get("departureDate", check_out)
-        guest_count = result.get("numberOfGuests", guest_count)
+    # Fetch reservation for context
+    reservation_obj = fetch_hostaway_reservation(reservation_id) if reservation_id else None
+    reservation_result = reservation_obj.get("result", {}) if reservation_obj else {}
+
+    if reservation_result:
+        guest_name = reservation_result.get("guestName", guest_name)
+        guest_first_name = reservation_result.get("guestFirstName", guest_first_name)
+        check_in = reservation_result.get("arrivalDate", check_in)
+        check_out = reservation_result.get("departureDate", check_out)
+        guest_count = reservation_result.get("numberOfGuests", guest_count)
         if not listing_map_id:
-            listing_map_id = result.get("listingId")
+            listing_map_id = reservation_result.get("listingId")
         if not guest_id:
-            guest_id = result.get("guestId", "")
+            guest_id = reservation_result.get("guestId", "")
 
-    # --- 1. Find what fields are needed to answer this specific guest question ---
-    fields_needed = get_fields_needed(guest_message)
-    logging.info(f"Fields needed for answer: {fields_needed}")
+    # Determine needed fields for the listing, based on guest question
+    fields_needed = determine_needed_fields(guest_message)
+    listing_obj = fetch_hostaway_listing(listing_map_id) if listing_map_id else None
+    listing_result = {}
+    if listing_obj:
+        # Only keep needed fields if full listing was fetched
+        raw_result = listing_obj.get("result", {})
+        listing_result = {k: v for k, v in raw_result.items() if k in fields_needed}
 
-    # --- 2. Fetch ONLY the needed fields ---
-    property_info = {}
-    reservation_info = {}
-    if listing_map_id and fields_needed:
-        prop_fields = [f for f in fields_needed if f in (
-            "wifiPassword", "wifiUsername", "houseManual", "checkInTimeStart", "checkInTimeEnd",
-            "checkOutTime", "petPolicy", "amenities", "propertyType", "parkingInfo", "summary", "name"
-        )]
-        if prop_fields:
-            property_info = fetch_hostaway_fields("listings", listing_map_id, prop_fields) or {}
+    # Message thread for this conversation
+    conversation_obj = fetch_hostaway_conversation(conversation_id) if conversation_id else None
+    thread_messages = []
+    if conversation_obj and conversation_obj.get("conversationMessages"):
+        thread_messages = conversation_obj["conversationMessages"]
 
-    if reservation_id and fields_needed:
-        res_fields = [f for f in fields_needed if f in (
-            "arrivalDate", "departureDate", "numberOfGuests", "status", "confirmationCode"
-        )]
-        if res_fields:
-            reservation_info = fetch_hostaway_fields("reservations", reservation_id, res_fields) or {}
+    property_type = get_property_type(listing_result)
+    property_info = get_property_info(listing_result, fields_needed)
 
-    # --- 3. Compose AI prompt and get final answer ---
-    prop_type = property_info.get("propertyType") or "home"
     similar_examples = get_similar_learning_examples(guest_message, listing_map_id)
     prev_answer = ""
     if similar_examples:
         prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
 
+    # Add conversation thread context
+    thread_context = ""
+    if thread_messages:
+        thread_context = "Conversation history:\n"
+        for msg in thread_messages[-5:]:
+            who = "Guest" if msg.get("isIncoming") else "Host"
+            body = msg.get("body", "")
+            thread_context += f"{who}: {body}\n"
+
+    # Add cancellation policy context
+    cancellation_context = get_cancellation_policy_summary(listing_result, reservation_result)
+
     prompt = (
         f"{prev_answer}"
+        f"{thread_context}"
         f"A guest sent this message:\n{guest_message}\n\n"
-        f"Reservation info: {reservation_info}\n"
-        f"Property info: {property_info}\n"
-        "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate."
+        f"Property info:\n{property_info}\n"
+        f"Reservation context:\n{json.dumps(reservation_result)}\n"
+        f"Cancellation: {cancellation_context}\n"
+        f"Respond according to your latest rules and tone, and use all information above if needed."
     )
 
     try:
@@ -169,12 +223,68 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             ]
         )
         ai_reply = response.choices[0].message.content.strip()
-        ai_reply = clean_ai_reply(ai_reply, prop_type)
+        ai_reply = clean_ai_reply(ai_reply, property_type)
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
         ai_reply = "(Error generating reply.)"
 
-    # You can now send the reply back via Slack, Hostaway, etc.
-    logging.info(f"🤖 AI reply: {ai_reply}")
+    header = (
+        f"*New {communication_type.capitalize()}* from *{guest_first_name}*\n"
+        f"Dates: *{check_in} → {check_out}*\n"
+        f"Guests: *{guest_count}* | Status: *{reservation_status}*"
+    )
 
-    return {"status": "ok", "reply": ai_reply}
+    slack_button_payload = {
+        "conv_id": conversation_id,
+        "listing_id": listing_map_id,
+        "guest_message": guest_message,
+        "ai_suggestion": ai_reply,
+        "type": communication_type,
+        "guest_id": guest_id
+    }
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_message}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Send"},
+                    "value": json.dumps({**slack_button_payload, "reply": ai_reply}),
+                    "action_id": "send"
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✏️ Edit"},
+                    "value": json.dumps({**slack_button_payload, "draft": ai_reply}),
+                    "action_id": "edit"
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "📝 Write Your Own"},
+                    "value": json.dumps(slack_button_payload),
+                    "action_id": "write_own"
+                }
+            ]
+        }
+    ]
+
+    from slack_sdk.web import WebClient
+    slack_client = WebClient(token=SLACK_BOT_TOKEN)
+    try:
+        slack_client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            blocks=blocks,
+            text="New message from guest"
+        )
+    except Exception as e:
+        logging.error(f"❌ Slack send error: {e}")
+
+    return {"status": "ok"}
+
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
