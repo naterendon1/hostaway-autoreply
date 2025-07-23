@@ -110,6 +110,7 @@ SYSTEM_PROMPT = (
     "For parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
     "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
     "If you have a previously saved answer for this question and house, use that wording if appropriate. "
+    "If a guest sends a very brief or vague message (such as 'just following up?' or 'any update?'), use the previous conversation history to infer what they are referring to. If you cannot infer the topic, politely ask the guest to clarify their request. "
     "Always be helpful and accurate, but always brief."
 )
 
@@ -178,28 +179,34 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         raw_result = listing_obj.get("result", {})
         listing_result = {k: v for k, v in raw_result.items() if k in fields_needed}
 
+    # --- New: Listing name/type for Slack block ---
+    listing_name = listing_result.get("name", "Unknown listing")
+    property_type = get_property_type(listing_result)
+
     # Message thread for this conversation
     conversation_obj = fetch_hostaway_conversation(conversation_id) if conversation_id else None
     thread_messages = []
     if conversation_obj and conversation_obj.get("conversationMessages"):
         thread_messages = conversation_obj["conversationMessages"]
 
-    property_type = get_property_type(listing_result)
+    # Add conversation thread context (always include last N messages)
+    thread_context = ""
+    if thread_messages:
+        last_msgs = thread_messages[-5:]
+        thread_context = "Conversation history:\n"
+        for msg in last_msgs:
+            who = "Guest" if msg.get("isIncoming") else "Host"
+            body = msg.get("body", "")
+            thread_context += f"{who}: {body}\n"
+    else:
+        logging.warning(f"[Hostaway AutoResponder] No thread messages found for conversation_id={conversation_id}")
+
     property_info = get_property_info(listing_result, fields_needed)
 
     similar_examples = get_similar_learning_examples(guest_message, listing_map_id)
     prev_answer = ""
     if similar_examples:
         prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
-
-    # Add conversation thread context
-    thread_context = ""
-    if thread_messages:
-        thread_context = "Conversation history:\n"
-        for msg in thread_messages[-5:]:
-            who = "Guest" if msg.get("isIncoming") else "Host"
-            body = msg.get("body", "")
-            thread_context += f"{who}: {body}\n"
 
     # Add cancellation policy context
     cancellation_context = get_cancellation_policy_summary(listing_result, reservation_result)
@@ -243,10 +250,30 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "guest_id": guest_id
     }
 
+    # --- Updated Slack blocks: Listing block at top ---
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_message}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Listing:* {listing_name} ({property_type})"
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": header
+            }
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"> {guest_message}"}
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}
+        },
         {
             "type": "actions",
             "elements": [
