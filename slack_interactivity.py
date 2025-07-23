@@ -176,7 +176,7 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
-        # ----- Improved "improve_with_ai" handler -----
+        # Improved "improve_with_ai" handler (re-open modal for reliability)
         if action_id == "improve_with_ai":
             logging.info("🚀 Improve with AI clicked.")
             view = payload.get("view", {})
@@ -223,57 +223,42 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved reply.)"
 
-            # Defensive: update input block with improved reply
-            import copy
-            new_modal = copy.deepcopy(view)
-            updated = False
-            for block in new_modal["blocks"]:
-                if block["type"] == "input" and block.get("block_id") == "reply_input":
-                    if "element" in block:
-                        block["element"]["initial_value"] = improved
-                        updated = True
-
-            if not updated:
-                logging.error("No reply_input block found in modal for update!")
-
-            logging.info("Returning modal update to Slack: %s", json.dumps(new_modal))
+            # Re-open modal with improved text for best Slack reliability
             slack_client.views_open(
-    trigger_id=trigger_id,
-    view={
-        "type": "modal",
-        "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
-        "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-        "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-        "private_metadata": view.get("private_metadata"),
-        "blocks": [
-            {
-                "type": "input",
-                "block_id": "reply_input",
-                "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "reply",
-                    "multiline": True,
-                    "initial_value": improved
+                trigger_id=trigger_id,
+                view={
+                    "type": "modal",
+                    "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                    "private_metadata": view.get("private_metadata"),
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "reply_input",
+                            "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "reply",
+                                "multiline": True,
+                                "initial_value": improved
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "block_id": "improve_ai_block",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "action_id": "improve_with_ai",
+                                    "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                                }
+                            ]
+                        }
+                    ]
                 }
-            },
-            {
-                "type": "actions",
-                "block_id": "improve_ai_block",
-                "elements": [
-                    {
-                        "type": "button",
-                        "action_id": "improve_with_ai",
-                        "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
-                    }
-                ]
-            }
-        ]
-    }
-)
-return JSONResponse({})
-
-        # ----- End improve_with_ai handler -----
+            )
+            return JSONResponse({})
 
         if action_id == "send":
             meta = get_meta_from_action(action)
