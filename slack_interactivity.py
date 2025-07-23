@@ -224,23 +224,26 @@ async def slack_actions(request: Request):
                 improved = "(Error generating improved reply.)"
 
             # Update modal with improved text
-            new_modal = view.copy()
-            new_blocks = []
-            found = False
-            for block in new_modal.get("blocks", []):
-                if block["type"] == "input" and block.get("block_id") == "reply_input":
-                    block = block.copy()
-                    block["element"] = block["element"].copy()
-                    block["element"]["initial_value"] = improved
-                    found = True
-                new_blocks.append(block)
-            new_modal["blocks"] = new_blocks
+                # Defensive: update input block with improved reply
+                import copy
+                new_modal = copy.deepcopy(view)
+                updated = False
+                for block in new_modal["blocks"]:
+                    if block["type"] == "input" and block.get("block_id") == "reply_input":
+                        if "element" in block and "initial_value" in block["element"]:
+                            block["element"]["initial_value"] = improved
+                                updated = True
+                            elif "element" in block:
+                            block["element"]["initial_value"] = improved
+                            updated = True
 
-            if not found:
-                logging.error("No reply_input block found in modal for update!")
+                if not updated:
+        logging.error("No reply_input block found in modal for update!")
+                        logging.info("JSONResponse to Slack:\n%s", json.dumps({"response_action": "update", "view": new_modal}))
 
-            logging.info("Returning modal update to Slack.")
-            return JSONResponse({"response_action": "update", "view": new_modal})
+
+    logging.info("Returning modal update to Slack: %s", json.dumps(new_modal))
+    return JSONResponse({"response_action": "update", "view": new_modal})
 
         # ------------- END "improve_with_ai" -------------
 
