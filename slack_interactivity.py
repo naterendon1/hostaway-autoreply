@@ -176,6 +176,7 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
+        # ------------- UPDATED "improve_with_ai" -------------
         if action_id == "improve_with_ai":
             logging.info("🚀 Improve with AI clicked.")
             view = payload.get("view", {})
@@ -183,7 +184,9 @@ async def slack_actions(request: Request):
             reply_block = state.get("reply_input", {})
             edited_text = None
             for v in reply_block.values():
-                edited_text = v.get("value")
+                if v.get("value") is not None:
+                    edited_text = v.get("value")
+            logging.info(f"User's draft text: {edited_text}")
             meta = json.loads(view.get("private_metadata", "{}"))
             guest_message = meta.get("guest_message", "")
             listing_id = meta.get("listing_id", None)
@@ -196,19 +199,16 @@ async def slack_actions(request: Request):
             if similar_examples:
                 prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
 
-            meta_lines = "\n".join([f"{k}: {v}" for k, v in meta.items() if k not in [
-                "guest_message", "listing_id", "ai_suggestion", "draft", "reply", "conv_id"
-            ]])
-
             prompt = (
                 f"{prev_answer}"
                 f"A guest sent this message:\n{guest_message}\n\n"
-                f"Other data:\n{meta_lines}\n"
-                "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
-                "If you don't know the answer from the details provided, say you will check and get back to them. "
-                f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
-                f"{edited_text}"
+                "Here is my draft reply (below). Please improve it for clarity, conciseness, and polite, informal tone, "
+                "but do NOT invent information that isn't in the property details or prior answers. "
+                f"\nDraft reply: {edited_text}\n"
+                "Respond ONLY with the improved reply."
             )
+            logging.info(f"Prompt sent to OpenAI:\n{prompt}")
+
             try:
                 response = openai_client.chat.completions.create(
                     model="gpt-4",
@@ -218,16 +218,16 @@ async def slack_actions(request: Request):
                     ]
                 )
                 improved = clean_ai_reply(response.choices[0].message.content.strip(), property_type)
-                logging.info(f"🚀 Sending improved reply back: {improved[:100]}")
+                logging.info(f"Improved reply from AI: {improved}")
             except Exception as e:
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved reply.)"
 
-            # Defensive: ensure input block exists and gets updated
+            # Update modal with improved text
             new_modal = view.copy()
             new_blocks = []
             found = False
-            for block in new_modal["blocks"]:
+            for block in new_modal.get("blocks", []):
                 if block["type"] == "input" and block.get("block_id") == "reply_input":
                     block = block.copy()
                     block["element"] = block["element"].copy()
@@ -239,7 +239,10 @@ async def slack_actions(request: Request):
             if not found:
                 logging.error("No reply_input block found in modal for update!")
 
+            logging.info("Returning modal update to Slack.")
             return JSONResponse({"response_action": "update", "view": new_modal})
+
+        # ------------- END "improve_with_ai" -------------
 
         if action_id == "send":
             meta = get_meta_from_action(action)
