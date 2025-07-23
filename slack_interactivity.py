@@ -7,9 +7,13 @@ from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
 from utils import (
     send_reply_to_hostaway,
-    fetch_hostaway_resource,
+    fetch_hostaway_listing,
+    fetch_hostaway_reservation,
+    fetch_hostaway_conversation,
+    fetch_conversation_messages,
     store_learning_example,
-    get_similar_learning_examples
+    get_similar_learning_examples,
+    get_cancellation_policy_summary,
 )
 from openai import OpenAI
 
@@ -81,40 +85,30 @@ SYSTEM_PROMPT = (
     "Always be helpful and accurate, but always brief."
 )
 
-def summarize_reservation(res_obj):
-    """Returns a short string summary of reservation object for AI context."""
-    if not res_obj:
-        return ""
-    return (
-        f"Reservation ID: {res_obj.get('id')}\n"
-        f"Status: {res_obj.get('status')}\n"
-        f"Channel: {res_obj.get('channelName', '')} (ID: {res_obj.get('channelId', '')})\n"
-        f"Guest: {res_obj.get('guestName', '')} ({res_obj.get('guestFirstName', '')})\n"
-        f"Dates: {res_obj.get('arrivalDate', '')} → {res_obj.get('departureDate', '')}\n"
-        f"Guests: {res_obj.get('numberOfGuests', '')}\n"
-        f"Is Instant Booked: {res_obj.get('isInstantBooked', '')}\n"
-        f"Total Price: {res_obj.get('totalPrice', '')} {res_obj.get('currency', '')}\n"
-        f"Channel Reservation ID: {res_obj.get('reservationId', '')}\n"
-        f"Other fields: {json.dumps({k:v for k,v in res_obj.items() if k in ['pendingExpireDate','manualIcalName','remainingBalance','confirmationCode','adults','children','infants','pets']}, default=str)}"
+def get_property_info(listing_id):
+    if not listing_id:
+        return "", {}
+    listing = fetch_hostaway_listing(listing_id)
+    result = listing.get("result", {}) if listing else {}
+    address = result.get("address", "")
+    city = result.get("city", "")
+    zipcode = result.get("zip", "")
+    summary = result.get("summary", "")
+    amenities = result.get("amenities", "")
+    house_manual = result.get("houseManual", "")
+    if isinstance(amenities, list):
+        amenities_str = ", ".join(amenities)
+    elif isinstance(amenities, dict):
+        amenities_str = ", ".join([k for k, v in amenities.items() if v])
+    else:
+        amenities_str = str(amenities)
+    property_info = (
+        f"Property Address: {address}, {city} {zipcode}\n"
+        f"Summary: {summary}\n"
+        f"Amenities: {amenities_str}\n"
+        f"House Manual: {house_manual[:800]}{'...' if len(house_manual) > 800 else ''}\n"
     )
-
-def summarize_listing(listing_obj):
-    """Returns a short string summary of listing object for AI context."""
-    if not listing_obj:
-        return ""
-    return (
-        f"Listing ID: {listing_obj.get('id')}\n"
-        f"Type: {get_property_type(listing_obj)}\n"
-        f"Room Type: {listing_obj.get('roomType','')}\n"
-        f"Name: {listing_obj.get('name','')}\n"
-        f"Capacity: {listing_obj.get('personCapacity','')}\n"
-        f"Bedrooms: {listing_obj.get('bedroomsNumber','')} | Beds: {listing_obj.get('bedsNumber','')} | Bathrooms: {listing_obj.get('bathroomsNumber','')}\n"
-        f"Summary: {listing_obj.get('summary','') or listing_obj.get('description','')}\n"
-        f"Amenities: {', '.join(listing_obj.get('amenities', [])) if isinstance(listing_obj.get('amenities'), list) else str(listing_obj.get('amenities'))}\n"
-        f"Check-in: {listing_obj.get('checkInTimeStart', '')}-{listing_obj.get('checkInTimeEnd','')} | Check-out: {listing_obj.get('checkOutTime','')}\n"
-        f"Cancellation: {listing_obj.get('cancellationPolicy','')}\n"
-        f"Other fields: {json.dumps({k:v for k,v in listing_obj.items() if k in ['address','city','zipcode','state','country','starRating','averageReviewRating','wifiUsername','wifiPassword']}, default=str)}"
-    )
+    return property_info, result
 
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
@@ -133,24 +127,44 @@ async def slack_actions(request: Request):
         def get_meta_from_action(action):
             return json.loads(action["value"]) if "value" in action else {}
 
-        if action_id in ("write_own", "edit"):
-            meta = get_meta_from_action(action)
+        if action_id in ["write_own", "edit", "improve_with_ai"]:
+            meta = get_meta_from_action(action) if action_id != "improve_with_ai" else json.loads(payload["view"]["private_metadata"])
             listing_id = meta.get("listing_id", None)
             reservation_id = meta.get("reservation_id", None)
-            # Fetch listing object
-            listing = fetch_hostaway_resource("listings", listing_id)
-            listing_result = listing.get("result", {}) if listing else {}
+            conversation_id = meta.get("conv_id", None)
+            guest_message = meta.get("guest_message", "")
+            ai_suggestion = meta.get("ai_suggestion", "")
+            guest_id = meta.get("guest_id", None)
+
+            # Get all context objects for AI prompt
+            _, listing_result = get_property_info(listing_id)
             property_type = get_property_type(listing_result)
-            # Fetch reservation object
-            reservation = fetch_hostaway_resource("reservations", reservation_id) if reservation_id else {}
-            reservation_result = reservation.get("result", {}) if reservation else {}
-            # Draft
-            draft = meta.get("draft", "") if action_id == "edit" else ""
-            if action_id == "edit":
-                draft = clean_ai_reply(draft, property_type)
+            reservation_result = None
+            if reservation_id:
+                reservation_obj = fetch_hostaway_reservation(reservation_id)
+                reservation_result = reservation_obj.get("result", {}) if reservation_obj else {}
+
+            # Thread context for this conversation
+            thread_messages = []
+            if conversation_id:
+                conversation_obj = fetch_hostaway_conversation(conversation_id)
+                if conversation_obj and conversation_obj.get("conversationMessages"):
+                    thread_messages = conversation_obj["conversationMessages"]
+
+            # Context for prompt
+            thread_context = ""
+            if thread_messages:
+                thread_context = "Conversation history:\n"
+                for msg in thread_messages[-5:]:
+                    who = "Guest" if msg.get("isIncoming") else "Host"
+                    body = msg.get("body", "")
+                    thread_context += f"{who}: {body}\n"
+            cancellation_context = get_cancellation_policy_summary(listing_result, reservation_result)
+
+        if action_id == "write_own":
             modal = {
                 "type": "modal",
-                "title": {"type": "plain_text", "text": "Edit Reply" if action_id == "edit" else "Write Your Own Reply", "emoji": True},
+                "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": json.dumps(meta),
@@ -158,12 +172,47 @@ async def slack_actions(request: Request):
                     {
                         "type": "input",
                         "block_id": "reply_input",
-                        "label": {"type": "plain_text", "text": "Edit your reply:" if action_id == "edit" else "Your reply:", "emoji": True},
+                        "label": {"type": "plain_text", "text": "Your reply:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            }
+                        ]
+                    }
+                ]
+            }
+            slack_client.views_open(trigger_id=trigger_id, view=modal)
+            return JSONResponse({})
+
+        if action_id == "edit":
+            draft = clean_ai_reply(meta.get("draft", ""), property_type)
+            modal = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": json.dumps(meta),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Edit your reply:", "emoji": True},
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "reply",
                             "multiline": True,
-                            **({"initial_value": draft} if action_id == "edit" else {})
+                            "initial_value": draft
                         }
                     },
                     {
@@ -189,31 +238,20 @@ async def slack_actions(request: Request):
             edited_text = None
             for v in reply_block.values():
                 edited_text = v.get("value")
-            meta = json.loads(view.get("private_metadata", "{}"))
-            guest_message = meta.get("guest_message", "")
-            listing_id = meta.get("listing_id", None)
-            reservation_id = meta.get("reservation_id", None)
-            guest_id = meta.get("guest_id", None)
-            ai_suggestion = meta.get("ai_suggestion", "")
-
-            listing = fetch_hostaway_resource("listings", listing_id)
-            listing_result = listing.get("result", {}) if listing else {}
-            reservation = fetch_hostaway_resource("reservations", reservation_id) if reservation_id else {}
-            reservation_result = reservation.get("result", {}) if reservation else {}
-            property_type = get_property_type(listing_result)
             similar_examples = get_similar_learning_examples(guest_message, listing_id)
             prev_answer = ""
             if similar_examples:
                 prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
-
             prompt = (
                 f"{prev_answer}"
+                f"{thread_context}"
                 f"A guest sent this message:\n{guest_message}\n\n"
-                f"Reservation Info:\n{summarize_reservation(reservation_result)}\n"
-                f"Listing Info:\n{summarize_listing(listing_result)}\n"
-                "Respond according to your latest rules and tone, and use property info and reservation info to make answers detailed and specific if appropriate. "
+                f"Property info:\n{json.dumps(listing_result)}\n"
+                f"Reservation context:\n{json.dumps(reservation_result) if reservation_result else ''}\n"
+                f"Cancellation: {cancellation_context}\n"
+                "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
                 "If you don't know the answer from the details provided, say you will check and get back to them. "
-                f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property or reservation details or previous answers:\n"
+                f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
                 f"{edited_text}"
             )
             try:
@@ -243,10 +281,7 @@ async def slack_actions(request: Request):
             meta = get_meta_from_action(action)
             conv_id = meta.get("conv_id")
             listing_id = meta.get("listing_id", None)
-            reservation_id = meta.get("reservation_id", None)
-            # Fetch property info/type for cleaning reply
-            listing = fetch_hostaway_resource("listings", listing_id)
-            listing_result = listing.get("result", {}) if listing else {}
+            _, listing_result = get_property_info(listing_id)
             property_type = get_property_type(listing_result)
             reply = clean_ai_reply(meta.get("reply", ""), property_type)
             type_ = meta.get("type")
@@ -270,10 +305,7 @@ async def slack_actions(request: Request):
         meta = json.loads(view.get("private_metadata", "{}"))
         conv_id = meta.get("conv_id")
         listing_id = meta.get("listing_id")
-        reservation_id = meta.get("reservation_id", None)
-        # Fetch property info/type for cleaning reply
-        listing = fetch_hostaway_resource("listings", listing_id)
-        listing_result = listing.get("result", {}) if listing else {}
+        _, listing_result = get_property_info(listing_id)
         property_type = get_property_type(listing_result)
         guest_message = meta.get("guest_message", "")
         type_ = meta.get("type")
