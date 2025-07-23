@@ -3,14 +3,18 @@ import logging
 import json
 import re
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from slack_interactivity import router as slack_router
+from pydantic import BaseModel
+from openai import OpenAI
 from utils import (
     fetch_hostaway_resource,
-    get_similar_learning_examples
+    fetch_hostaway_listing,
+    fetch_hostaway_reservation,
+    fetch_hostaway_conversation,
+    fetch_conversation_messages,
+    get_cancellation_policy_summary,
+    get_similar_learning_examples,
 )
-from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,7 +27,46 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 app = FastAPI()
 app.include_router(slack_router)
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+def get_property_type(listing_result):
+    prop_type = (listing_result.get("type") or "").lower()
+    name = (listing_result.get("name") or "").lower()
+    for t in ["house", "cabin", "condo", "apartment", "villa", "bungalow", "cottage", "suite"]:
+        if t in prop_type:
+            return t
+        if t in name:
+            return t
+    return "home"
+
+def clean_ai_reply(reply: str, property_type="home"):
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    for signoff in bad_signoffs:
+        reply = reply.replace(signoff, "")
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(s.replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+    reply = ' '.join(filtered_lines)
+    address_patterns = [
+        r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
+        r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
+        r"at [\d]+ [\w .]+, [\w ]+"
+    ]
+    for pattern in address_patterns:
+        reply = re.sub(pattern, f"the {property_type}", reply, flags=re.IGNORECASE)
+    reply = re.sub(r"at [A-Za-z0-9 ,/\-\(\)\']+", f"at the {property_type}", reply, flags=re.IGNORECASE)
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    return reply.rstrip(",. ")
 
 SYSTEM_PROMPT = (
     "You are a vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
@@ -56,62 +99,30 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-def get_property_type(listing_result):
-    prop_type = (listing_result.get("type") or "").lower()
-    name = (listing_result.get("name") or "").lower()
-    for t in ["house", "cabin", "condo", "apartment", "villa", "bungalow", "cottage", "suite"]:
-        if t in prop_type or t in name:
-            return t
-    return "home"
-
-def summarize_listing(listing):
-    fields = [
-        "name", "propertyTypeId", "description", "houseRules", "address", "city", "zipcode", "bedroomsNumber",
-        "bedsNumber", "bathroomsNumber", "personCapacity", "maxPetsAllowed", "minNights", "maxNights", "cleaningFee",
-        "instantBookable", "cancellationPolicy", "wifiUsername", "wifiPassword", "listingAmenities", "listingBedTypes",
-        "checkInTimeStart", "checkInTimeEnd", "checkOutTime"
-    ]
+def get_property_info(listing_id):
+    if not listing_id:
+        return "", {}
+    listing = fetch_hostaway_listing(listing_id)
     result = listing.get("result", {}) if listing else {}
-    summary = {field: result.get(field) for field in fields}
-    summary["property_type"] = get_property_type(result)
-    return summary, result
-
-def summarize_reservation(res):
-    fields = [
-        "id", "listingMapId", "channelId", "channelName", "guestName", "guestFirstName", "guestLastName",
-        "numberOfGuests", "arrivalDate", "departureDate", "status", "totalPrice", "currency", "isInstantBooked"
-    ]
-    result = res.get("result", {}) if res else {}
-    summary = {field: result.get(field) for field in fields}
-    return summary, result
-
-def clean_ai_reply(reply: str, property_type="home"):
-    bad_signoffs = [
-        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
-    ]
-    for signoff in bad_signoffs:
-        reply = reply.replace(signoff, "")
-    lines = reply.split('\n')
-    filtered_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if any(stripped.startswith(s.replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
-            continue
-        if "[Your Name]" in stripped:
-            continue
-        filtered_lines.append(line)
-    reply = ' '.join(filtered_lines)
-    address_patterns = [
-        r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
-        r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
-        r"at [\d]+ [\w .]+, [\w ]+",
-        r"at [A-Za-z0-9 ,/\-\(\)\']+"  # property names
-    ]
-    for pattern in address_patterns:
-        reply = re.sub(pattern, f"the {property_type}", reply, flags=re.IGNORECASE)
-    reply = ' '.join(reply.split())
-    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
-    return reply.rstrip(",. ")
+    address = result.get("address", "")
+    city = result.get("city", "")
+    zipcode = result.get("zip", "")
+    summary = result.get("summary", "")
+    amenities = result.get("amenities", "")
+    house_manual = result.get("houseManual", "")
+    if isinstance(amenities, list):
+        amenities_str = ", ".join(amenities)
+    elif isinstance(amenities, dict):
+        amenities_str = ", ".join([k for k, v in amenities.items() if v])
+    else:
+        amenities_str = str(amenities)
+    property_info = (
+        f"Property Address: {address}, {city} {zipcode}\n"
+        f"Summary: {summary}\n"
+        f"Amenities: {amenities_str}\n"
+        f"House Manual: {house_manual[:800]}{'...' if len(house_manual) > 800 else ''}\n"
+    )
+    return property_info, result
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -126,61 +137,65 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_map_id = payload.data.get("listingMapId")
     guest_id = payload.data.get("userId", "")
 
+    guest_name = "Guest"
     guest_first_name = "Guest"
     check_in = "N/A"
     check_out = "N/A"
     guest_count = "N/A"
-    listing_name = "Unknown"
     reservation_status = payload.data.get("status", "Unknown").capitalize()
 
-    # --- Listing and Reservation Objects ---
-    listing = fetch_hostaway_resource("listings", listing_map_id) if listing_map_id else {}
-    listing_summary, listing_result = summarize_listing(listing)
-    property_type = listing_summary.get("property_type", "home")
-    logging.info(f"Listing summary: {json.dumps(listing_summary, indent=2)}")
+    # Pull in all context objects
+    listing_obj = fetch_hostaway_listing(listing_map_id) if listing_map_id else None
+    listing_result = listing_obj.get("result", {}) if listing_obj else {}
+    reservation_obj = fetch_hostaway_reservation(reservation_id) if reservation_id else None
+    reservation_result = reservation_obj.get("result", {}) if reservation_obj else {}
 
-    res = fetch_hostaway_resource("reservations", reservation_id) if reservation_id else {}
-    res_summary, res_result = summarize_reservation(res)
-    logging.info(f"Reservation summary: {json.dumps(res_summary, indent=2)}")
+    # Message thread for this conversation
+    conversation_obj = fetch_hostaway_conversation(conversation_id) if conversation_id else None
+    thread_messages = []
+    if conversation_obj and conversation_obj.get("conversationMessages"):
+        thread_messages = conversation_obj["conversationMessages"]
 
-    if res_summary.get("guestFirstName"):
-        guest_first_name = res_summary.get("guestFirstName")
-    if res_summary.get("arrivalDate"):
-        check_in = res_summary.get("arrivalDate")
-    if res_summary.get("departureDate"):
-        check_out = res_summary.get("departureDate")
-    if res_summary.get("numberOfGuests"):
-        guest_count = res_summary.get("numberOfGuests")
-    if not guest_id and res_result.get("guestId"):
-        guest_id = res_result.get("guestId")
-    if listing_summary.get("name"):
-        listing_name = listing_summary.get("name")
-    if res_summary.get("status"):
-        reservation_status = res_summary.get("status").capitalize()
+    if reservation_result:
+        guest_name = reservation_result.get("guestName", guest_name)
+        guest_first_name = reservation_result.get("guestFirstName", guest_first_name)
+        check_in = reservation_result.get("arrivalDate", check_in)
+        check_out = reservation_result.get("departureDate", check_out)
+        guest_count = reservation_result.get("numberOfGuests", guest_count)
+        if not listing_map_id:
+            listing_map_id = reservation_result.get("listingId")
+        if not guest_id:
+            guest_id = reservation_result.get("guestId", "")
 
-    # Give AI *all* info
+    property_info, _ = get_property_info(listing_map_id)
+    property_type = get_property_type(listing_result)
+
     similar_examples = get_similar_learning_examples(guest_message, listing_map_id)
     prev_answer = ""
     if similar_examples:
         prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
 
-    readable_communication = {
-        "channel": "Channel Message",
-        "email": "Email",
-        "sms": "SMS",
-        "whatsapp": "WhatsApp",
-        "airbnb": "Airbnb",
-        "vrbo": "VRBO",
-        "bookingcom": "Booking.com",
-    }.get(communication_type, communication_type.capitalize())
+    # Add conversation thread context
+    thread_context = ""
+    if thread_messages:
+        thread_context = "Conversation history:\n"
+        for msg in thread_messages[-5:]:  # Only the last 5 messages for context
+            who = "Guest" if msg.get("isIncoming") else "Host"
+            body = msg.get("body", "")
+            thread_context += f"{who}: {body}\n"
 
-    # Compose prompt with *full context*
+    # Add cancellation policy context
+    cancellation_context = get_cancellation_policy_summary(listing_result, reservation_result)
+
     prompt = (
         f"{prev_answer}"
-        f"Guest message:\n{guest_message}\n\n"
-        f"Reservation info:\n{json.dumps(res_summary, indent=2)}\n"
-        f"Listing info:\n{json.dumps(listing_summary, indent=2)}\n"
-        "Respond according to your latest rules and tone, and use listing/reservation info to make answers specific and accurate."
+        f"{thread_context}"
+        f"A guest sent this message:\n{guest_message}\n\n"
+        f"Property info:\n{property_info}\n"
+        f"Reservation context:\n{json.dumps(reservation_result)}\n"
+        f"Listing context:\n{json.dumps(listing_result)}\n"
+        f"Cancellation: {cancellation_context}\n"
+        f"Respond according to your latest rules and tone, and use all information above if needed."
     )
 
     try:
@@ -198,7 +213,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         ai_reply = "(Error generating reply.)"
 
     header = (
-        f"*New {readable_communication}* from *{guest_first_name}* at *{listing_name}*\n"
+        f"*New {communication_type.capitalize()}* from *{guest_first_name}*\n"
         f"Dates: *{check_in} → {check_out}*\n"
         f"Guests: *{guest_count}* | Status: *{reservation_status}*"
     )
