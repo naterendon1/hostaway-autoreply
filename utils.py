@@ -1,5 +1,3 @@
-# utils.py
-
 import os
 import requests
 import logging
@@ -7,32 +5,11 @@ import sqlite3
 from datetime import datetime
 from difflib import get_close_matches
 
-
-
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
-
-from typing import List
-
-def fetch_hostaway_fields(resource: str, resource_id: int, fields: List[str]):
-    """Fetch only specific fields for listing or reservation."""
-    token = get_hostaway_access_token()
-    if not token:
-        return None
-    url = f"{HOSTAWAY_API_BASE}/{resource}/{resource_id}"
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-        r.raise_for_status()
-        data = r.json()
-        result = data.get("result", {}) if data else {}
-        filtered = {f: result.get(f, None) for f in fields}
-        return filtered
-    except Exception as e:
-        logging.error(f"❌ Fetch {resource} fields error: {e}")
-        return None
 
 def get_hostaway_access_token() -> str:
     url = f"{HOSTAWAY_API_BASE}/accessTokens"
@@ -63,38 +40,12 @@ def fetch_hostaway_resource(resource: str, resource_id: int):
         logging.error(f"❌ Fetch {resource} error: {e}")
         return None
 
-def fetch_hostaway_conversation(conversation_id: int, include_resources: int = 1):
-    token = get_hostaway_access_token()
-    if not token:
+def fetch_hostaway_listing(listing_id, fields=None):
+    """
+    Fetch listing. If 'fields' is given, will return only those fields (filters locally).
+    """
+    if not listing_id:
         return None
-    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}"
-    params = {"includeResources": include_resources}
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
-        r.raise_for_status()
-        data = r.json()
-        logging.info(f"[Hostaway] Conversation object: {data}")
-        return data
-    except Exception as e:
-        logging.error(f"❌ Fetch conversation error: {e}")
-        return None
-
-def fetch_hostaway_reservation(reservation_id: int):
-    token = get_hostaway_access_token()
-    if not token:
-        return None
-    url = f"{HOSTAWAY_API_BASE}/reservations/{reservation_id}"
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-        r.raise_for_status()
-        data = r.json()
-        logging.info(f"[Hostaway] Reservation object: {data}")
-        return data
-    except Exception as e:
-        logging.error(f"❌ Fetch reservation error: {e}")
-        return None
-
-def fetch_hostaway_listing(listing_id: int):
     token = get_hostaway_access_token()
     if not token:
         return None
@@ -102,73 +53,33 @@ def fetch_hostaway_listing(listing_id: int):
     try:
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
-        data = r.json()
-        logging.info(f"[Hostaway] Listing object: {data}")
-        return data
+        result = r.json()
+        if fields:
+            filtered = {k: v for k, v in result.get("result", {}).items() if k in fields}
+            return {"result": filtered}
+        return result
     except Exception as e:
         logging.error(f"❌ Fetch listing error: {e}")
         return None
 
-def fetch_conversation_messages(conversation_id: int, limit: int = 20):
-    token = get_hostaway_access_token()
-    if not token:
-        return []
-    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}"
-    params = {"includeResources": 1}
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
-        r.raise_for_status()
-        data = r.json()
-        # Typical structure: data['conversationMessages'] is a list
-        messages = data.get('conversationMessages', [])
-        # If too many, return most recent N
-        return messages[-limit:] if messages else []
-    except Exception as e:
-        logging.error(f"❌ Fetch conversation messages error: {e}")
-        return []
+def fetch_hostaway_reservation(reservation_id):
+    return fetch_hostaway_resource("reservations", reservation_id)
 
-def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_type: str = "email") -> bool:
-    token = get_hostaway_access_token()
-    if not token:
-        return False
-    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
-    payload = {
-        "body": reply_text,
-        "isIncoming": 0,
-        "communicationType": communication_type
+def fetch_hostaway_conversation(conversation_id):
+    return fetch_hostaway_resource("conversations", conversation_id)
+
+def get_cancellation_policy_summary(listing_result, reservation_result):
+    # Compose a readable cancellation policy summary from the context
+    policy = reservation_result.get("cancellationPolicy") or listing_result.get("cancellationPolicy")
+    if not policy:
+        return "No cancellation policy found."
+    desc = {
+        "flexible": "Flexible: Full refund 1 day prior to arrival.",
+        "moderate": "Moderate: Full refund 5 days prior to arrival.",
+        "strict": "Strict: 50% refund up to 1 week before arrival."
     }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    try:
-        r = requests.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        logging.info(f"✅ Sent to Hostaway: {r.text}")
-        return True
-    except Exception as e:
-        logging.error(f"❌ Send error: {e}")
-        return False
-
-# --- Policy summarization utility ---
-
-def get_cancellation_policy_summary(listing_result=None, reservation_result=None):
-    """Returns a readable string for cancellation policy, from listing or reservation."""
-    if reservation_result:
-        policy = reservation_result.get('cancellationPolicy')
-        policy_id = reservation_result.get('cancellationPolicyId')
-        airbnb_policy = reservation_result.get('airbnbCancellationPolicy')
-        # Use channel-specific if available
-        if airbnb_policy:
-            return f"Airbnb cancellation policy: {airbnb_policy}"
-        if policy:
-            return f"Cancellation policy: {policy} (id: {policy_id})"
-    if listing_result:
-        policy = listing_result.get('cancellationPolicy')
-        policy_id = listing_result.get('cancellationPolicyId')
-        if policy:
-            return f"Cancellation policy: {policy} (id: {policy_id})"
-    return "No cancellation policy information available."
+    policy_text = desc.get(policy, f"Policy: {policy}")
+    return policy_text
 
 # --- SQLite Learning Functions ---
 def _init_learning_db():
@@ -215,7 +126,6 @@ def store_learning_example(guest_message, ai_suggestion, user_reply, listing_id,
         logging.error(f"❌ DB save error: {e}")
 
 def get_similar_learning_examples(guest_message, listing_id):
-    """ Retrieve previous replies for similar guest questions and listing. """
     _init_learning_db()
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
@@ -260,5 +170,3 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
     except Exception as e:
         logging.error(f"❌ Retrieval error: {e}")
         return None
-
-# --- END OF FILE ---
