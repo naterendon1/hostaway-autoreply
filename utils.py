@@ -7,11 +7,32 @@ import sqlite3
 from datetime import datetime
 from difflib import get_close_matches
 
+
+
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
 
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
+
+from typing import List
+
+def fetch_hostaway_fields(resource: str, resource_id: int, fields: List[str]):
+    """Fetch only specific fields for listing or reservation."""
+    token = get_hostaway_access_token()
+    if not token:
+        return None
+    url = f"{HOSTAWAY_API_BASE}/{resource}/{resource_id}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        data = r.json()
+        result = data.get("result", {}) if data else {}
+        filtered = {f: result.get(f, None) for f in fields}
+        return filtered
+    except Exception as e:
+        logging.error(f"❌ Fetch {resource} fields error: {e}")
+        return None
 
 def get_hostaway_access_token() -> str:
     url = f"{HOSTAWAY_API_BASE}/accessTokens"
