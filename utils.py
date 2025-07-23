@@ -42,6 +42,70 @@ def fetch_hostaway_resource(resource: str, resource_id: int):
         logging.error(f"❌ Fetch {resource} error: {e}")
         return None
 
+def fetch_hostaway_conversation(conversation_id: int, include_resources: int = 1):
+    token = get_hostaway_access_token()
+    if not token:
+        return None
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}"
+    params = {"includeResources": include_resources}
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
+        r.raise_for_status()
+        data = r.json()
+        logging.info(f"[Hostaway] Conversation object: {data}")
+        return data
+    except Exception as e:
+        logging.error(f"❌ Fetch conversation error: {e}")
+        return None
+
+def fetch_hostaway_reservation(reservation_id: int):
+    token = get_hostaway_access_token()
+    if not token:
+        return None
+    url = f"{HOSTAWAY_API_BASE}/reservations/{reservation_id}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        data = r.json()
+        logging.info(f"[Hostaway] Reservation object: {data}")
+        return data
+    except Exception as e:
+        logging.error(f"❌ Fetch reservation error: {e}")
+        return None
+
+def fetch_hostaway_listing(listing_id: int):
+    token = get_hostaway_access_token()
+    if not token:
+        return None
+    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        data = r.json()
+        logging.info(f"[Hostaway] Listing object: {data}")
+        return data
+    except Exception as e:
+        logging.error(f"❌ Fetch listing error: {e}")
+        return None
+
+def fetch_conversation_messages(conversation_id: int, limit: int = 20):
+    token = get_hostaway_access_token()
+    if not token:
+        return []
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}"
+    params = {"includeResources": 1}
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
+        r.raise_for_status()
+        data = r.json()
+        # Typical structure: data['conversationMessages'] is a list
+        messages = data.get('conversationMessages', [])
+        # If too many, return most recent N
+        return messages[-limit:] if messages else []
+    except Exception as e:
+        logging.error(f"❌ Fetch conversation messages error: {e}")
+        return []
+
 def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_type: str = "email") -> bool:
     token = get_hostaway_access_token()
     if not token:
@@ -64,6 +128,26 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_
     except Exception as e:
         logging.error(f"❌ Send error: {e}")
         return False
+
+# --- Policy summarization utility ---
+
+def get_cancellation_policy_summary(listing_result=None, reservation_result=None):
+    """Returns a readable string for cancellation policy, from listing or reservation."""
+    if reservation_result:
+        policy = reservation_result.get('cancellationPolicy')
+        policy_id = reservation_result.get('cancellationPolicyId')
+        airbnb_policy = reservation_result.get('airbnbCancellationPolicy')
+        # Use channel-specific if available
+        if airbnb_policy:
+            return f"Airbnb cancellation policy: {airbnb_policy}"
+        if policy:
+            return f"Cancellation policy: {policy} (id: {policy_id})"
+    if listing_result:
+        policy = listing_result.get('cancellationPolicy')
+        policy_id = listing_result.get('cancellationPolicyId')
+        if policy:
+            return f"Cancellation policy: {policy} (id: {policy_id})"
+    return "No cancellation policy information available."
 
 # --- SQLite Learning Functions ---
 def _init_learning_db():
@@ -115,7 +199,6 @@ def get_similar_learning_examples(guest_message, listing_id):
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
         c = conn.cursor()
-        # This is a simple LIKE match. For real production, consider semantic search!
         c.execute('''
             SELECT guest_message, ai_suggestion, user_reply FROM learning_examples
             WHERE listing_id = ? AND guest_message LIKE ?
@@ -130,10 +213,6 @@ def get_similar_learning_examples(guest_message, listing_id):
         return []
 
 def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8):
-    """
-    Look for a previously learned user_reply for similar guest questions and the same listing.
-    Returns the best match or None.
-    """
     _init_learning_db()
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
@@ -147,13 +226,11 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
         rows = c.fetchall()
         conn.close()
         questions = [row[0] for row in rows]
-        # Simple fuzzy match with difflib
         matches = get_close_matches(guest_message, questions, n=1, cutoff=cutoff)
         if matches:
             idx = questions.index(matches[0])
             user_reply = rows[idx][1]
             found_guest_id = rows[idx][2]
-            # Optionally prioritize same guest
             if guest_id and found_guest_id == guest_id:
                 return user_reply
             if not guest_id:
@@ -162,3 +239,5 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
     except Exception as e:
         logging.error(f"❌ Retrieval error: {e}")
         return None
+
+# --- END OF FILE ---
