@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import re
+import copy
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
@@ -101,6 +102,7 @@ async def slack_actions(request: Request):
         if action_id == "write_own":
             meta = get_meta_from_action(action)
             listing_id = meta.get("listing_id", None)
+            _, listing_result = {}, {}
             property_type = "home"
             modal = {
                 "type": "modal",
@@ -138,6 +140,7 @@ async def slack_actions(request: Request):
         if action_id == "edit":
             meta = get_meta_from_action(action)
             listing_id = meta.get("listing_id", None)
+            _, listing_result = {}, {}
             property_type = "home"
             draft = clean_ai_reply(meta.get("draft", ""), property_type)
             modal = {
@@ -174,7 +177,7 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
-        # ------------------- FIXED improve_with_ai -------------------
+        # ------ PATCHED improve_with_ai ------
         if action_id == "improve_with_ai":
             logging.info("🚀 Improve with AI clicked.")
             view = payload.get("view", {})
@@ -185,6 +188,7 @@ async def slack_actions(request: Request):
                 if v.get("value") is not None:
                     edited_text = v.get("value")
             logging.info(f"User's draft text: {edited_text}")
+
             meta = json.loads(view.get("private_metadata", "{}"))
             guest_message = meta.get("guest_message", "")
             listing_id = meta.get("listing_id", None)
@@ -221,11 +225,7 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved reply.)"
 
-            view_id = view.get("id")
-            if not view_id:
-                logging.error("No view_id found in payload; cannot update modal!")
-                return JSONResponse({"text": "Could not update modal, missing view_id."})
-
+            # Rebuild modal view with improved reply
             new_modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
@@ -257,14 +257,22 @@ async def slack_actions(request: Request):
                     }
                 ]
             }
-            logging.info(f"Modal to send to Slack:\n{json.dumps(new_modal, indent=2)}")
 
+            view_id = view.get("id")
+            hash_val = view.get("hash")
+            logging.info(f"Modal to send to Slack:\n{json.dumps(new_modal, indent=2)}")
+            logging.info(f"Updating Slack view_id: {view_id}, hash: {hash_val}")
+
+            # --- The key Slack call ---
             slack_client.views_update(
                 view_id=view_id,
+                hash=hash_val,
                 view=new_modal
             )
+            # Slack requires you to acknowledge the HTTP request even after updating
             return JSONResponse({})
-        # ----------------- END improve_with_ai ----------------------
+
+        # ------ END PATCHED improve_with_ai ------
 
         if action_id == "send":
             meta = get_meta_from_action(action)
@@ -314,3 +322,4 @@ async def slack_actions(request: Request):
         return JSONResponse({"response_action": "update", "view": done_modal})
 
     return JSONResponse({"text": "Action received."})
+
