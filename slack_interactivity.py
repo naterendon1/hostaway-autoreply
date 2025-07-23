@@ -177,60 +177,69 @@ async def slack_actions(request: Request):
             return JSONResponse({})
 
         if action_id == "improve_with_ai":
-            view = payload.get("view", {})
-            state = view.get("state", {}).get("values", {})
-            reply_block = state.get("reply_input", {})
-            edited_text = None
-            for v in reply_block.values():
-                edited_text = v.get("value")
-            meta = json.loads(view.get("private_metadata", "{}"))
-            guest_message = meta.get("guest_message", "")
-            listing_id = meta.get("listing_id", None)
-            guest_id = meta.get("guest_id", None)
-            ai_suggestion = meta.get("ai_suggestion", "")
+    logging.info("🚀 Improve with AI clicked.")
+    view = payload.get("view", {})
+    state = view.get("state", {}).get("values", {})
+    reply_block = state.get("reply_input", {})
+    edited_text = None
+    for v in reply_block.values():
+        edited_text = v.get("value")
+    meta = json.loads(view.get("private_metadata", "{}"))
+    guest_message = meta.get("guest_message", "")
+    listing_id = meta.get("listing_id", None)
+    guest_id = meta.get("guest_id", None)
+    ai_suggestion = meta.get("ai_suggestion", "")
 
-            # For editing, just pass what we got. Field filtering is handled in webhook
-            property_type = "home"
-            similar_examples = get_similar_learning_examples(guest_message, listing_id)
-            prev_answer = ""
-            if similar_examples:
-                prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
+    property_type = "home"
+    similar_examples = get_similar_learning_examples(guest_message, listing_id)
+    prev_answer = ""
+    if similar_examples:
+        prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
 
-            meta_lines = "\n".join([f"{k}: {v}" for k, v in meta.items() if k not in [
-                "guest_message", "listing_id", "ai_suggestion", "draft", "reply", "conv_id"
-            ]])
+    meta_lines = "\n".join([f"{k}: {v}" for k, v in meta.items() if k not in [
+        "guest_message", "listing_id", "ai_suggestion", "draft", "reply", "conv_id"
+    ]])
 
-            prompt = (
-                f"{prev_answer}"
-                f"A guest sent this message:\n{guest_message}\n\n"
-                f"Other data:\n{meta_lines}\n"
-                "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
-                "If you don't know the answer from the details provided, say you will check and get back to them. "
-                f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
-                f"{edited_text}"
-            )
-            try:
-                response = openai_client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                improved = clean_ai_reply(response.choices[0].message.content.strip(), property_type)
-            except Exception as e:
-                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
-                improved = "(Error generating improved reply.)"
+    prompt = (
+        f"{prev_answer}"
+        f"A guest sent this message:\n{guest_message}\n\n"
+        f"Other data:\n{meta_lines}\n"
+        "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
+        "If you don't know the answer from the details provided, say you will check and get back to them. "
+        f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
+        f"{edited_text}"
+    )
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        improved = clean_ai_reply(response.choices[0].message.content.strip(), property_type)
+        logging.info(f"🚀 Sending improved reply back: {improved[:100]}")
+    except Exception as e:
+        logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+        improved = "(Error generating improved reply.)"
 
-            new_modal = view.copy()
-            new_blocks = []
-            for block in new_modal["blocks"]:
-                if block["type"] == "input" and block["block_id"] == "reply_input":
-                    block["element"]["initial_value"] = improved
-                new_blocks.append(block)
-            new_modal["blocks"] = new_blocks
+    # Defensive: ensure input block exists and gets updated
+    new_modal = view.copy()
+    new_blocks = []
+    found = False
+    for block in new_modal["blocks"]:
+        if block["type"] == "input" and block.get("block_id") == "reply_input":
+            block = block.copy()
+            block["element"] = block["element"].copy()
+            block["element"]["initial_value"] = improved
+            found = True
+        new_blocks.append(block)
+    new_modal["blocks"] = new_blocks
 
-            return JSONResponse({"response_action": "update", "view": new_modal})
+    if not found:
+        logging.error("No reply_input block found in modal for update!")
+
+    return JSONResponse({"response_action": "update", "view": new_modal})
 
         if action_id == "send":
             meta = get_meta_from_action(action)
