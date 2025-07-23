@@ -100,9 +100,6 @@ async def slack_actions(request: Request):
 
         if action_id == "write_own":
             meta = get_meta_from_action(action)
-            listing_id = meta.get("listing_id", None)
-            _, listing_result = {}, {}
-            property_type = "home"
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
@@ -138,10 +135,7 @@ async def slack_actions(request: Request):
 
         if action_id == "edit":
             meta = get_meta_from_action(action)
-            listing_id = meta.get("listing_id", None)
-            _, listing_result = {}, {}
-            property_type = "home"
-            draft = clean_ai_reply(meta.get("draft", ""), property_type)
+            draft = clean_ai_reply(meta.get("draft", ""), "home")
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
@@ -176,7 +170,6 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
-        # Improved "improve_with_ai" handler (re-open modal for reliability)
         if action_id == "improve_with_ai":
             logging.info("🚀 Improve with AI clicked.")
             view = payload.get("view", {})
@@ -223,9 +216,9 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved reply.)"
 
-            # Re-open modal with improved text for best Slack reliability
-            slack_client.views_open(
-                trigger_id=trigger_id,
+            # Update the currently open modal in-place using views_update!
+            slack_client.views_update(
+                view_id=view["id"],
                 view={
                     "type": "modal",
                     "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
