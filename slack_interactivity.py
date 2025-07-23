@@ -176,7 +176,7 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
-        # ------------- UPDATED "improve_with_ai" -------------
+        # ----- Improved "improve_with_ai" handler -----
         if action_id == "improve_with_ai":
             logging.info("🚀 Improve with AI clicked.")
             view = payload.get("view", {})
@@ -223,29 +223,23 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved reply.)"
 
-            # Update modal with improved text
-                # Defensive: update input block with improved reply
-                import copy
-                new_modal = copy.deepcopy(view)
-                updated = False
-                for block in new_modal["blocks"]:
-                    if block["type"] == "input" and block.get("block_id") == "reply_input":
-                        if "element" in block and "initial_value" in block["element"]:
-                            block["element"]["initial_value"] = improved
-                                updated = True
-                            elif "element" in block:
-                            block["element"]["initial_value"] = improved
-                            updated = True
+            # Defensive: update input block with improved reply
+            import copy
+            new_modal = copy.deepcopy(view)
+            updated = False
+            for block in new_modal["blocks"]:
+                if block["type"] == "input" and block.get("block_id") == "reply_input":
+                    if "element" in block:
+                        block["element"]["initial_value"] = improved
+                        updated = True
 
-                if not updated:
-        logging.error("No reply_input block found in modal for update!")
-                        logging.info("JSONResponse to Slack:\n%s", json.dumps({"response_action": "update", "view": new_modal}))
+            if not updated:
+                logging.error("No reply_input block found in modal for update!")
 
+            logging.info("Returning modal update to Slack: %s", json.dumps(new_modal))
+            return JSONResponse({"response_action": "update", "view": new_modal})
 
-    logging.info("Returning modal update to Slack: %s", json.dumps(new_modal))
-    return JSONResponse({"response_action": "update", "view": new_modal})
-
-        # ------------- END "improve_with_ai" -------------
+        # ----- End improve_with_ai handler -----
 
         if action_id == "send":
             meta = get_meta_from_action(action)
