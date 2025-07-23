@@ -7,13 +7,9 @@ from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
 from utils import (
     send_reply_to_hostaway,
-    fetch_hostaway_listing,
-    fetch_hostaway_reservation,
-    fetch_hostaway_conversation,
-    fetch_conversation_messages,
+    fetch_hostaway_resource,
     store_learning_example,
-    get_similar_learning_examples,
-    get_cancellation_policy_summary,
+    get_similar_learning_examples
 )
 from openai import OpenAI
 
@@ -85,31 +81,6 @@ SYSTEM_PROMPT = (
     "Always be helpful and accurate, but always brief."
 )
 
-def get_property_info(listing_id):
-    if not listing_id:
-        return "", {}
-    listing = fetch_hostaway_listing(listing_id)
-    result = listing.get("result", {}) if listing else {}
-    address = result.get("address", "")
-    city = result.get("city", "")
-    zipcode = result.get("zip", "")
-    summary = result.get("summary", "")
-    amenities = result.get("amenities", "")
-    house_manual = result.get("houseManual", "")
-    if isinstance(amenities, list):
-        amenities_str = ", ".join(amenities)
-    elif isinstance(amenities, dict):
-        amenities_str = ", ".join([k for k, v in amenities.items() if v])
-    else:
-        amenities_str = str(amenities)
-    property_info = (
-        f"Property Address: {address}, {city} {zipcode}\n"
-        f"Summary: {summary}\n"
-        f"Amenities: {amenities_str}\n"
-        f"House Manual: {house_manual[:800]}{'...' if len(house_manual) > 800 else ''}\n"
-    )
-    return property_info, result
-
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
     form = await request.form()
@@ -127,41 +98,11 @@ async def slack_actions(request: Request):
         def get_meta_from_action(action):
             return json.loads(action["value"]) if "value" in action else {}
 
-        if action_id in ["write_own", "edit", "improve_with_ai"]:
-            meta = get_meta_from_action(action) if action_id != "improve_with_ai" else json.loads(payload["view"]["private_metadata"])
-            listing_id = meta.get("listing_id", None)
-            reservation_id = meta.get("reservation_id", None)
-            conversation_id = meta.get("conv_id", None)
-            guest_message = meta.get("guest_message", "")
-            ai_suggestion = meta.get("ai_suggestion", "")
-            guest_id = meta.get("guest_id", None)
-
-            # Get all context objects for AI prompt
-            _, listing_result = get_property_info(listing_id)
-            property_type = get_property_type(listing_result)
-            reservation_result = None
-            if reservation_id:
-                reservation_obj = fetch_hostaway_reservation(reservation_id)
-                reservation_result = reservation_obj.get("result", {}) if reservation_obj else {}
-
-            # Thread context for this conversation
-            thread_messages = []
-            if conversation_id:
-                conversation_obj = fetch_hostaway_conversation(conversation_id)
-                if conversation_obj and conversation_obj.get("conversationMessages"):
-                    thread_messages = conversation_obj["conversationMessages"]
-
-            # Context for prompt
-            thread_context = ""
-            if thread_messages:
-                thread_context = "Conversation history:\n"
-                for msg in thread_messages[-5:]:
-                    who = "Guest" if msg.get("isIncoming") else "Host"
-                    body = msg.get("body", "")
-                    thread_context += f"{who}: {body}\n"
-            cancellation_context = get_cancellation_policy_summary(listing_result, reservation_result)
-
         if action_id == "write_own":
+            meta = get_meta_from_action(action)
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = {}, {}
+            property_type = "home"
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
@@ -196,6 +137,10 @@ async def slack_actions(request: Request):
             return JSONResponse({})
 
         if action_id == "edit":
+            meta = get_meta_from_action(action)
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = {}, {}
+            property_type = "home"
             draft = clean_ai_reply(meta.get("draft", ""), property_type)
             modal = {
                 "type": "modal",
@@ -238,17 +183,27 @@ async def slack_actions(request: Request):
             edited_text = None
             for v in reply_block.values():
                 edited_text = v.get("value")
+            meta = json.loads(view.get("private_metadata", "{}"))
+            guest_message = meta.get("guest_message", "")
+            listing_id = meta.get("listing_id", None)
+            guest_id = meta.get("guest_id", None)
+            ai_suggestion = meta.get("ai_suggestion", "")
+
+            # For editing, just pass what we got. Field filtering is handled in webhook
+            property_type = "home"
             similar_examples = get_similar_learning_examples(guest_message, listing_id)
             prev_answer = ""
             if similar_examples:
                 prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
+
+            meta_lines = "\n".join([f"{k}: {v}" for k, v in meta.items() if k not in [
+                "guest_message", "listing_id", "ai_suggestion", "draft", "reply", "conv_id"
+            ]])
+
             prompt = (
                 f"{prev_answer}"
-                f"{thread_context}"
                 f"A guest sent this message:\n{guest_message}\n\n"
-                f"Property info:\n{json.dumps(listing_result)}\n"
-                f"Reservation context:\n{json.dumps(reservation_result) if reservation_result else ''}\n"
-                f"Cancellation: {cancellation_context}\n"
+                f"Other data:\n{meta_lines}\n"
                 "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
                 "If you don't know the answer from the details provided, say you will check and get back to them. "
                 f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
@@ -281,8 +236,7 @@ async def slack_actions(request: Request):
             meta = get_meta_from_action(action)
             conv_id = meta.get("conv_id")
             listing_id = meta.get("listing_id", None)
-            _, listing_result = get_property_info(listing_id)
-            property_type = get_property_type(listing_result)
+            property_type = "home"
             reply = clean_ai_reply(meta.get("reply", ""), property_type)
             type_ = meta.get("type")
             guest_message = meta.get("guest_message", "")
@@ -305,8 +259,7 @@ async def slack_actions(request: Request):
         meta = json.loads(view.get("private_metadata", "{}"))
         conv_id = meta.get("conv_id")
         listing_id = meta.get("listing_id")
-        _, listing_result = get_property_info(listing_id)
-        property_type = get_property_type(listing_result)
+        property_type = "home"
         guest_message = meta.get("guest_message", "")
         type_ = meta.get("type")
         guest_id = meta.get("guest_id")
