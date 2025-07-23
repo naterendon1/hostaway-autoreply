@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import re
+import pprint
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
@@ -100,6 +101,9 @@ async def slack_actions(request: Request):
 
         if action_id == "write_own":
             meta = get_meta_from_action(action)
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = {}, {}
+            property_type = "home"
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
@@ -135,7 +139,10 @@ async def slack_actions(request: Request):
 
         if action_id == "edit":
             meta = get_meta_from_action(action)
-            draft = clean_ai_reply(meta.get("draft", ""), "home")
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = {}, {}
+            property_type = "home"
+            draft = clean_ai_reply(meta.get("draft", ""), property_type)
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
@@ -170,9 +177,11 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
+        # ----- Improved "improve_with_ai" handler -----
         if action_id == "improve_with_ai":
             logging.info("🚀 Improve with AI clicked.")
             view = payload.get("view", {})
+            view_id = view.get("id")
             state = view.get("state", {}).get("values", {})
             reply_block = state.get("reply_input", {})
             edited_text = None
@@ -216,42 +225,49 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved reply.)"
 
-            # Update the currently open modal in-place using views_update!
-            slack_client.views_update(
-                view_id=view["id"],
-                view={
-                    "type": "modal",
-                    "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
-                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                    "private_metadata": view.get("private_metadata"),
-                    "blocks": [
-                        {
-                            "type": "input",
-                            "block_id": "reply_input",
-                            "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                            "element": {
-                                "type": "plain_text_input",
-                                "action_id": "reply",
-                                "multiline": True,
-                                "initial_value": improved
-                            }
-                        },
-                        {
-                            "type": "actions",
-                            "block_id": "improve_ai_block",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "action_id": "improve_with_ai",
-                                    "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
-                                }
-                            ]
+            # Defensive: update input block with improved reply via views_update
+            modal_view = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": view.get("private_metadata"),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True,
+                            "initial_value": improved
                         }
-                    ]
-                }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            }
+                        ]
+                    }
+                ]
+            }
+
+            logging.info("Modal to send to Slack:\n%s", pprint.pformat(modal_view))
+
+            # Use views_update to update the same modal (not views_open)
+            slack_client.views_update(
+                view_id=view_id,
+                view=modal_view
             )
             return JSONResponse({})
+
+        # ----- End improve_with_ai handler -----
 
         if action_id == "send":
             meta = get_meta_from_action(action)
