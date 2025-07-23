@@ -1,14 +1,16 @@
-from fastapi import FastAPI
-from slack_interactivity import router as slack_router
-from pydantic import BaseModel
 import os
 import logging
 import json
 import re
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from slack_interactivity import router as slack_router
+from utils import (
+    fetch_hostaway_resource,
+    get_similar_learning_examples
+)
 from openai import OpenAI
-from utils import fetch_hostaway_resource, get_similar_learning_examples
-
-from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 
@@ -21,7 +23,6 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 app = FastAPI()
 app.include_router(slack_router)
-
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM_PROMPT = (
@@ -32,7 +33,7 @@ SYSTEM_PROMPT = (
     "Never use sign-offs like 'Enjoy your meal', 'Enjoy your meals', 'Enjoy!', 'Best', or your name. Only use a simple closing like 'Let me know if you need anything else' or 'Let me know if you need more recommendations' if it’s natural for the situation, and leave it off entirely if the message already feels complete. "
     "Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
     "Greet the guest casually using their first name if known, then answer their question immediately. "
-    "Never include the property’s address, city, or zip in your answer unless the guest specifically asks for it. "
+    "Never include the property’s address, city, zip, or property name in your answer unless the guest specifically asks for it. Instead, refer to it as 'the house', 'the condo', or the appropriate property type. "
     "If you don’t know the answer, say you’ll check and get back to them. "
     "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
     "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions directly. "
@@ -55,7 +56,36 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-def clean_ai_reply(reply: str) -> str:
+def get_property_type(listing_result):
+    prop_type = (listing_result.get("type") or "").lower()
+    name = (listing_result.get("name") or "").lower()
+    for t in ["house", "cabin", "condo", "apartment", "villa", "bungalow", "cottage", "suite"]:
+        if t in prop_type or t in name:
+            return t
+    return "home"
+
+def summarize_listing(listing):
+    fields = [
+        "name", "propertyTypeId", "description", "houseRules", "address", "city", "zipcode", "bedroomsNumber",
+        "bedsNumber", "bathroomsNumber", "personCapacity", "maxPetsAllowed", "minNights", "maxNights", "cleaningFee",
+        "instantBookable", "cancellationPolicy", "wifiUsername", "wifiPassword", "listingAmenities", "listingBedTypes",
+        "checkInTimeStart", "checkInTimeEnd", "checkOutTime"
+    ]
+    result = listing.get("result", {}) if listing else {}
+    summary = {field: result.get(field) for field in fields}
+    summary["property_type"] = get_property_type(result)
+    return summary, result
+
+def summarize_reservation(res):
+    fields = [
+        "id", "listingMapId", "channelId", "channelName", "guestName", "guestFirstName", "guestLastName",
+        "numberOfGuests", "arrivalDate", "departureDate", "status", "totalPrice", "currency", "isInstantBooked"
+    ]
+    result = res.get("result", {}) if res else {}
+    summary = {field: result.get(field) for field in fields}
+    return summary, result
+
+def clean_ai_reply(reply: str, property_type="home"):
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
     ]
@@ -71,82 +101,17 @@ def clean_ai_reply(reply: str) -> str:
             continue
         filtered_lines.append(line)
     reply = ' '.join(filtered_lines)
-    # Remove any address/city if not explicitly asked
     address_patterns = [
         r"(the )?house at [\d]+ [^,]+, [A-Za-z ]+",
         r"\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
-        r"at [\d]+ [\w .]+, [\w ]+"
+        r"at [\d]+ [\w .]+, [\w ]+",
+        r"at [A-Za-z0-9 ,/\-\(\)\']+"  # property names
     ]
     for pattern in address_patterns:
-        reply = re.sub(pattern, "the house", reply, flags=re.IGNORECASE)
+        reply = re.sub(pattern, f"the {property_type}", reply, flags=re.IGNORECASE)
     reply = ' '.join(reply.split())
     reply = reply.strip().replace(" ,", ",").replace(" .", ".")
     return reply.rstrip(",. ")
-
-def get_property_info(listing_id):
-    property_info = ""
-    if not listing_id:
-        return property_info
-    listing = fetch_hostaway_resource("listings", listing_id)
-    result = listing.get("result", {}) if listing else {}
-    address = result.get("address", "")
-    city = result.get("city", "")
-    zipcode = result.get("zip", "")
-    summary = result.get("summary", "")
-    amenities = result.get("amenities", "")
-    house_manual = result.get("houseManual", "")
-    if isinstance(amenities, list):
-        amenities_str = ", ".join(amenities)
-    elif isinstance(amenities, dict):
-        amenities_str = ", ".join([k for k, v in amenities.items() if v])
-    else:
-        amenities_str = str(amenities)
-    property_info = (
-        f"Property Address: {address}, {city} {zipcode}\n"
-        f"Summary: {summary}\n"
-        f"Amenities: {amenities_str}\n"
-        f"House Manual: {house_manual[:800]}{'...' if len(house_manual) > 800 else ''}\n"
-    )
-    return property_info
-
-def get_property_type(listing_result: dict):
-    # Looks for property type in Hostaway API response
-    type_ = listing_result.get("type", "")
-    if not type_:
-        # fallback: try to guess from name or summary
-        name = listing_result.get("name", "").lower()
-        summary = listing_result.get("summary", "").lower()
-        for prop in ["house", "condo", "cabin", "villa", "apartment", "studio", "townhome"]:
-            if prop in name or prop in summary:
-                return prop
-        return "property"
-    return type_.lower()
-
-def is_availability_question(message: str) -> bool:
-    patterns = [
-        r"(are|is) (these|those|the) dates available",
-        r"can i book (these|those|the) dates",
-        r"(do you have|any) availability",
-        r"are you available (on|for|during)",
-        r"(is|are) the (house|property|place|condo|cabin|apartment|listing) (available|free)",
-        r"available for (these|those|the) dates",
-    ]
-    message = message.lower()
-    return any(re.search(p, message) for p in patterns)
-
-def check_availability(listing_id, arrival, departure):
-    calendar = fetch_hostaway_resource("calendar", listing_id)
-    if not calendar or "result" not in calendar:
-        return None  # Can't check
-    date = datetime.strptime(arrival, "%Y-%m-%d")
-    end_date = datetime.strptime(departure, "%Y-%m-%d")
-    while date < end_date:
-        day_str = date.strftime("%Y-%m-%d")
-        day = next((d for d in calendar['result'] if d.get("date") == day_str), None)
-        if not day or not day.get("available", True):
-            return False
-        date += timedelta(days=1)
-    return True
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -161,7 +126,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_map_id = payload.data.get("listingMapId")
     guest_id = payload.data.get("userId", "")
 
-    guest_name = "Guest"
     guest_first_name = "Guest"
     check_in = "N/A"
     check_out = "N/A"
@@ -169,25 +133,32 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_name = "Unknown"
     reservation_status = payload.data.get("status", "Unknown").capitalize()
 
-    if reservation_id:
-        res = fetch_hostaway_resource("reservations", reservation_id)
-        result = res.get("result", {}) if res else {}
-        guest_name = result.get("guestName", guest_name)
-        guest_first_name = result.get("guestFirstName", guest_first_name)
-        check_in = result.get("arrivalDate", check_in)
-        check_out = result.get("departureDate", check_out)
-        guest_count = result.get("numberOfGuests", guest_count)
-        if not listing_map_id:
-            listing_map_id = result.get("listingId")
-        if not guest_id:
-            guest_id = result.get("guestId", "")
-
-    property_info = get_property_info(listing_map_id)
+    # --- Listing and Reservation Objects ---
     listing = fetch_hostaway_resource("listings", listing_map_id) if listing_map_id else {}
-    listing_result = listing.get("result", {}) if listing else {}
-    listing_name = listing_result.get("name", listing_name)
-    property_type = get_property_type(listing_result)
+    listing_summary, listing_result = summarize_listing(listing)
+    property_type = listing_summary.get("property_type", "home")
+    logging.info(f"Listing summary: {json.dumps(listing_summary, indent=2)}")
 
+    res = fetch_hostaway_resource("reservations", reservation_id) if reservation_id else {}
+    res_summary, res_result = summarize_reservation(res)
+    logging.info(f"Reservation summary: {json.dumps(res_summary, indent=2)}")
+
+    if res_summary.get("guestFirstName"):
+        guest_first_name = res_summary.get("guestFirstName")
+    if res_summary.get("arrivalDate"):
+        check_in = res_summary.get("arrivalDate")
+    if res_summary.get("departureDate"):
+        check_out = res_summary.get("departureDate")
+    if res_summary.get("numberOfGuests"):
+        guest_count = res_summary.get("numberOfGuests")
+    if not guest_id and res_result.get("guestId"):
+        guest_id = res_result.get("guestId")
+    if listing_summary.get("name"):
+        listing_name = listing_summary.get("name")
+    if res_summary.get("status"):
+        reservation_status = res_summary.get("status").capitalize()
+
+    # Give AI *all* info
     similar_examples = get_similar_learning_examples(guest_message, listing_map_id)
     prev_answer = ""
     if similar_examples:
@@ -203,49 +174,28 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "bookingcom": "Booking.com",
     }.get(communication_type, communication_type.capitalize())
 
-    # ---- New: Handle direct date-availability questions using calendar ----
-    if (
-        is_availability_question(guest_message)
-        and listing_map_id
-        and check_in != "N/A"
-        and check_out != "N/A"
-        and reservation_status == "Sent"
-    ):
-        availability = check_availability(listing_map_id, check_in, check_out)
-        if availability is None:
-            ai_reply = f"Sorry, I wasn't able to check the calendar right now. I'll check and get back to you soon."
-        elif availability:
-            ai_reply = f"Yes, the {property_type} is available for your requested dates."
-        else:
-            ai_reply = f"Sorry, the {property_type} is already booked for those dates."
-        ai_reply = clean_ai_reply(ai_reply)
-    else:
-        prompt = (
-            f"{prev_answer}"
-            f"A guest sent this message:\n{guest_message}\n\n"
-            f"Property info:\n{property_info}\n"
-            f"Conversation meta:\n"
-            f"Property type: {property_type}\n"
-            f"Dates: {check_in} to {check_out}\n"
-            f"Guest name: {guest_first_name}\n"
-            f"Guest count: {guest_count}\n"
-            f"Reservation status: {reservation_status}\n"
-            f"Communication type: {readable_communication}\n"
-            "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate."
+    # Compose prompt with *full context*
+    prompt = (
+        f"{prev_answer}"
+        f"Guest message:\n{guest_message}\n\n"
+        f"Reservation info:\n{json.dumps(res_summary, indent=2)}\n"
+        f"Listing info:\n{json.dumps(listing_summary, indent=2)}\n"
+        "Respond according to your latest rules and tone, and use listing/reservation info to make answers specific and accurate."
+    )
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ]
         )
-        try:
-            response = openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            ai_reply = response.choices[0].message.content.strip()
-            ai_reply = clean_ai_reply(ai_reply)
-        except Exception as e:
-            logging.error(f"❌ OpenAI error: {e}")
-            ai_reply = "(Error generating reply.)"
+        ai_reply = response.choices[0].message.content.strip()
+        ai_reply = clean_ai_reply(ai_reply, property_type)
+    except Exception as e:
+        logging.error(f"❌ OpenAI error: {e}")
+        ai_reply = "(Error generating reply.)"
 
     header = (
         f"*New {readable_communication}* from *{guest_first_name}* at *{listing_name}*\n"
