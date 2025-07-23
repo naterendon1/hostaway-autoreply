@@ -2,7 +2,6 @@ import os
 import logging
 import json
 import re
-import copy
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
@@ -177,7 +176,7 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
-        # ------ PATCHED improve_with_ai ------
+        # --- MAIN FIX: Use views_push so the improved reply is always visible ---
         if action_id == "improve_with_ai":
             logging.info("🚀 Improve with AI clicked.")
             view = payload.get("view", {})
@@ -225,8 +224,8 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved reply.)"
 
-            # Rebuild modal view with improved reply
-            new_modal = {
+            # Build improved modal
+            improved_modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
@@ -258,21 +257,16 @@ async def slack_actions(request: Request):
                 ]
             }
 
-            view_id = view.get("id")
-            hash_val = view.get("hash")
-            logging.info(f"Modal to send to Slack:\n{json.dumps(new_modal, indent=2)}")
-            logging.info(f"Updating Slack view_id: {view_id}, hash: {hash_val}")
-
-            # --- The key Slack call ---
-            slack_client.views_update(
-                view_id=view_id,
-                hash=hash_val,
-                view=new_modal
-            )
-            # Slack requires you to acknowledge the HTTP request even after updating
+            # Use views_push (with trigger_id) so modal *always* shows up to the user!
+            try:
+                logging.info(f"Pushing improved modal via views_push (trigger_id={trigger_id})")
+                slack_client.views_push(
+                    trigger_id=trigger_id,
+                    view=improved_modal
+                )
+            except Exception as e:
+                logging.error(f"Failed to push improved modal: {e}")
             return JSONResponse({})
-
-        # ------ END PATCHED improve_with_ai ------
 
         if action_id == "send":
             meta = get_meta_from_action(action)
@@ -322,4 +316,3 @@ async def slack_actions(request: Request):
         return JSONResponse({"response_action": "update", "view": done_modal})
 
     return JSONResponse({"text": "Action received."})
-
