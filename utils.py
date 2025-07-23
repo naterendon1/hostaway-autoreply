@@ -41,9 +41,6 @@ def fetch_hostaway_resource(resource: str, resource_id: int):
         return None
 
 def fetch_hostaway_listing(listing_id, fields=None):
-    """
-    Fetch listing. If 'fields' is given, will return only those fields (filters locally).
-    """
     if not listing_id:
         return None
     token = get_hostaway_access_token()
@@ -68,8 +65,36 @@ def fetch_hostaway_reservation(reservation_id):
 def fetch_hostaway_conversation(conversation_id):
     return fetch_hostaway_resource("conversations", conversation_id)
 
+def fetch_conversation_messages(conversation_id):
+    obj = fetch_hostaway_conversation(conversation_id)
+    if obj and "conversationMessages" in obj:
+        return obj["conversationMessages"]
+    return []
+
+def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_type: str = "email") -> bool:
+    token = get_hostaway_access_token()
+    if not token:
+        return False
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
+    payload = {
+        "body": reply_text,
+        "isIncoming": 0,
+        "communicationType": communication_type
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        logging.info(f"✅ Sent to Hostaway: {r.text}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Send error: {e}")
+        return False
+
 def get_cancellation_policy_summary(listing_result, reservation_result):
-    # Compose a readable cancellation policy summary from the context
     policy = reservation_result.get("cancellationPolicy") or listing_result.get("cancellationPolicy")
     if not policy:
         return "No cancellation policy found."
