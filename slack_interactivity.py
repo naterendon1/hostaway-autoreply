@@ -2,56 +2,24 @@ import os
 import logging
 import json
 import re
-from fastapi import FastAPI
-from slack_interactivity import router as slack_router
-from pydantic import BaseModel
-from openai import OpenAI
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+from slack_sdk import WebClient
 from utils import (
+    send_reply_to_hostaway,
     fetch_hostaway_resource,
-    fetch_hostaway_listing,
-    fetch_hostaway_reservation,
-    fetch_hostaway_conversation,
-    get_cancellation_policy_summary,
-    get_similar_learning_examples,
+    store_learning_example,
+    get_similar_learning_examples
 )
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
+router = APIRouter()
 
-HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
-HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
-HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-
-app = FastAPI()
-app.include_router(slack_router)
-
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-def determine_needed_fields(guest_message: str):
-    core_listing_fields = {"summary", "amenities", "houseManual", "type", "name"}
-    extra_fields = set()
-    text = guest_message.lower()
-    if any(keyword in text for keyword in [
-        "how far", "distance", "close", "how close", "near", "nearest", "proximity", "from", "to", "airport", "downtown", "center", "stadium"
-    ]):
-        extra_fields.update({"address", "city", "zipcode", "state"})
-    if "parking" in text or "car" in text or "vehicle" in text:
-        extra_fields.update({"parking", "amenities", "houseManual"})
-    if "price" in text or "cost" in text or "fee" in text or "rate" in text:
-        extra_fields.update({"price", "cleaningFee", "securityDepositFee", "currencyCode"})
-    if "cancel" in text or "refund" in text:
-        extra_fields.update({"cancellationPolicy", "cancellationPolicyId"})
-    if any(x in text for x in ["wifi", "internet", "tv", "cable", "smart", "stream", "netflix"]):
-        extra_fields.update({"amenities", "houseManual", "wifiUsername", "wifiPassword"})
-    if any(x in text for x in ["bed", "sofa", "couch", "sleep", "bedroom"]):
-        extra_fields.update({"bedroomsNumber", "bedsNumber", "guestBathroomsNumber"})
-    if "guest" in text or "person" in text or "max" in text or "limit" in text or "occupancy" in text:
-        extra_fields.update({"personCapacity", "maxChildrenAllowed", "maxInfantsAllowed", "maxPetsAllowed", "guestsIncluded"})
-    if "pet" in text or "dog" in text or "cat" in text or "animal" in text:
-        extra_fields.update({"maxPetsAllowed", "amenities", "houseRules"})
-    return core_listing_fields.union(extra_fields)
 
 def get_property_type(listing_result):
     prop_type = (listing_result.get("type") or "").lower()
@@ -110,208 +78,214 @@ SYSTEM_PROMPT = (
     "For parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
     "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
     "If you have a previously saved answer for this question and house, use that wording if appropriate. "
-    "If a guest sends a very brief or vague message (such as 'just following up?' or 'any update?'), use the previous conversation history to infer what they are referring to. If you cannot infer the topic, politely ask the guest to clarify their request. "
     "Always be helpful and accurate, but always brief."
 )
 
-class HostawayUnifiedWebhook(BaseModel):
-    object: str
-    event: str
-    accountId: int
-    data: dict
-    body: str = None
-    listingName: str = None
-    date: str = None
+@router.post("/slack/actions")
+async def slack_actions(request: Request):
+    form = await request.form()
+    payload = json.loads(form.get("payload"))
+    logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
-def get_property_info(listing_result, fields_needed):
-    """Return property info string for prompt. Only includes needed fields."""
-    lines = []
-    for field in fields_needed:
-        val = listing_result.get(field, "")
-        if not val:
-            continue
-        if isinstance(val, (list, dict)):
-            val = json.dumps(val)
-        lines.append(f"{field}: {val}")
-    return "\n".join(lines)
+    if payload.get("type") == "block_actions":
+        action = payload["actions"][0]
+        action_id = action.get("action_id")
+        trigger_id = payload.get("trigger_id")
+        user = payload["user"]
+        user_id = user.get("id")
+        logging.info(f"Slack action: {action_id} by {user_id}")
 
-@app.post("/unified-webhook")
-async def unified_webhook(payload: HostawayUnifiedWebhook):
-    logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
-    if payload.event != "message.received" or payload.object != "conversationMessage":
-        return {"status": "ignored"}
+        def get_meta_from_action(action):
+            return json.loads(action["value"]) if "value" in action else {}
 
-    guest_message = payload.data.get("body", "")
-    conversation_id = payload.data.get("conversationId")
-    communication_type = payload.data.get("communicationType", "channel")
-    reservation_id = payload.data.get("reservationId")
-    listing_map_id = payload.data.get("listingMapId")
-    guest_id = payload.data.get("userId", "")
-
-    guest_name = "Guest"
-    guest_first_name = "Guest"
-    check_in = "N/A"
-    check_out = "N/A"
-    guest_count = "N/A"
-    reservation_status = payload.data.get("status", "Unknown").capitalize()
-
-    # Fetch reservation for context
-    reservation_obj = fetch_hostaway_reservation(reservation_id) if reservation_id else None
-    reservation_result = reservation_obj.get("result", {}) if reservation_obj else {}
-
-    if reservation_result:
-        guest_name = reservation_result.get("guestName", guest_name)
-        guest_first_name = reservation_result.get("guestFirstName", guest_first_name)
-        check_in = reservation_result.get("arrivalDate", check_in)
-        check_out = reservation_result.get("departureDate", check_out)
-        guest_count = reservation_result.get("numberOfGuests", guest_count)
-        if not listing_map_id:
-            listing_map_id = reservation_result.get("listingId")
-        if not guest_id:
-            guest_id = reservation_result.get("guestId", "")
-
-    # Determine needed fields for the listing, based on guest question
-    fields_needed = determine_needed_fields(guest_message)
-    listing_obj = fetch_hostaway_listing(listing_map_id) if listing_map_id else None
-    listing_result = {}
-    if listing_obj:
-        # Only keep needed fields if full listing was fetched
-        raw_result = listing_obj.get("result", {})
-        listing_result = {k: v for k, v in raw_result.items() if k in fields_needed}
-
-    # --- New: Listing name/type for Slack block ---
-    listing_name = listing_result.get("name", "Unknown listing")
-    property_type = get_property_type(listing_result)
-
-    # Message thread for this conversation
-    conversation_obj = fetch_hostaway_conversation(conversation_id) if conversation_id else None
-    thread_messages = []
-    if conversation_obj and conversation_obj.get("conversationMessages"):
-        thread_messages = conversation_obj["conversationMessages"]
-
-    # Add conversation thread context (always include last N messages)
-    thread_context = ""
-    if thread_messages:
-        last_msgs = thread_messages[-5:]
-        thread_context = "Conversation history:\n"
-        for msg in last_msgs:
-            who = "Guest" if msg.get("isIncoming") else "Host"
-            body = msg.get("body", "")
-            thread_context += f"{who}: {body}\n"
-    else:
-        logging.warning(f"[Hostaway AutoResponder] No thread messages found for conversation_id={conversation_id}")
-
-    property_info = get_property_info(listing_result, fields_needed)
-
-    similar_examples = get_similar_learning_examples(guest_message, listing_map_id)
-    prev_answer = ""
-    if similar_examples:
-        prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
-
-    # Add cancellation policy context
-    cancellation_context = get_cancellation_policy_summary(listing_result, reservation_result)
-
-    prompt = (
-        f"{prev_answer}"
-        f"{thread_context}"
-        f"A guest sent this message:\n{guest_message}\n\n"
-        f"Property info:\n{property_info}\n"
-        f"Reservation context:\n{json.dumps(reservation_result)}\n"
-        f"Cancellation: {cancellation_context}\n"
-        f"Respond according to your latest rules and tone, and use all information above if needed."
-    )
-
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        ai_reply = response.choices[0].message.content.strip()
-        ai_reply = clean_ai_reply(ai_reply, property_type)
-    except Exception as e:
-        logging.error(f"❌ OpenAI error: {e}")
-        ai_reply = "(Error generating reply.)"
-
-    header = (
-        f"*New {communication_type.capitalize()}* from *{guest_first_name}*\n"
-        f"Dates: *{check_in} → {check_out}*\n"
-        f"Guests: *{guest_count}* | Status: *{reservation_status}*"
-    )
-
-    slack_button_payload = {
-        "conv_id": conversation_id,
-        "listing_id": listing_map_id,
-        "guest_message": guest_message,
-        "ai_suggestion": ai_reply,
-        "type": communication_type,
-        "guest_id": guest_id
-    }
-
-    # --- Updated Slack blocks: Listing block at top ---
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Listing:* {listing_name} ({property_type})"
+        if action_id == "write_own":
+            meta = get_meta_from_action(action)
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = {}, {}
+            property_type = "home"
+            modal = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": json.dumps(meta),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Your reply:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            }
+                        ]
+                    }
+                ]
             }
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": header
+            slack_client.views_open(trigger_id=trigger_id, view=modal)
+            return JSONResponse({})
+
+        if action_id == "edit":
+            meta = get_meta_from_action(action)
+            listing_id = meta.get("listing_id", None)
+            _, listing_result = {}, {}
+            property_type = "home"
+            draft = clean_ai_reply(meta.get("draft", ""), property_type)
+            modal = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": json.dumps(meta),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Edit your reply:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True,
+                            "initial_value": draft
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            }
+                        ]
+                    }
+                ]
             }
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"> {guest_message}"}
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Send"},
-                    "value": json.dumps({**slack_button_payload, "reply": ai_reply}),
-                    "action_id": "send"
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "✏️ Edit"},
-                    "value": json.dumps({**slack_button_payload, "draft": ai_reply}),
-                    "action_id": "edit"
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "📝 Write Your Own"},
-                    "value": json.dumps(slack_button_payload),
-                    "action_id": "write_own"
-                }
+            slack_client.views_open(trigger_id=trigger_id, view=modal)
+            return JSONResponse({})
+
+        if action_id == "improve_with_ai":
+            logging.info("🚀 Improve with AI clicked.")
+            view = payload.get("view", {})
+            state = view.get("state", {}).get("values", {})
+            reply_block = state.get("reply_input", {})
+            edited_text = None
+            for v in reply_block.values():
+                edited_text = v.get("value")
+            meta = json.loads(view.get("private_metadata", "{}"))
+            guest_message = meta.get("guest_message", "")
+            listing_id = meta.get("listing_id", None)
+            guest_id = meta.get("guest_id", None)
+            ai_suggestion = meta.get("ai_suggestion", "")
+
+            property_type = "home"
+            similar_examples = get_similar_learning_examples(guest_message, listing_id)
+            prev_answer = ""
+            if similar_examples:
+                prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
+
+            meta_lines = "\n".join([f"{k}: {v}" for k, v in meta.items() if k not in [
+                "guest_message", "listing_id", "ai_suggestion", "draft", "reply", "conv_id"
+            ]])
+
+            prompt = (
+                f"{prev_answer}"
+                f"A guest sent this message:\n{guest_message}\n\n"
+                f"Other data:\n{meta_lines}\n"
+                "Respond according to your latest rules and tone, and use property info to make answers detailed and specific if appropriate. "
+                "If you don't know the answer from the details provided, say you will check and get back to them. "
+                f"Here’s my draft, please improve it for clarity and tone, but do NOT make up info you can't find in the property details or previous answers:\n"
+                f"{edited_text}"
+            )
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                improved = clean_ai_reply(response.choices[0].message.content.strip(), property_type)
+                logging.info(f"🚀 Sending improved reply back: {improved[:100]}")
+            except Exception as e:
+                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+                improved = "(Error generating improved reply.)"
+
+            # Defensive: ensure input block exists and gets updated
+            new_modal = view.copy()
+            new_blocks = []
+            found = False
+            for block in new_modal["blocks"]:
+                if block["type"] == "input" and block.get("block_id") == "reply_input":
+                    block = block.copy()
+                    block["element"] = block["element"].copy()
+                    block["element"]["initial_value"] = improved
+                    found = True
+                new_blocks.append(block)
+            new_modal["blocks"] = new_blocks
+
+            if not found:
+                logging.error("No reply_input block found in modal for update!")
+
+            return JSONResponse({"response_action": "update", "view": new_modal})
+
+        if action_id == "send":
+            meta = get_meta_from_action(action)
+            conv_id = meta.get("conv_id")
+            listing_id = meta.get("listing_id", None)
+            property_type = "home"
+            reply = clean_ai_reply(meta.get("reply", ""), property_type)
+            type_ = meta.get("type")
+            guest_message = meta.get("guest_message", "")
+            guest_id = meta.get("guest_id", None)
+            ai_suggestion = reply
+            store_learning_example(guest_message, ai_suggestion, reply, listing_id, guest_id)
+            send_ok = send_reply_to_hostaway(conv_id, reply, type_)
+            msg = ":white_check_mark: AI reply sent and saved!" if send_ok else ":warning: Failed to send."
+            return JSONResponse({"text": msg})
+
+        return JSONResponse({"text": "Action received."})
+
+    if payload.get("type") == "view_submission":
+        view = payload.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        reply_block = state.get("reply_input", {})
+        user_text = None
+        for v in reply_block.values():
+            user_text = v.get("value")
+        meta = json.loads(view.get("private_metadata", "{}"))
+        conv_id = meta.get("conv_id")
+        listing_id = meta.get("listing_id")
+        property_type = "home"
+        guest_message = meta.get("guest_message", "")
+        type_ = meta.get("type")
+        guest_id = meta.get("guest_id")
+        ai_suggestion = meta.get("ai_suggestion", "")
+
+        clean_reply = clean_ai_reply(user_text, property_type)
+        store_learning_example(guest_message, ai_suggestion, clean_reply, listing_id, guest_id)
+        send_ok = send_reply_to_hostaway(conv_id, clean_reply, type_)
+        msg = ":white_check_mark: Your reply was sent and saved for future learning!" if send_ok else ":warning: Failed to send."
+        done_modal = {
+            "type": "modal",
+            "title": {"type": "plain_text", "text": "Done!", "emoji": True},
+            "close": {"type": "plain_text", "text": "Close", "emoji": True},
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": msg}}
             ]
         }
-    ]
+        return JSONResponse({"response_action": "update", "view": done_modal})
 
-    from slack_sdk.web import WebClient
-    slack_client = WebClient(token=SLACK_BOT_TOKEN)
-    try:
-        slack_client.chat_postMessage(
-            channel=SLACK_CHANNEL,
-            blocks=blocks,
-            text="New message from guest"
-        )
-    except Exception as e:
-        logging.error(f"❌ Slack send error: {e}")
-
-    return {"status": "ok"}
-
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
+    return JSONResponse({"text": "Action received."})
