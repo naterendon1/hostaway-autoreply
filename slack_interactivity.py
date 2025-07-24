@@ -21,16 +21,6 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-def get_property_type(listing_result):
-    prop_type = (listing_result.get("type") or "").lower()
-    name = (listing_result.get("name") or "").lower()
-    for t in ["house", "cabin", "condo", "apartment", "villa", "bungalow", "cottage", "suite"]:
-        if t in prop_type:
-            return t
-        if t in name:
-            return t
-    return "home"
-
 def clean_ai_reply(reply: str, property_type="home"):
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
@@ -59,28 +49,6 @@ def clean_ai_reply(reply: str, property_type="home"):
     reply = reply.strip().replace(" ,", ",").replace(" .", ".")
     return reply.rstrip(",. ")
 
-SYSTEM_PROMPT = (
-    "You are a vacation rental host for homes in Crystal Beach, TX, Austin, TX, Galveston, TX, and Georgetown, TX. "
-    "Answer guest questions in a concise, informal, and polite way, always to-the-point. "
-    "Never add extra information, suggestions, or local tips unless the guest asks for it. "
-    "Do not include fluff, chit-chat, upsell, or overly friendly phrases. "
-    "Never use sign-offs like 'Enjoy your meal', 'Enjoy your meals', 'Enjoy!', 'Best', or your name. Only use a simple closing like 'Let me know if you need anything else' or 'Let me know if you need more recommendations' if it’s natural for the situation, and leave it off entirely if the message already feels complete. "
-    "Never use multi-line replies unless absolutely necessary—keep replies to a single paragraph with greeting and answer together. "
-    "Greet the guest casually using their first name if known, then answer their question immediately. "
-    "Never include the property’s address, city, zip, or property name in your answer unless the guest specifically asks for it. Instead, refer to it as 'the house', 'the condo', or the appropriate property type. "
-    "If you don’t know the answer, say you’ll check and get back to them. "
-    "If a guest is only inquiring about dates or making a request, always check the calendar to confirm availability before agreeing. "
-    "If the guest already has a confirmed booking, do not check the calendar or mention availability—just answer their questions directly. "
-    "For early check-in or late check-out requests, check if available first, then mention a fee applies. "
-    "For refund requests outside the cancellation policy, politely explain that refunds are only possible if the dates rebook. "
-    "If a guest cancels for an emergency, show empathy and refer to Airbnb’s extenuating circumstances policy or the relevant platform's version. "
-    "For amenity/house details, answer directly with no extra commentary. "
-    "For parking, clarify how many vehicles are allowed and where to park (driveways, not blocking neighbors, etc). "
-    "For tech/amenity questions (WiFi, TV, grill, etc.), give quick, direct instructions. "
-    "If you have a previously saved answer for this question and house, use that wording if appropriate. "
-    "Always be helpful and accurate, but always brief."
-)
-
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
     form = await request.form()
@@ -100,9 +68,6 @@ async def slack_actions(request: Request):
 
         if action_id == "write_own":
             meta = get_meta_from_action(action)
-            listing_id = meta.get("listing_id", None)
-            _, listing_result = {}, {}
-            property_type = "home"
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
@@ -138,10 +103,7 @@ async def slack_actions(request: Request):
 
         if action_id == "edit":
             meta = get_meta_from_action(action)
-            listing_id = meta.get("listing_id", None)
-            _, listing_result = {}, {}
-            property_type = "home"
-            draft = clean_ai_reply(meta.get("draft", ""), property_type)
+            draft = clean_ai_reply(meta.get("draft", ""), "home")
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Edit Reply", "emoji": True},
@@ -176,41 +138,38 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
-        # --- MAIN FIX: Use views_push so the improved reply is always visible ---
         if action_id == "improve_with_ai":
-    logging.info("🚀 Improve with AI clicked.")
-    view = payload.get("view", {})
-    state = view.get("state", {}).get("values", {})
-    reply_block = state.get("reply_input", {})
-    edited_text = None
-    for v in reply_block.values():
-        if v.get("value") is not None:
-            edited_text = v.get("value")
-    logging.info(f"User's draft text: {edited_text}")
+            logging.info("🚀 Improve with AI clicked.")
+            view = payload.get("view", {})
+            state = view.get("state", {}).get("values", {})
+            reply_block = state.get("reply_input", {})
+            edited_text = None
+            for v in reply_block.values():
+                if v.get("value") is not None:
+                    edited_text = v.get("value")
+            logging.info(f"User's draft text: {edited_text}")
 
-    prompt = (
-        "Make the following message as clear, concise, and informal as possible. "
-        "Ensure it makes sense, and do not add any extra information. Only return the improved message.\n\n"
-        f"Original message:\n{edited_text}"
-    )
-    logging.info(f"Prompt sent to OpenAI:\n{prompt}")
+            prompt = (
+                "Make the following message as clear, concise, and informal as possible. "
+                "Ensure it makes sense, and do not add any extra information. Only return the improved message.\n\n"
+                f"Original message:\n{edited_text}"
+            )
+            logging.info(f"Prompt sent to OpenAI:\n{prompt}")
 
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        improved = response.choices[0].message.content.strip()
-        logging.info(f"Improved reply from AI: {improved}")
-    except Exception as e:
-        logging.error(f"OpenAI error in 'improve_with_ai': {e}")
-        improved = "(Error generating improved reply.)"
-    ...
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                improved = response.choices[0].message.content.strip()
+                logging.info(f"Improved reply from AI: {improved}")
+            except Exception as e:
+                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+                improved = "(Error generating improved reply.)"
 
-            # Build improved modal
             improved_modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
@@ -242,8 +201,6 @@ async def slack_actions(request: Request):
                     }
                 ]
             }
-
-            # Use views_push (with trigger_id) so modal *always* shows up to the user!
             try:
                 logging.info(f"Pushing improved modal via views_push (trigger_id={trigger_id})")
                 slack_client.views_push(
@@ -258,8 +215,7 @@ async def slack_actions(request: Request):
             meta = get_meta_from_action(action)
             conv_id = meta.get("conv_id")
             listing_id = meta.get("listing_id", None)
-            property_type = "home"
-            reply = clean_ai_reply(meta.get("reply", ""), property_type)
+            reply = clean_ai_reply(meta.get("reply", ""), "home")
             type_ = meta.get("type")
             guest_message = meta.get("guest_message", "")
             guest_id = meta.get("guest_id", None)
@@ -281,13 +237,12 @@ async def slack_actions(request: Request):
         meta = json.loads(view.get("private_metadata", "{}"))
         conv_id = meta.get("conv_id")
         listing_id = meta.get("listing_id")
-        property_type = "home"
         guest_message = meta.get("guest_message", "")
         type_ = meta.get("type")
         guest_id = meta.get("guest_id")
         ai_suggestion = meta.get("ai_suggestion", "")
 
-        clean_reply = clean_ai_reply(user_text, property_type)
+        clean_reply = clean_ai_reply(user_text, "home")
         store_learning_example(guest_message, ai_suggestion, clean_reply, listing_id, guest_id)
         send_ok = send_reply_to_hostaway(conv_id, clean_reply, type_)
         msg = ":white_check_mark: Your reply was sent and saved for future learning!" if send_ok else ":warning: Failed to send."
