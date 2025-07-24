@@ -22,6 +22,41 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# === Clean AI Reply ===
+def clean_ai_reply(reply: str, property_type="home"):
+    # Strip awkward or template sign-offs
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    for signoff in bad_signoffs:
+        reply = reply.replace(signoff, "")
+
+    # Remove lines that start with unwanted signoffs
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.lower().startswith(s.lower().replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+
+    reply = ' '.join(filtered_lines)
+
+    # Replace specific addresses with property_type, while preserving structure
+    address_patterns = [
+        r"(at\s+)?\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
+        r"(the\s+)?house at [\d]+ [^,]+, [A-Za-z ]+",
+        r"at [\d]+ [\w .]+, [\w ]+"
+    ]
+    for pattern in address_patterns:
+        reply = re.sub(pattern, f"at the {property_type}", reply, flags=re.IGNORECASE)
+
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    return reply.rstrip(",. ")
+
 # === AI Clarification Trigger ===
 def needs_clarification(reply: str) -> bool:
     return any(phrase in reply.lower() for phrase in [
@@ -80,7 +115,7 @@ def generate_reply_with_clarification(guest_msg, host_clarification):
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are a helpful vacation rental assistant."},
+                {"role": "system", "content": "You are a warm and professional vacation rental assistant. Your tone is clear, helpful, and friendly. Avoid sounding robotic. Be specific and natural."},
                 {"role": "user", "content": prompt}
             ]
         )
