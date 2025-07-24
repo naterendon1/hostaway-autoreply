@@ -204,11 +204,19 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     property_info = get_property_info(listing_result, fields_needed)
 
     similar_examples = get_similar_learning_examples(guest_message, listing_map_id)
-    prev_answer = (
-        f"Previously, you (the host) replied to a similar guest question about this property:\n"
-        f"\"{similar_examples[0][2]}\"\n"
-        f"Use this previous reply for *context only*; do not copy it verbatim. Write a new, clear answer in your own words if possible."
-)
+    prev_answer = ""
+    # --- NEW SAFE BLOCK for similar_examples ---
+    if (
+        similar_examples and
+        isinstance(similar_examples[0], (list, tuple)) and
+        len(similar_examples[0]) >= 3 and
+        similar_examples[0][2]
+    ):
+        prev_answer = (
+            "Previously, you (the host) replied to a similar guest question about this property:\n"
+            f"\"{similar_examples[0][2]}\"\n"
+            "Use this previous reply for *context only*; do not copy it verbatim. Write a new, clear answer in your own words if possible.\n"
+        )
 
     # Add cancellation policy context
     cancellation_context = get_cancellation_policy_summary(listing_result, reservation_result)
