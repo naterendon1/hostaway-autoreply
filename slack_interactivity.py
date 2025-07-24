@@ -138,6 +138,76 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
+        if action_id == "improve_with_ai":
+            logging.info("🚀 Improve with AI clicked.")
+            view = payload.get("view", {})
+            state = view.get("state", {}).get("values", {})
+            reply_block = state.get("reply_input", {})
+            edited_text = None
+            for v in reply_block.values():
+                if v.get("value") is not None:
+                    edited_text = v.get("value")
+            logging.info(f"User's draft text: {edited_text}")
+
+            prompt = (
+                "Make the following message as clear, concise, and informal as possible. "
+                "Ensure it makes sense, and do not add any extra information. Only return the improved message.\n\n"
+                f"Original message:\n{edited_text}"
+            )
+
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                improved = response.choices[0].message.content.strip()
+                logging.info(f"Improved reply from AI: {improved}")
+            except Exception as e:
+                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+                improved = "(Error generating improved reply.)"
+
+            try:
+                slack_client.views_push(
+                    trigger_id=trigger_id,
+                    view={
+                        "type": "modal",
+                        "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+                        "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                        "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                        "private_metadata": view.get("private_metadata"),
+                        "blocks": [
+                            {
+                                "type": "input",
+                                "block_id": "reply_input",
+                                "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                                "element": {
+                                    "type": "plain_text_input",
+                                    "action_id": "reply",
+                                    "multiline": True,
+                                    "initial_value": improved
+                                }
+                            },
+                            {
+                                "type": "actions",
+                                "block_id": "improve_ai_block",
+                                "elements": [
+                                    {
+                                        "type": "button",
+                                        "action_id": "improve_with_ai",
+                                        "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                )
+            except Exception as e:
+                logging.error(f"Failed to push improved modal: {e}")
+            return JSONResponse({})
+
         if action_id == "send":
             meta = get_meta_from_action(action)
             conv_id = meta.get("conv_id")
