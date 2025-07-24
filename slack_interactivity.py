@@ -178,51 +178,37 @@ async def slack_actions(request: Request):
 
         # --- MAIN FIX: Use views_push so the improved reply is always visible ---
         if action_id == "improve_with_ai":
-            logging.info("🚀 Improve with AI clicked.")
-            view = payload.get("view", {})
-            state = view.get("state", {}).get("values", {})
-            reply_block = state.get("reply_input", {})
-            edited_text = None
-            for v in reply_block.values():
-                if v.get("value") is not None:
-                    edited_text = v.get("value")
-            logging.info(f"User's draft text: {edited_text}")
+    logging.info("🚀 Improve with AI clicked.")
+    view = payload.get("view", {})
+    state = view.get("state", {}).get("values", {})
+    reply_block = state.get("reply_input", {})
+    edited_text = None
+    for v in reply_block.values():
+        if v.get("value") is not None:
+            edited_text = v.get("value")
+    logging.info(f"User's draft text: {edited_text}")
 
-            meta = json.loads(view.get("private_metadata", "{}"))
-            guest_message = meta.get("guest_message", "")
-            listing_id = meta.get("listing_id", None)
-            guest_id = meta.get("guest_id", None)
-            ai_suggestion = meta.get("ai_suggestion", "")
+    prompt = (
+        "Make the following message as clear, concise, and informal as possible. "
+        "Ensure it makes sense, and do not add any extra information. Only return the improved message.\n\n"
+        f"Original message:\n{edited_text}"
+    )
+    logging.info(f"Prompt sent to OpenAI:\n{prompt}")
 
-            property_type = "home"
-            similar_examples = get_similar_learning_examples(guest_message, listing_id)
-            prev_answer = ""
-            if similar_examples:
-                prev_answer = f"Previously, you (the host) replied to a similar guest question about this property: \"{similar_examples[0][2]}\". Use this as a guide if it fits.\n"
-
-            prompt = (
-                f"{prev_answer}"
-                f"A guest sent this message:\n{guest_message}\n\n"
-                "Here is my draft reply (below). Please improve it for clarity, conciseness, and polite, informal tone, "
-                "but do NOT invent information that isn't in the property details or prior answers. "
-                f"\nDraft reply: {edited_text}\n"
-                "Respond ONLY with the improved reply."
-            )
-            logging.info(f"Prompt sent to OpenAI:\n{prompt}")
-
-            try:
-                response = openai_client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                improved = clean_ai_reply(response.choices[0].message.content.strip(), property_type)
-                logging.info(f"Improved reply from AI: {improved}")
-            except Exception as e:
-                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
-                improved = "(Error generating improved reply.)"
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        improved = response.choices[0].message.content.strip()
+        logging.info(f"Improved reply from AI: {improved}")
+    except Exception as e:
+        logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+        improved = "(Error generating improved reply.)"
+    ...
 
             # Build improved modal
             improved_modal = {
