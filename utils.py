@@ -195,3 +195,13 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
     except Exception as e:
         logging.error(f"❌ Retrieval error: {e}")
         return None
+
+# --- New: Clarification Log ---
+def store_clarification_log(guest_message, listing_id, guest_id, tag):
+    try:
+        log_line = f"{datetime.utcnow().isoformat()} | Listing: {listing_id} | Guest ID: {guest_id} | Tag: {tag}\nMessage: {guest_message}\n---\n"
+        with open("clarification_log.txt", "a") as f:
+            f.write(log_line)
+        logging.info("[CLARIFY] Logged clarification.")
+    except Exception as e:
+        logging.error(f"❌ Clarification log error: {e}")
