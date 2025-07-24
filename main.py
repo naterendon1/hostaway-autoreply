@@ -3,7 +3,7 @@ import logging
 import json
 import re
 from fastapi import FastAPI
-from slack_interactivity import router as slack_router
+from slack_interactivity import router as slack_router, needs_clarification, ask_host_for_clarification
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
@@ -13,6 +13,7 @@ from utils import (
     fetch_hostaway_conversation,
     get_cancellation_policy_summary,
     get_similar_learning_examples,
+    store_clarification_log
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -225,12 +226,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error(f"❌ OpenAI error: {e}")
         ai_reply = "(Error generating reply.)"
 
-    header = (
-        f"*New {communication_type.capitalize()}* from *{guest_first_name}*\n"
-        f"Dates: *{check_in} → {check_out}*\n"
-        f"Guests: *{guest_count}* | Status: *{reservation_status}*"
-    )
-
     slack_button_payload = {
         "conv_id": conversation_id,
         "listing_id": listing_map_id,
@@ -239,6 +234,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "type": communication_type,
         "guest_id": guest_id
     }
+
+    if needs_clarification(ai_reply):
+        logging.info("🤖 AI reply needs clarification – triggering clarify modal")
+        ask_host_for_clarification(
+            guest_msg=guest_message,
+            metadata=slack_button_payload,
+            trigger_id=None
+        )
+        return {"status": "clarification_requested"}
+
+    header = (
+        f"*New {communication_type.capitalize()}* from *{guest_first_name}*\n"
+        f"Dates: *{check_in} → {check_out}*\n"
+        f"Guests: *{guest_count}* | Status: *{reservation_status}*"
+    )
 
     blocks = [
         {
@@ -283,6 +293,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                     "text": {"type": "plain_text", "text": "📝 Write Your Own"},
                     "value": json.dumps(slack_button_payload),
                     "action_id": "write_own"
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🤔 Clarify"},
+                    "value": json.dumps(slack_button_payload),
+                    "action_id": "clarify"
                 }
             ]
         }
