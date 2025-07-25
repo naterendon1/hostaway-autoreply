@@ -184,7 +184,7 @@ def store_clarification_log(conversation_id, guest_message, clarification, tags)
             '''INSERT INTO clarifications (conversation_id, guest_message, clarification, tags, created_at)
                VALUES (?, ?, ?, ?, ?)''',
             (
-                str(conversation_id),
+                str(conversation_id) if conversation_id else "",
                 guest_message or "",
                 clarification or "",
                 ",".join(tags) if tags else "",
