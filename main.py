@@ -4,7 +4,6 @@ import json
 import re
 from fastapi import FastAPI
 from slack_interactivity import router as slack_router, needs_clarification, ask_host_for_clarification
-
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
