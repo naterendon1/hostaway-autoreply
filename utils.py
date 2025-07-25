@@ -117,6 +117,11 @@ def get_cancellation_policy_summary(listing_result, reservation_result):
     policy_text = desc.get(policy, f"Policy: {policy}")
     return policy_text
 
+def get_property_info(listing_result: dict, fields: list[str]) -> dict:
+    if not listing_result or "result" not in listing_result:
+        return {}
+    return {field: listing_result["result"].get(field) for field in fields}
+
 # --- SQLite Learning Functions ---
 def _init_learning_db():
     try:
