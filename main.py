@@ -1,23 +1,22 @@
+import os
 import logging
 from fastapi import FastAPI, Request
+from slack_sdk import WebClient
 from slack_interactivity import router as slack_router
 from utils import (
-    send_reply_to_hostaway,
-    fetch_hostaway_resource,
-    store_learning_example,
-    get_similar_learning_examples,
-    store_clarification_log,
-    get_property_info,          # <-- THIS FIXES YOUR ERROR
-    fetch_hostaway_listing
+    fetch_hostaway_listing,
+    get_property_info
 )
-# (No need to import re, os, json, WebClient, or OpenAI here—keep those in the files where you actually use them.)
 
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
-
-# Mount your Slack interactivity router
 app.include_router(slack_router)
+
+# Configure Slack client
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")  # Set in your environment
 
 @app.post("/unified-webhook")
 async def unified_webhook(request: Request):
@@ -25,18 +24,26 @@ async def unified_webhook(request: Request):
     logging.info(f"📬 Webhook received: {payload}")
 
     data = payload.get("data", {})
-    conversation_id = data.get("conversationId")
-    listing_id = data.get("listingMapId")
     guest_message = data.get("body")
-    reservation_id = data.get("reservationId")
+    listing_id = data.get("listingMapId")
+    conversation_id = data.get("conversationId")
 
-    # --- EXAMPLE: using get_property_info correctly ---
+    # Example: Get listing property info
     fields_needed = ["propertyType", "bedrooms", "bathrooms"]
     listing_result = fetch_hostaway_listing(listing_id)
     property_info = get_property_info(listing_result, fields_needed)
 
-    # Your business logic here...
-    logging.info(f"Property Info: {property_info}")
+    # Send a message to Slack when a new Hostaway message comes in
+    if guest_message and SLACK_CHANNEL_ID:
+        slack_text = (
+            f"*New Guest Message in Hostaway*\n"
+            f"*Listing:* {listing_id}\n"
+            f"*Property:* {property_info}\n"
+            f"*Conversation ID:* {conversation_id}\n"
+            f"*Message:*\n>{guest_message}"
+        )
+        slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=slack_text)
+        logging.info("✅ Sent message to Slack.")
 
     return {"status": "ok"}
 
