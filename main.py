@@ -3,7 +3,7 @@ import logging
 import json
 import re
 from fastapi import FastAPI
-from slack_interactivity import router as slack_router
+from slack_interactivity import router as slack_router, needs_clarification, open_clarification_modal
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
@@ -13,9 +13,7 @@ from utils import (
     fetch_hostaway_conversation,
     get_cancellation_policy_summary,
     get_similar_learning_examples,
-    get_property_info,  # <-- ADDED THIS!
 )
-from slack_interactivity import needs_clarification, ask_host_for_clarification
 
 logging.basicConfig(level=logging.INFO)
 
@@ -75,6 +73,9 @@ def get_property_type(listing_result):
         if t in name:
             return t
     return "home"
+
+def get_property_info(listing_result: dict, fields: set):
+    return {field: listing_result.get(field) for field in fields}
 
 def clean_ai_reply(reply: str, property_type="home"):
     bad_signoffs = [
@@ -235,10 +236,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     if needs_clarification(ai_reply):
         logging.info("🤖 AI reply needs clarification – triggering clarify modal")
-        ask_host_for_clarification(
-            guest_msg=guest_message,
+        # Use open_clarification_modal instead of ask_host_for_clarification
+        open_clarification_modal(
+            trigger_id=None,
             metadata=slack_button_payload,
-            trigger_id=None
+            guest_msg=guest_message
         )
         return {"status": "clarification_requested"}
 
