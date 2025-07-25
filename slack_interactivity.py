@@ -182,60 +182,65 @@ async def slack_actions(request: Request):
         conversation_id = meta.get("conversation_id")
 
         # Handle clarification modal submission
-       if "clarify_input" in state:
-    clarify_block = state.get("clarify_input", {})
-    clarification_text = list(clarify_block.values())[0].get("value")
-    tag_block = state.get("clarify_tag", {})
-    clarification_tag = list(tag_block.values())[0].get("value")
+        if "clarify_input" in state:
+            clarify_block = state.get("clarify_input", {})
+            clarification_text = list(clarify_block.values())[0].get("value")
+            tag_block = state.get("clarify_tag", {})
+            clarification_tag = list(tag_block.values())[0].get("value")
 
-    store_clarification_log(
-        conversation_id=conversation_id,
-        guest_message=guest_msg,
-        clarification=clarification_text,
-        tags=[clarification_tag] if clarification_tag else []
-    )
+            store_clarification_log(
+                conversation_id=conversation_id,
+                guest_message=guest_msg,
+                clarification=clarification_text,
+                tags=[clarification_tag] if clarification_tag else []
+            )
 
-    improved = generate_reply_with_clarification(guest_msg, clarification_text)
+            improved = generate_reply_with_clarification(guest_msg, clarification_text)
 
-    store_learning_example(
-        guest_message=guest_msg,
-        ai_suggestion="",  # Fill if you have a prior suggestion
-        user_reply=improved,
-        listing_id=listing_id,
-        guest_id=guest_id
-    )
+            store_learning_example(
+                guest_message=guest_msg,
+                ai_suggestion="",  # Fill if you have a prior suggestion
+                user_reply=improved,
+                listing_id=listing_id,
+                guest_id=guest_id
+            )
 
-    return JSONResponse({
-        "response_action": "update",
-        "view": {
-            "type": "modal",
-            "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
-            "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-            "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-            "private_metadata": json.dumps(meta),
-            "blocks": [
-                {
-                    "type": "input",
-                    "block_id": "reply_input",
-                    "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "reply",
-                        "multiline": True,
-                        "initial_value": improved
-                    }
-                },
-                {
-                    "type": "actions",
-                    "block_id": "improve_ai_block",
-                    "elements": [
+            return JSONResponse({
+                "response_action": "update",
+                "view": {
+                    "type": "modal",
+                    "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                    "private_metadata": json.dumps(meta),
+                    "blocks": [
                         {
-                            "type": "button",
-                            "action_id": "improve_with_ai",
-                            "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            "type": "input",
+                            "block_id": "reply_input",
+                            "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "reply",
+                                "multiline": True,
+                                "initial_value": improved
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "block_id": "improve_ai_block",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "action_id": "improve_with_ai",
+                                    "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                                }
+                            ]
                         }
                     ]
                 }
-            ]
-        }
-    })
+            })
+
+        # You can handle other view_submissions here (e.g. manual reply), if needed
+
+    # Fallback response if nothing matches
+    return JSONResponse({"text": "Action received."})
