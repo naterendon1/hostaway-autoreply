@@ -1,4 +1,3 @@
-# utils.py
 import os
 import requests
 import logging
@@ -59,7 +58,8 @@ def fetch_hostaway_listing(listing_id, fields=None):
         logging.error(f"\u274c Fetch listing error: {e}")
         return None
 
-def get_property_info(listing_result: dict, fields: list[str]) -> dict:
+def get_property_info(listing_result: dict, fields: list) -> dict:
+    # listing_result is expected to be {"result": { ... }}
     result = listing_result.get("result", {}) if isinstance(listing_result, dict) else {}
     return {field: result.get(field) for field in fields if field in result}
 
@@ -184,7 +184,7 @@ def store_clarification_log(conversation_id, guest_message, clarification, tags)
             '''INSERT INTO clarifications (conversation_id, guest_message, clarification, tags, created_at)
                VALUES (?, ?, ?, ?, ?)''',
             (
-                str(conversation_id) if conversation_id else "",
+                str(conversation_id),
                 guest_message or "",
                 clarification or "",
                 ",".join(tags) if tags else "",
