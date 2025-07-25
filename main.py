@@ -1,56 +1,248 @@
 import os
 import logging
-from fastapi import FastAPI, Request
+import json
+import re
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
-from slack_interactivity import router as slack_router
 from utils import (
-    fetch_hostaway_listing,
-    get_property_info
+    send_reply_to_hostaway,
+    fetch_hostaway_resource,
+    store_learning_example,
+    get_similar_learning_examples,
+    store_clarification_log
 )
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
+router = APIRouter()
 
-app = FastAPI()
-app.include_router(slack_router)
-
-# Configure Slack client
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
-SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")  # Set in your environment
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-@app.post("/unified-webhook")
-async def unified_webhook(request: Request):
-    payload = await request.json()
-    logging.info(f"📬 Webhook received: {payload}")
+def clean_ai_reply(reply: str, property_type="home"):
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    for signoff in bad_signoffs:
+        reply = reply.replace(signoff, "")
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.lower().startswith(s.lower().replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+    reply = ' '.join(filtered_lines)
+    address_patterns = [
+        r"(at\s+)?\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
+        r"(the\s+)?house at [\d]+ [^,]+, [A-Za-z ]+",
+        r"at [\d]+ [\w .]+, [\w ]+"
+    ]
+    for pattern in address_patterns:
+        reply = re.sub(pattern, f"at the {property_type}", reply, flags=re.IGNORECASE)
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    return reply.rstrip(",. ")
 
-    data = payload.get("data", {})
-    guest_message = data.get("body")
-    listing_id = data.get("listingMapId")
-    conversation_id = data.get("conversationId")
+def needs_clarification(reply: str) -> bool:
+    return any(phrase in reply.lower() for phrase in [
+        "i'm not sure", "i don't know", "let me check", "can't find that info",
+        "need to verify", "need to ask", "unsure"
+    ])
 
-    # Example: Get listing property info
-    fields_needed = ["propertyType", "bedrooms", "bathrooms"]
-    listing_result = fetch_hostaway_listing(listing_id)
-    property_info = get_property_info(listing_result, fields_needed)
+def ask_host_for_clarification(guest_msg, metadata, trigger_id):
+    slack_client.views_open(
+        trigger_id=trigger_id,
+        view={
+            "type": "modal",
+            "title": {"type": "plain_text", "text": "Need Your Help", "emoji": True},
+            "submit": {"type": "plain_text", "text": "Submit", "emoji": True},
+            "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+            "private_metadata": json.dumps(metadata),
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"The guest asked: *{guest_msg}*\nI couldn't confidently answer this. Can you help me out?"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "clarify_input",
+                    "label": {"type": "plain_text", "text": "What should I tell the guest?", "emoji": True},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "clarify_text",
+                        "multiline": True
+                    }
+                },
+                {
+                    "type": "input",
+                    "block_id": "clarify_tag",
+                    "label": {"type": "plain_text", "text": "Tag this clarification (e.g. wifi, parking, etc)", "emoji": True},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "clarify_tag_input",
+                        "multiline": False
+                    }
+                }
+            ]
+        }
+    )
 
-    # Send a message to Slack when a new Hostaway message comes in
-    if guest_message and SLACK_CHANNEL_ID:
-        slack_text = (
-            f"*New Guest Message in Hostaway*\n"
-            f"*Listing:* {listing_id}\n"
-            f"*Property:* {property_info}\n"
-            f"*Conversation ID:* {conversation_id}\n"
-            f"*Message:*\n>{guest_message}"
+def generate_reply_with_clarification(guest_msg, host_clarification):
+    prompt = (
+        "A guest asked a question, and the host provided clarification. Based on both, write a helpful, clear reply.\n\n"
+        f"Guest: {guest_msg}\n"
+        f"Host clarification: {host_clarification}\n"
+        "Reply:"
+    )
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a warm and professional vacation rental assistant. Your tone is clear, helpful, and friendly. Avoid sounding robotic. Be specific and natural."},
+                {"role": "user", "content": prompt}
+            ]
         )
-        slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=slack_text)
-        logging.info("✅ Sent message to Slack.")
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"Clarify AI generation failed: {e}")
+        return "(Error generating response from clarification.)"
 
-    return {"status": "ok"}
+@router.post("/slack/actions")
+async def slack_actions(request: Request):
+    form = await request.form()
+    payload = json.loads(form.get("payload"))
+    logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
-@app.get("/")
-async def health():
-    return {"status": "ok"}
+    if payload.get("type") == "block_actions":
+        action = payload["actions"][0]
+        action_id = action.get("action_id")
+        trigger_id = payload.get("trigger_id")
+        user = payload["user"]
+        user_id = user.get("id")
+        logging.info(f"Slack action: {action_id} by {user_id}")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        def get_meta_from_action(action):
+            return json.loads(action["value"]) if "value" in action else {}
+
+        if action_id == "write_own":
+            meta = get_meta_from_action(action)
+            modal = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": json.dumps(meta),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Your reply:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            },
+                            {
+                                "type": "button",
+                                "action_id": "clarify_submission",
+                                "text": {"type": "plain_text", "text": ":question: Clarify for AI", "emoji": True}
+                            }
+                        ]
+                    }
+                ]
+            }
+            slack_client.views_open(trigger_id=trigger_id, view=modal)
+            return JSONResponse({})
+
+    if payload.get("type") == "view_submission":
+        view = payload.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        meta = json.loads(view.get("private_metadata", "{}"))
+
+        # Extract required metadata for learning/logging
+        guest_msg = meta.get("guest_message", "")
+        listing_id = meta.get("listing_id")
+        guest_id = meta.get("guest_id")
+        conversation_id = meta.get("conversation_id")
+
+        # Handle clarification modal submission
+        if "clarify_input" in state:
+            clarify_block = state.get("clarify_input", {})
+            clarification_text = list(clarify_block.values())[0].get("value")
+            tag_block = state.get("clarify_tag", {})
+            clarification_tag = list(tag_block.values())[0].get("value")
+
+            store_clarification_log(
+                conversation_id=conversation_id,
+                guest_message=guest_msg,
+                clarification=clarification_text,
+                tags=[clarification_tag] if clarification_tag else []
+            )
+
+            improved = generate_reply_with_clarification(guest_msg, clarification_text)
+
+            store_learning_example(
+                guest_message=guest_msg,
+                ai_suggestion="",  # Fill if you have a prior suggestion
+                user_reply=improved,
+                listing_id=listing_id,
+                guest_id=guest_id
+            )
+
+            return JSONResponse({
+                "response_action": "update",
+                "view": {
+                    "type": "modal",
+                    "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                    "private_metadata": json.dumps(meta),
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "reply_input",
+                            "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "reply",
+                                "multiline": True,
+                                "initial_value": improved
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "block_id": "improve_ai_block",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "action_id": "improve_with_ai",
+                                    "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })
+
+        # You can handle other view_submissions here (e.g. manual reply), if needed
+
+    # Fallback response if nothing matches
+    return JSONResponse({"text": "Action received."})
+
+
