@@ -63,7 +63,18 @@ def fetch_hostaway_reservation(reservation_id):
     return fetch_hostaway_resource("reservations", reservation_id)
 
 def fetch_hostaway_conversation(conversation_id):
-    return fetch_hostaway_resource("conversations", conversation_id)
+    token = get_hostaway_access_token()
+    if not token:
+        return None
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}?includeScheduledMessages=1"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        logging.info(f"✅ Conversation {conversation_id} fetched with messages.")
+        return r.json()
+    except Exception as e:
+        logging.error(f"❌ Fetch conversation error: {e}")
+        return None
 
 def fetch_conversation_messages(conversation_id):
     obj = fetch_hostaway_conversation(conversation_id)
@@ -195,13 +206,3 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
     except Exception as e:
         logging.error(f"❌ Retrieval error: {e}")
         return None
-
-# --- New: Clarification Log ---
-def store_clarification_log(guest_message, listing_id, guest_id, tag):
-    try:
-        log_line = f"{datetime.utcnow().isoformat()} | Listing: {listing_id} | Guest ID: {guest_id} | Tag: {tag}\nMessage: {guest_message}\n---\n"
-        with open("clarification_log.txt", "a") as f:
-            f.write(log_line)
-        logging.info("[CLARIFY] Logged clarification.")
-    except Exception as e:
-        logging.error(f"❌ Clarification log error: {e}")
