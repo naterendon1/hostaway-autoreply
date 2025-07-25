@@ -3,7 +3,7 @@ import logging
 import json
 import re
 from fastapi import FastAPI
-from slack_interactivity import router as slack_router, needs_clarification, ask_host_for_clarification
+from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
@@ -13,8 +13,8 @@ from utils import (
     fetch_hostaway_conversation,
     get_cancellation_policy_summary,
     get_similar_learning_examples,
-    store_clarification_log
 )
+from slack_interactivity import needs_clarification, ask_host_for_clarification
 
 logging.basicConfig(level=logging.INFO)
 
@@ -31,6 +31,15 @@ app.include_router(slack_router)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 MAX_THREAD_MESSAGES = 10
+
+class HostawayUnifiedWebhook(BaseModel):
+    object: str
+    event: str
+    accountId: int
+    data: dict
+    body: str = None
+    listingName: str = None
+    date: str = None
 
 def determine_needed_fields(guest_message: str):
     core_listing_fields = {"summary", "amenities", "houseManual", "type", "name"}
@@ -102,29 +111,9 @@ SYSTEM_PROMPT = (
     "No chit-chat, no extra tips, no sign-offs."
 )
 
-class HostawayUnifiedWebhook(BaseModel):
-    object: str
-    event: str
-    accountId: int
-    data: dict
-    body: str = None
-    listingName: str = None
-    date: str = None
-
-def get_property_info(listing_result, fields_needed):
-    lines = []
-    for field in fields_needed:
-        val = listing_result.get(field, "")
-        if not val:
-            continue
-        if isinstance(val, (list, dict)):
-            val = json.dumps(val)
-        lines.append(f"{field}: {val}")
-    return "\n".join(lines)
-
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
+    logging.info(f"\U0001f4ec Webhook received: {json.dumps(payload.dict(), indent=2)}")
     if payload.event != "message.received" or payload.object != "conversationMessage":
         return {"status": "ignored"}
 
@@ -134,6 +123,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     reservation_id = payload.data.get("reservationId")
     listing_map_id = payload.data.get("listingMapId")
     guest_id = payload.data.get("userId", "")
+
+    if not guest_message:
+        attachments = payload.data.get("attachments") or []
+        if attachments:
+            logging.info("\U0001f4f7 Skipping AI response: message contains only image(s).")
+        else:
+            logging.info("\U0001f4ed Skipping empty message.")
+        return {"status": "ignored"}
 
     guest_name = "Guest"
     guest_first_name = "Guest"
@@ -298,7 +295,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                     "type": "button",
                     "text": {"type": "plain_text", "text": "🤔 Clarify"},
                     "value": json.dumps(slack_button_payload),
-                    "action_id": "clarify"
+                    "action_id": "clarify_request"
                 }
             ]
         }
