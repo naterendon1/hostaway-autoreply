@@ -133,6 +133,16 @@ def _init_learning_db():
                 created_at TEXT
             )
         ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS clarifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT,
+                guest_message TEXT,
+                clarification TEXT,
+                tags TEXT,
+                created_at TEXT
+            )
+        ''')
         conn.commit()
         conn.close()
     except Exception as e:
@@ -206,21 +216,12 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
     except Exception as e:
         logging.error(f"❌ Retrieval error: {e}")
         return None
-        def store_clarification_log(conversation_id, guest_message, clarification, tags):
+
+def store_clarification_log(conversation_id, guest_message, clarification, tags):
     _init_learning_db()
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
         c = conn.cursor()
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS clarifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT,
-                guest_message TEXT,
-                clarification TEXT,
-                tags TEXT,
-                created_at TEXT
-            )
-        ''')
         c.execute(
             '''INSERT INTO clarifications (conversation_id, guest_message, clarification, tags, created_at)
                VALUES (?, ?, ?, ?, ?)''',
@@ -237,4 +238,3 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
         logging.info(f"[CLARIFY] Clarification stored for conversation {conversation_id}")
     except Exception as e:
         logging.error(f"❌ Clarification DB error: {e}")
-
