@@ -77,9 +77,19 @@ def generate_reply_with_clarification(guest_msg, host_clarification):
         logging.error(f"Clarify AI generation failed: {e}")
         return "(Error generating response from clarification.)"
 
+def slack_open_or_push(payload, trigger_id, modal):
+    """Open or Push modal based on whether action is from message or modal."""
+    container = payload.get("container", {})
+    if container.get("type") == "message":
+        slack_client.views_open(trigger_id=trigger_id, view=modal)
+        logging.info("Opened modal with views_open.")
+    else:
+        slack_client.views_push(trigger_id=trigger_id, view=modal)
+        logging.info("Pushed modal with views_push.")
+
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
-    logging.info("🎯 /slack/actions endpoint hit!")  # Debug entry log
+    logging.info("🎯 /slack/actions endpoint hit!")
     form = await request.form()
     payload_raw = form.get("payload")
     if not payload_raw:
@@ -191,7 +201,7 @@ async def slack_actions(request: Request):
                     }
                 ]
             }
-            slack_client.views_push(trigger_id=trigger_id, view=modal)
+            slack_open_or_push(payload, trigger_id, modal)
             return JSONResponse({})
 
         # --- CLARIFY ---
@@ -231,7 +241,7 @@ async def slack_actions(request: Request):
                     }
                 ]
             }
-            slack_client.views_push(trigger_id=trigger_id, view=modal)
+            slack_open_or_push(payload, trigger_id, modal)
             return JSONResponse({})
 
         # --- IMPROVE WITH AI ---
@@ -303,11 +313,8 @@ async def slack_actions(request: Request):
                 ]
             }
 
-            try:
-                slack_client.views_push(trigger_id=trigger_id, view=new_modal)
-                logging.info("Slack views_push sent new AI modal.")
-            except Exception as e:
-                logging.error(f"Slack views_push failed: {e}")
+            slack_client.views_push(trigger_id=trigger_id, view=new_modal)
+            logging.info("Slack views_push sent new AI modal.")
 
             return JSONResponse({})
 
