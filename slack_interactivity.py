@@ -57,47 +57,6 @@ def needs_clarification(reply: str) -> bool:
         "need to verify", "need to ask", "unsure"
     ])
 
-def ask_host_for_clarification(guest_msg, metadata, trigger_id):
-    slack_client.views_open(
-        trigger_id=trigger_id,
-        view={
-            "type": "modal",
-            "title": {"type": "plain_text", "text": "Need Your Help", "emoji": True},
-            "submit": {"type": "plain_text", "text": "Submit", "emoji": True},
-            "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-            "private_metadata": json.dumps(metadata),
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"The guest asked: *{guest_msg}*\nI couldn't confidently answer this. Can you help me out?"
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "clarify_input",
-                    "label": {"type": "plain_text", "text": "What should I tell the guest?", "emoji": True},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "clarify_text",
-                        "multiline": True
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "clarify_tag",
-                    "label": {"type": "plain_text", "text": "Tag this clarification (e.g. wifi, parking, etc)", "emoji": True},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "clarify_tag_input",
-                        "multiline": False
-                    }
-                }
-            ]
-        }
-    )
-
 def generate_reply_with_clarification(guest_msg, host_clarification):
     prompt = (
         "A guest asked a question, and the host provided clarification. Based on both, write a helpful, clear reply.\n\n"
@@ -140,6 +99,7 @@ async def slack_actions(request: Request):
         def get_meta_from_action(action):
             return json.loads(action["value"]) if "value" in action else {}
 
+        # --- SEND ---
         if action_id == "send":
             meta = get_meta_from_action(action)
             reply = meta.get("reply")
@@ -150,6 +110,7 @@ async def slack_actions(request: Request):
             success = send_reply_to_hostaway(conv_id, reply, communication_type)
             return JSONResponse({"text": "Reply sent to guest!" if success else "Failed to send reply to guest."})
 
+        # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
             modal = {
@@ -190,6 +151,90 @@ async def slack_actions(request: Request):
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
+        # --- EDIT ---
+        if action_id == "edit":
+            meta = get_meta_from_action(action)
+            ai_suggestion = meta.get("ai_suggestion", "")
+            modal = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Edit AI Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": json.dumps(meta),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Edit the reply below:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True,
+                            "initial_value": ai_suggestion
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            },
+                            {
+                                "type": "button",
+                                "action_id": "clarify_submission",
+                                "text": {"type": "plain_text", "text": ":question: Clarify for AI", "emoji": True}
+                            }
+                        ]
+                    }
+                ]
+            }
+            slack_client.views_push(trigger_id=trigger_id, view=modal)
+            return JSONResponse({})
+
+        # --- CLARIFY ---
+        if action_id == "clarify_request":
+            meta = get_meta_from_action(action)
+            guest_message = meta.get("guest_message", "")
+            ai_suggestion = meta.get("ai_suggestion", "")
+            modal = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Clarify or Correct for AI", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Teach AI", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": json.dumps(meta),
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*Guest asked:*\n>{guest_message}\n\n*AI suggested:*\n>{ai_suggestion}"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "clarify_input",
+                        "label": {"type": "plain_text", "text": "Your correct/clarifying reply for this situation", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "clarify_text",
+                            "multiline": True
+                        }
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "clarify_tag",
+                        "label": {"type": "plain_text", "text": "Tag (wifi, checkin, pet policy...)", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "clarify_tag_input"
+                        }
+                    }
+                ]
+            }
+            slack_client.views_push(trigger_id=trigger_id, view=modal)
+            return JSONResponse({})
+
+        # --- IMPROVE WITH AI ---
         if action_id == "improve_with_ai":
             view = payload.get("view", {})
             state = view.get("state", {}).get("values", {})
@@ -198,7 +243,6 @@ async def slack_actions(request: Request):
 
             logging.info(f"Improve with AI clicked. view_id: {view.get('id')}, hash: {view.get('hash')}")
 
-            # Synchronously call OpenAI and push a new modal view
             prompt = (
                 "Take this guest message reply and improve it. "
                 "Make it clear, concise, polite, and ensure it makes sense. "
@@ -267,23 +311,13 @@ async def slack_actions(request: Request):
 
             return JSONResponse({})
 
-        if action_id == "clarify_submission":
-            view = payload.get("view", {})
-            state = view.get("state", {}).get("values", {})
-            meta = json.loads(view.get("private_metadata", "{}"))
-            guest_msg = meta.get("guest_message", "")
-            ask_host_for_clarification(
-                guest_msg=guest_msg,
-                metadata=meta,
-                trigger_id=trigger_id
-            )
-            return JSONResponse({})
-
+    # --- CLARIFY MODAL SUBMISSION HANDLER ---
     if payload.get("type") == "view_submission":
         view = payload.get("view", {})
         state = view.get("state", {}).get("values", {})
         meta = json.loads(view.get("private_metadata", "{}"))
 
+        # Clarification modal submission (for AI learning)
         if "clarify_input" in state:
             clarification_text = next(iter(state["clarify_input"].values())).get("value")
             clarification_tag = next(iter(state["clarify_tag"].values())).get("value")
@@ -331,6 +365,7 @@ async def slack_actions(request: Request):
                 }
             })
 
+        # Regular reply submission handler
         if "reply_input" in state:
             reply_text = next(iter(state["reply_input"].values())).get("value")
             conv_id = meta.get("conv_id") or meta.get("conversation_id")
