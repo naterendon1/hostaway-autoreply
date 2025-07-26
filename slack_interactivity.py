@@ -23,8 +23,8 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-
 def clean_ai_reply(reply: str, property_type="home"):
+    # ... [same as yours]
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
         "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
@@ -52,13 +52,11 @@ def clean_ai_reply(reply: str, property_type="home"):
     reply = reply.strip().replace(" ,", ",").replace(" .", ".")
     return reply.rstrip(",. ")
 
-
 def needs_clarification(reply: str) -> bool:
     return any(phrase in reply.lower() for phrase in [
         "i'm not sure", "i don't know", "let me check", "can't find that info",
         "need to verify", "need to ask", "unsure"
     ])
-
 
 def ask_host_for_clarification(guest_msg, metadata, trigger_id):
     slack_client.views_open(
@@ -101,7 +99,6 @@ def ask_host_for_clarification(guest_msg, metadata, trigger_id):
         }
     )
 
-
 def generate_reply_with_clarification(guest_msg, host_clarification):
     prompt = (
         "A guest asked a question, and the host provided clarification. Based on both, write a helpful, clear reply.\n\n"
@@ -121,7 +118,6 @@ def generate_reply_with_clarification(guest_msg, host_clarification):
     except Exception as e:
         logging.error(f"Clarify AI generation failed: {e}")
         return "(Error generating response from clarification.)"
-
 
 def update_modal_with_ai_improvement(view, edited_text):
     """
@@ -195,19 +191,25 @@ def update_modal_with_ai_improvement(view, edited_text):
     except Exception as e:
         logging.error(f"Slack views_update failed: {e}")
 
-
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
+    logging.info("🎯 /slack/actions endpoint hit!")  # Debug entry log
     form = await request.form()
-    payload = json.loads(form.get("payload"))
+    payload_raw = form.get("payload")
+    if not payload_raw:
+        logging.error("No payload found in Slack actions request!")
+        return JSONResponse({})
+
+    payload = json.loads(payload_raw)
     logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
+    # Handle block_actions (e.g. button clicks)
     if payload.get("type") == "block_actions":
         action = payload["actions"][0]
         action_id = action.get("action_id")
         trigger_id = payload.get("trigger_id")
-        user = payload["user"]
-        user_id = user.get("id")
+        user = payload.get("user", {})
+        user_id = user.get("id", "")
 
         def get_meta_from_action(action):
             return json.loads(action["value"]) if "value" in action else {}
@@ -268,9 +270,10 @@ async def slack_actions(request: Request):
             reply_block = state.get("reply_input", {})
             edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
 
-            # Kick off improvement in background thread; return to Slack immediately!
+            logging.info(f"Improve with AI clicked. view_id: {view.get('id')}, hash: {view.get('hash')}")
+            # Run update in background, return immediately to Slack (must respond in <3s)
             threading.Thread(target=update_modal_with_ai_improvement, args=(view, edited_text), daemon=True).start()
-            return JSONResponse({})  # Must respond in <3s or Slack ignores us
+            return JSONResponse({})
 
         if action_id == "clarify_submission":
             view = payload.get("view", {})
@@ -284,6 +287,7 @@ async def slack_actions(request: Request):
             )
             return JSONResponse({})
 
+    # Handle modal submit events
     if payload.get("type") == "view_submission":
         view = payload.get("view", {})
         state = view.get("state", {}).get("values", {})
