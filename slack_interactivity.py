@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import re
+import threading
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
@@ -122,6 +123,79 @@ def generate_reply_with_clarification(guest_msg, host_clarification):
         return "(Error generating response from clarification.)"
 
 
+def update_modal_with_ai_improvement(view, edited_text):
+    """
+    Calls OpenAI to improve text, then updates Slack modal in-place.
+    Runs in a background thread.
+    """
+    view_id = view.get("id")
+    if not view_id:
+        logging.error("No view_id found in view payload for improve_with_ai action.")
+        return
+
+    prompt = (
+        "Take this guest message reply and improve it. "
+        "Make it clear, concise, polite, and ensure it makes sense. "
+        "Do not add extra content. Return only the improved version.\n\n"
+        f"{edited_text}"
+    )
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        improved = response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+        improved = "(Error generating improved message.)"
+
+    modal_update = {
+        "type": "modal",
+        "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+        "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+        "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+        "private_metadata": view.get("private_metadata"),
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "reply_input",
+                "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "reply",
+                    "multiline": True,
+                    "initial_value": improved
+                }
+            },
+            {
+                "type": "actions",
+                "block_id": "improve_ai_block",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "improve_with_ai",
+                        "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                    }
+                ]
+            }
+        ]
+    }
+
+    kwargs = dict(view_id=view_id, view=modal_update)
+    view_hash = view.get("hash")
+    if view_hash:
+        kwargs["hash"] = view_hash
+
+    try:
+        slack_response = slack_client.views_update(**kwargs)
+        logging.info(f"Slack views_update response: {slack_response}")
+    except Exception as e:
+        logging.error(f"Slack views_update failed: {e}")
+
+
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
     form = await request.form()
@@ -193,75 +267,10 @@ async def slack_actions(request: Request):
             state = view.get("state", {}).get("values", {})
             reply_block = state.get("reply_input", {})
             edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
-            prompt = (
-                "Take this guest message reply and improve it. "
-                "Make it clear, concise, polite, and ensure it makes sense. "
-                "Do not add extra content. Return only the improved version.\n\n"
-                f"{edited_text}"
-            )
-            try:
-                response = openai_client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                improved = response.choices[0].message.content.strip()
-            except Exception as e:
-                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
-                improved = "(Error generating improved message.)"
 
-            view_id = view.get("id")
-            if not view_id:
-                logging.error("No view_id found in view payload for improve_with_ai action.")
-                return JSONResponse({})
-
-            # Prepare modal update
-            modal_update = {
-                "type": "modal",
-                "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
-                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                "private_metadata": view.get("private_metadata"),
-                "blocks": [
-                    {
-                        "type": "input",
-                        "block_id": "reply_input",
-                        "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "reply",
-                            "multiline": True,
-                            "initial_value": improved
-                        }
-                    },
-                    {
-                        "type": "actions",
-                        "block_id": "improve_ai_block",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "action_id": "improve_with_ai",
-                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
-                            }
-                        ]
-                    }
-                ]
-            }
-
-            # Only include the hash if it exists
-            kwargs = dict(view_id=view_id, view=modal_update)
-            view_hash = view.get("hash")
-            if view_hash:
-                kwargs["hash"] = view_hash
-
-            try:
-                slack_response = slack_client.views_update(**kwargs)
-                logging.info(f"Slack views_update response: {slack_response}")
-            except Exception as e:
-                logging.error(f"Slack views_update failed: {e}")
-            return JSONResponse({})
+            # Kick off improvement in background thread; return to Slack immediately!
+            threading.Thread(target=update_modal_with_ai_improvement, args=(view, edited_text), daemon=True).start()
+            return JSONResponse({})  # Must respond in <3s or Slack ignores us
 
         if action_id == "clarify_submission":
             view = payload.get("view", {})
