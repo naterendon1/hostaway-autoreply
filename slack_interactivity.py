@@ -130,6 +130,23 @@ async def slack_actions(request: Request):
         def get_meta_from_action(action):
             return json.loads(action["value"]) if "value" in action else {}
 
+        if action_id == "send":
+            logging.info("✅ Send button clicked.")
+            meta = get_meta_from_action(action)
+            reply = meta.get("reply")
+            conv_id = meta.get("conv_id")
+            communication_type = meta.get("type", "email")
+
+            if not reply or not conv_id:
+                logging.warning("⚠️ Missing reply or conv_id in Send payload.")
+                return JSONResponse({"text": "Missing reply or conversation ID."})
+
+            success = send_reply_to_hostaway(conv_id, reply, communication_type)
+            if success:
+                return JSONResponse({"text": "Reply sent to guest!"})
+            else:
+                return JSONResponse({"text": "Failed to send reply to guest."})
+
         # "Write Your Own Reply" - open the manual reply modal
         if action_id == "write_own":
             meta = get_meta_from_action(action)
