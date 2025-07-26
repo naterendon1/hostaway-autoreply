@@ -190,75 +190,79 @@ async def slack_actions(request: Request):
 
         # "Improve with AI" - rewrite the reply using GPT, update the modal in place
         if action_id == "improve_with_ai":
-            logging.info("🚀 Improve with AI clicked.")
-            view = payload.get("view", {})
-            state = view.get("state", {}).get("values", {})
-            reply_block = state.get("reply_input", {})
-            edited_text = None
-            for v in reply_block.values():
-                if v.get("value") is not None:
-                    edited_text = v.get("value")
-            logging.info(f"User's draft text: {edited_text}")
+    logging.info("🚀 Improve with AI clicked.")
+    view = payload.get("view", {})
+    state = view.get("state", {}).get("values", {})
+    reply_block = state.get("reply_input", {})
+    edited_text = None
+    for v in reply_block.values():
+        if v.get("value") is not None:
+            edited_text = v.get("value")
 
-            prompt = (
-                "Make the following message as clear, concise, and informal as possible. "
-                "Ensure it makes sense, and do not add any extra information. Only return the improved message.\n\n"
-                f"Original message:\n{edited_text}"
-            )
+    logging.info(f"User's draft text: {edited_text}")
 
-            try:
-                response = openai_client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                improved = response.choices[0].message.content.strip()
-                logging.info(f"Improved reply from AI: {improved}")
-            except Exception as e:
-                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
-                improved = "(Error generating improved reply.)"
+    prompt = (
+        "Take this guest message reply and improve it. "
+        "Make it clear, concise, polite, and ensure it makes sense. "
+        "Do not add extra content. Return only the improved version.\n\n"
+        f"{edited_text}"
+    )
 
-            try:
-                slack_client.views_update(
-                    view_id=view.get("id"),
-                    hash=view.get("hash"),
-                    view={
-                        "type": "modal",
-                        "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
-                        "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                        "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                        "private_metadata": view.get("private_metadata"),
-                        "blocks": [
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        improved = response.choices[0].message.content.strip()
+        logging.info(f"AI improved text: {improved}")
+    except Exception as e:
+        logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+        improved = "(Error generating improved message.)"
+
+    try:
+        slack_client.views_update(
+            view_id=view.get("id"),
+            hash=view.get("hash"),
+            view={
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": view.get("private_metadata"),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True,
+                            "initial_value": improved
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
                             {
-                                "type": "input",
-                                "block_id": "reply_input",
-                                "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                                "element": {
-                                    "type": "plain_text_input",
-                                    "action_id": "reply",
-                                    "multiline": True,
-                                    "initial_value": improved
-                                }
-                            },
-                            {
-                                "type": "actions",
-                                "block_id": "improve_ai_block",
-                                "elements": [
-                                    {
-                                        "type": "button",
-                                        "action_id": "improve_with_ai",
-                                        "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
-                                    }
-                                ]
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
                             }
                         ]
                     }
-                )
-            except Exception as e:
-                logging.error(f"Failed to update improved modal: {e}")
-            return JSONResponse({})
+                ]
+            }
+        )
+    except Exception as e:
+        logging.error(f"Failed to update modal with improved reply: {e}")
+
+    return JSONResponse({})
+
 
         # "Clarify for AI" - open the clarify modal
         if action_id == "clarify_submission":
