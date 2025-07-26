@@ -3,6 +3,7 @@ import logging
 import json
 import re
 import threading
+import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
@@ -24,7 +25,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 def clean_ai_reply(reply: str, property_type="home"):
-    # ... [same as yours]
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
         "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
@@ -150,7 +150,7 @@ def update_modal_with_ai_improvement(view, edited_text):
 
     modal_update = {
         "type": "modal",
-        "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+        "title": {"type": "plain_text", "text": "AI Improved Reply 🚀", "emoji": True},
         "submit": {"type": "plain_text", "text": "Send", "emoji": True},
         "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
         "private_metadata": view.get("private_metadata"),
@@ -174,6 +174,15 @@ def update_modal_with_ai_improvement(view, edited_text):
                         "type": "button",
                         "action_id": "improve_with_ai",
                         "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                    }
+                ]
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "plain_text",
+                        "text": f"Last AI improvement: {datetime.datetime.now().isoformat()}"
                     }
                 ]
             }
@@ -271,7 +280,6 @@ async def slack_actions(request: Request):
             edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
 
             logging.info(f"Improve with AI clicked. view_id: {view.get('id')}, hash: {view.get('hash')}")
-            # Run update in background, return immediately to Slack (must respond in <3s)
             threading.Thread(target=update_modal_with_ai_improvement, args=(view, edited_text), daemon=True).start()
             return JSONResponse({})
 
