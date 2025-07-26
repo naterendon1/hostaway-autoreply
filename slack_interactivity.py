@@ -24,7 +24,10 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 def clean_ai_reply(reply: str, property_type="home"):
-    bad_signoffs = ["Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"]
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
+        "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
     for signoff in bad_signoffs:
         reply = reply.replace(signoff, "")
     lines = reply.split('\n')
@@ -68,7 +71,10 @@ def ask_host_for_clarification(guest_msg, metadata, trigger_id):
             "blocks": [
                 {
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"The guest asked: *{guest_msg}*\nI couldn't confidently answer this. Can you help me out?"}
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"The guest asked: *{guest_msg}*\nI couldn't confidently answer this. Can you help me out?"
+                    }
                 },
                 {
                     "type": "input",
@@ -206,41 +212,55 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved message.)"
 
-            slack_client.views_update(
-                view_id=view.get("id"),
-                hash=view.get("hash"),
-                view={
-                    "type": "modal",
-                    "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
-                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                    "private_metadata": view.get("private_metadata"),
-                    "blocks": [
-                        {
-                            "type": "input",
-                            "block_id": "reply_input",
-                            "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                            "element": {
-                                "type": "plain_text_input",
-                                "action_id": "reply",
-                                "multiline": True,
-                                "initial_value": improved
-                            }
-                        },
-                        {
-                            "type": "actions",
-                            "block_id": "improve_ai_block",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "action_id": "improve_with_ai",
-                                    "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
-                                }
-                            ]
+            view_id = view.get("id")
+            if not view_id:
+                logging.error("No view_id found in view payload for improve_with_ai action.")
+                return JSONResponse({})
+
+            # Prepare modal update
+            modal_update = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": view.get("private_metadata"),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True,
+                            "initial_value": improved
                         }
-                    ]
-                }
-            )
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            }
+                        ]
+                    }
+                ]
+            }
+
+            # Only include the hash if it exists
+            kwargs = dict(view_id=view_id, view=modal_update)
+            view_hash = view.get("hash")
+            if view_hash:
+                kwargs["hash"] = view_hash
+
+            try:
+                slack_response = slack_client.views_update(**kwargs)
+                logging.info(f"Slack views_update response: {slack_response}")
+            except Exception as e:
+                logging.error(f"Slack views_update failed: {e}")
             return JSONResponse({})
 
         if action_id == "clarify_submission":
