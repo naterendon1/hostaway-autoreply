@@ -2,7 +2,6 @@ import os
 import logging
 import json
 import re
-import threading
 import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -119,87 +118,6 @@ def generate_reply_with_clarification(guest_msg, host_clarification):
         logging.error(f"Clarify AI generation failed: {e}")
         return "(Error generating response from clarification.)"
 
-def update_modal_with_ai_improvement(view, edited_text):
-    """
-    Calls OpenAI to improve text, then updates Slack modal in-place.
-    Runs in a background thread.
-    """
-    view_id = view.get("id")
-    if not view_id:
-        logging.error("No view_id found in view payload for improve_with_ai action.")
-        return
-
-    prompt = (
-        "Take this guest message reply and improve it. "
-        "Make it clear, concise, polite, and ensure it makes sense. "
-        "Do not add extra content. Return only the improved version.\n\n"
-        f"{edited_text}"
-    )
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        improved = response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"OpenAI error in 'improve_with_ai': {e}")
-        improved = "(Error generating improved message.)"
-
-    modal_update = {
-        "type": "modal",
-        "title": {"type": "plain_text", "text": "AI Improved Reply 🚀", "emoji": True},
-        "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-        "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-        "private_metadata": view.get("private_metadata"),
-        "blocks": [
-            {
-                "type": "input",
-                "block_id": "reply_input",
-                "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "reply",
-                    "multiline": True,
-                    "initial_value": improved
-                }
-            },
-            {
-                "type": "actions",
-                "block_id": "improve_ai_block",
-                "elements": [
-                    {
-                        "type": "button",
-                        "action_id": "improve_with_ai",
-                        "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
-                    }
-                ]
-            },
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "plain_text",
-                        "text": f"Last AI improvement: {datetime.datetime.now().isoformat()}"
-                    }
-                ]
-            }
-        ]
-    }
-
-    kwargs = dict(view_id=view_id, view=modal_update)
-    view_hash = view.get("hash")
-    if view_hash:
-        kwargs["hash"] = view_hash
-
-    try:
-        slack_response = slack_client.views_update(**kwargs)
-        logging.info(f"Slack views_update response: {slack_response}")
-    except Exception as e:
-        logging.error(f"Slack views_update failed: {e}")
-
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
     logging.info("🎯 /slack/actions endpoint hit!")  # Debug entry log
@@ -212,7 +130,6 @@ async def slack_actions(request: Request):
     payload = json.loads(payload_raw)
     logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
-    # Handle block_actions (e.g. button clicks)
     if payload.get("type") == "block_actions":
         action = payload["actions"][0]
         action_id = action.get("action_id")
@@ -280,7 +197,74 @@ async def slack_actions(request: Request):
             edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
 
             logging.info(f"Improve with AI clicked. view_id: {view.get('id')}, hash: {view.get('hash')}")
-            threading.Thread(target=update_modal_with_ai_improvement, args=(view, edited_text), daemon=True).start()
+
+            # Synchronously call OpenAI and push a new modal view
+            prompt = (
+                "Take this guest message reply and improve it. "
+                "Make it clear, concise, polite, and ensure it makes sense. "
+                "Do not add extra content. Return only the improved version.\n\n"
+                f"{edited_text}"
+            )
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant for editing guest replies."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                improved = response.choices[0].message.content.strip()
+            except Exception as e:
+                logging.error(f"OpenAI error in 'improve_with_ai': {e}")
+                improved = "(Error generating improved message.)"
+
+            new_modal = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "AI Improved Reply 🚀", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": view.get("private_metadata"),
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True,
+                            "initial_value": improved
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "improve_ai_block",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "improve_with_ai",
+                                "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "plain_text",
+                                "text": f"Last AI improvement: {datetime.datetime.now().isoformat()}"
+                            }
+                        ]
+                    }
+                ]
+            }
+
+            try:
+                slack_client.views_push(trigger_id=trigger_id, view=new_modal)
+                logging.info("Slack views_push sent new AI modal.")
+            except Exception as e:
+                logging.error(f"Slack views_push failed: {e}")
+
             return JSONResponse({})
 
         if action_id == "clarify_submission":
@@ -295,7 +279,6 @@ async def slack_actions(request: Request):
             )
             return JSONResponse({})
 
-    # Handle modal submit events
     if payload.get("type") == "view_submission":
         view = payload.get("view", {})
         state = view.get("state", {}).get("values", {})
