@@ -346,12 +346,20 @@ async def slack_actions(request: Request):
         if "reply_input" in state:
             reply_block = state.get("reply_input", {})
             reply_text = list(reply_block.values())[0].get("value")
-            # Optionally, post reply to Hostaway or elsewhere here
-            logging.info(f"Manual reply submitted: {reply_text}")
-            # You may want to add code to send the reply to Hostaway or log it
 
-            return JSONResponse({"text": "Reply sent!"})
+            conv_id = meta.get("conv_id") or meta.get("conversation_id")
+            communication_type = meta.get("type", "email")
 
-    # Fallback response
-    return JSONResponse({"text": "Action received."})
+            if not conv_id or not reply_text:
+                logging.warning("Missing conversation ID or reply text.")
+                return JSONResponse({"response_action": "errors"})
 
+            success = send_reply_to_hostaway(conv_id, reply_text, communication_type)
+            if success:
+                logging.info(f"✅ Reply sent from modal for conv_id={conv_id}")
+            else:
+                logging.error(f"❌ Failed to send reply for conv_id={conv_id}")
+
+            return JSONResponse({
+                "response_action": "clear"
+            })
