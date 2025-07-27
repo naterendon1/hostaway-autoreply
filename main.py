@@ -28,7 +28,6 @@ app = FastAPI()
 app.include_router(slack_router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
 MAX_THREAD_MESSAGES = 10
 
 class HostawayUnifiedWebhook(BaseModel):
@@ -40,25 +39,21 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-# --- Retrieval-augmented system prompt ---
+SYSTEM_PROMPT_FIELD_SELECTION = """
+You are a knowledgeable, friendly property host. When you receive a guest’s question, first decide which property details you need.
+If you need info, respond only with a comma-separated list of fields (e.g., wifiUsername, wifiPassword, bedroomsNumber).
+If you have all info you need, reply with "ready". Wait for the property info, then write your reply as if you know the house personally.
+Never mention “listing,” “database,” or where info came from—just answer as the host. Keep it warm, concise, and use the guest’s name.
+"""
+
 SYSTEM_PROMPT_ANSWER = """
-You are a knowledgeable, friendly property host. When replying to guests, be brief, warm, and informal. 
-Greet guests by their first name only if it sounds natural. Only include property details if they directly answer a question. 
-Avoid formalities like "Dear" or "delighted to hear". Never restate the guest’s message. 
-Write as if texting a friend—keep replies clear, concise, and focused on what the guest needs now. 
-Never mention listings, databases, or house rules unless specifically asked. 
+You are a knowledgeable, friendly property host. When replying to guests, be brief, warm, and informal.
+Greet guests by their first name only if it sounds natural. Only include property details if they directly answer a question.
+Avoid formalities like "Dear" or "delighted to hear". Never restate the guest’s message.
+Write as if texting a friend—keep replies clear, concise, and focused on what the guest needs now.
+Never mention listings, databases, or house rules unless specifically asked.
 Keep replies under 250 characters unless extra details are required.
 """
-    "If you need info, respond only with a comma-separated list of fields (e.g., wifiUsername, wifiPassword, bedroomsNumber). "
-    "If you have all info you need, reply with \"ready\". Wait for the property info, then write your reply as if you know the house personally. "
-    "Never mention “listing,” “database,” or where info came from—just answer as the host. Keep it warm, concise, and use the guest’s name."
-)
-
-SYSTEM_PROMPT_ANSWER = (
-    "You are a knowledgeable, friendly property host. Write a warm, clear, helpful response to the guest using the property details provided. "
-    "If a property detail is blank, say you'll check and follow up. Never mention you checked a listing or database. Use the guest’s name and property’s name in a natural, human way. "
-    "Keep it concise, inviting, and use a conversational host tone."
-)
 
 def clean_ai_reply(reply: str):
     bad_signoffs = [
@@ -176,7 +171,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error(f"❌ OpenAI answer generation error: {e}")
         ai_reply = "(Error generating reply.)"
 
-    # --- ONLY store IDs (not giant strings) in button values! ---
     button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -184,14 +178,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "type": communication_type,
         "guest_name": guest_name
     }
-    # All context for modals is in private_metadata!
     modal_metadata = {
         **button_meta_minimal,
         "guest_message": guest_msg,
         "ai_suggestion": ai_reply,
     }
 
-    # Button values now small and safe!
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Listing:* {listing.get('name', 'Unknown listing')}" }},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
@@ -211,12 +203,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     from slack_sdk import WebClient
     slack_client = WebClient(token=SLACK_BOT_TOKEN)
     try:
-        # For modals, pass full context in private_metadata, not in button value!
         slack_client.chat_postMessage(
             channel=SLACK_CHANNEL,
             blocks=blocks,
-            text="New message from guest",
-            metadata={"private_metadata": json.dumps(modal_metadata)}  # <-- optional, can be used if needed
+            text="New message from guest"
         )
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
