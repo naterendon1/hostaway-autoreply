@@ -7,7 +7,6 @@ from slack_interactivity import router as slack_router, needs_clarification
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
-    fetch_hostaway_resource,
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
@@ -41,50 +40,41 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-def determine_needed_fields(guest_message: str):
-    core = {"summary", "amenities", "houseManual", "type", "name"}
-    extra = set()
-    text = guest_message.lower()
-    if any(x in text for x in ["how far", "distance", "close", "from", "to", "airport", "center"]):
-        extra.update({"address", "city", "zipcode", "state"})
-    if any(x in text for x in ["parking", "car", "vehicle"]):
-        extra.update({"parking", "houseManual"})
-    if any(x in text for x in ["price", "cost", "fee", "rate"]):
-        extra.update({"price", "cleaningFee", "securityDepositFee", "currencyCode"})
-    if "cancel" in text or "refund" in text:
-        extra.update({"cancellationPolicy", "cancellationPolicyId"})
-    if any(x in text for x in ["wifi", "internet", "tv", "netflix"]):
-        extra.update({"amenities", "wifiUsername", "wifiPassword"})
-    if any(x in text for x in ["bed", "sofa", "couch"]):
-        extra.update({"bedroomsNumber", "bedsNumber"})
-    if "guest" in text or "person" in text:
-        extra.update({"personCapacity", "maxChildrenAllowed", "maxInfantsAllowed", "maxPetsAllowed", "guestsIncluded"})
-    if "pet" in text or "dog" in text or "cat" in text:
-        extra.update({"maxPetsAllowed", "amenities", "houseRules"})
-    return core.union(extra)
-
-def get_property_type(listing_result):
-    prop = (listing_result.get("type") or "").lower()
-    name = (listing_result.get("name") or "").lower()
-    for t in ["house", "cabin", "condo", "apartment", "villa"]:
-        if t in prop or t in name:
-            return t
-    return "home"
-
-def clean_ai_reply(reply: str, property_type="home"):
-    for s in ["Best,", "Cheers,", "Sincerely,", "Enjoy!", "[Your Name]"]:
-        reply = reply.replace(s, "")
-    lines = reply.split('\n')
-    filtered = [line for line in lines if not any(sign in line for sign in ["Best", "Cheers", "Sincerely", "[Your Name]"])]
-    reply = ' '.join(filtered)
-    reply = re.sub(r"\d{3,} [\w .]+, [\w ]+", f"at the {property_type}", reply)
-    reply = re.sub(r"at [\d]+ [\w .]+", f"at the {property_type}", reply)
-    return reply.strip(" ,.").replace(" ,", ",").replace(" .", ".")
-
-SYSTEM_PROMPT = (
-    "You're a helpful vacation rental host. Reply casually and briefly using available info. "
-    "Don't guess. If unsure, say you'll follow up. No sign-offs."
+# --- Retrieval-augmented system prompt ---
+SYSTEM_PROMPT_FIELD_SELECTION = (
+    "You are a knowledgeable, friendly property host. When you receive a guest’s question, first decide which property details you need. "
+    "If you need info, respond only with a comma-separated list of fields (e.g., wifiUsername, wifiPassword, bedroomsNumber). "
+    "If you have all info you need, reply with \"ready\". Wait for the property info, then write your reply as if you know the house personally. "
+    "Never mention “listing,” “database,” or where info came from—just answer as the host. Keep it warm, concise, and use the guest’s name."
 )
+
+SYSTEM_PROMPT_ANSWER = (
+    "You are a knowledgeable, friendly property host. Write a warm, clear, helpful response to the guest using the property details provided. "
+    "If a property detail is blank, say you'll check and follow up. Never mention you checked a listing or database. Use the guest’s name and property’s name in a natural, human way. "
+    "Keep it concise, inviting, and use a conversational host tone."
+)
+
+def clean_ai_reply(reply: str):
+    # Remove trailing sign-offs and excessive whitespace
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
+        "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    for signoff in bad_signoffs:
+        reply = reply.replace(signoff, "")
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.lower().startswith(s.lower().replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+    reply = ' '.join(filtered_lines)
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    return reply.rstrip(",. ")
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -119,46 +109,72 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    fields = determine_needed_fields(guest_msg)
+    # --- Step 1: Let AI decide which fields are needed ---
+    try:
+        field_response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_FIELD_SELECTION},
+                {"role": "user", "content": f'Guest message: "{guest_msg}"'}
+            ]
+        ).choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"❌ OpenAI field selection error: {e}")
+        field_response = "ready"
+
+    # Always ensure some "core" fields are available for personality/context
+    core_fields = {"name", "description", "city"}
+    requested_fields = set()
+
+    if field_response.lower() != "ready":
+        requested_fields.update([f.strip() for f in field_response.split(",") if f.strip()])
+    requested_fields = requested_fields.union(core_fields)
+
+    # --- Step 2: Fetch those fields from Hostaway ---
     listing_obj = fetch_hostaway_listing(listing_id) or {}
     listing = listing_obj.get("result", {})
-    listing_info = get_property_info(listing_obj, fields)
-    property_type = get_property_type(listing)
-    listing_name = listing.get("name", "Unknown listing")
+    property_details = {k: listing.get(k, "") for k in requested_fields if k in listing}
 
+    # --- Step 3: Compose answer prompt ---
+    property_str = "\n".join([f"{k}: {v}" for k, v in property_details.items() if v])
+    if not property_str:
+        property_str = "(no extra details available)"
+
+    # Build the context
     convo = fetch_hostaway_conversation(conv_id) or {}
     msgs = convo.get("conversationMessages", [])
     context = "\n".join([f"{'Guest' if m['isIncoming'] else 'Host'}: {m['body']}" for m in msgs[-MAX_THREAD_MESSAGES:]])
 
-    examples = get_similar_learning_examples(guest_msg, listing_id)
+    prev_examples = get_similar_learning_examples(guest_msg, listing_id)
     prev_answer = ""
-    if examples and examples[0][2]:
-        prev_answer = f"Previously, you replied:\n\"{examples[0][2]}\"\nUse this only as context.\n"
+    if prev_examples and prev_examples[0][2]:
+        prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
 
     cancellation = get_cancellation_policy_summary(listing, res)
 
-    prompt = (
-        f"{context}\nGuest: \"{guest_msg}\"\n{prev_answer}"
-        f"Listing Info:\n{listing_info}\n"
+    ai_prompt = (
+        f"Guest name: {guest_name}\n"
+        f"Guest message: \"{guest_msg}\"\n"
+        f"{prev_answer}"
+        f"Property details:\n{property_str}\n"
         f"Reservation Info:\n{json.dumps(res)}\n"
         f"Cancellation: {cancellation}\n"
-        "---\nWrite a reply using only the data above. Don't guess. If unsure, say you'll check."
+        "---\nWrite a warm, clear, and helpful reply as the host, using the info above. If a detail is missing, say you'll check and follow up. Do not mention 'listing' or 'database'."
     )
 
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": SYSTEM_PROMPT_ANSWER},
+                {"role": "user", "content": ai_prompt}
             ]
         )
-        ai_reply = clean_ai_reply(response.choices[0].message.content.strip(), property_type)
+        ai_reply = clean_ai_reply(response.choices[0].message.content.strip())
     except Exception as e:
-        logging.error(f"❌ OpenAI error: {e}")
+        logging.error(f"❌ OpenAI answer generation error: {e}")
         ai_reply = "(Error generating reply.)"
 
-    # <-- HERE IS THE META INCLUDING guest_name!
     payload_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -166,17 +182,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "ai_suggestion": ai_reply,
         "type": communication_type,
         "guest_id": guest_id,
-        "guest_name": guest_name,  # <--- added here!
+        "guest_name": guest_name
     }
 
+    # Only used if you still want clarification modals
     if needs_clarification(ai_reply):
-        # Optionally: Pass guest_name to clarification logic here if needed.
-        # ask_host_for_clarification(guest_msg, payload_meta, trigger_id=None)
+        # You might want to route a message to the host here
         return {"status": "clarification_requested"}
 
     header = f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Listing:* {listing_name} ({property_type})"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Listing:* {listing.get('name', 'Unknown listing')}" }},
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
