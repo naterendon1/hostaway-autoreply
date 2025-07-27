@@ -255,7 +255,7 @@ async def slack_actions(request: Request):
 
             prompt = (
                 "Take this guest message reply and improve it. "
-                "Make it clear, concise, polite, and ensure it makes sense. "
+                "Make it clear, concise, polite, informal, and ensure it makes sense. "
                 "Do not add extra content. Return only the improved version.\n\n"
                 f"{edited_text}"
             )
