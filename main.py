@@ -55,7 +55,6 @@ SYSTEM_PROMPT_ANSWER = (
 )
 
 def clean_ai_reply(reply: str):
-    # Remove trailing sign-offs and excessive whitespace
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
         "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
@@ -122,7 +121,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error(f"❌ OpenAI field selection error: {e}")
         field_response = "ready"
 
-    # Always ensure some "core" fields are available for personality/context
     core_fields = {"name", "description", "city"}
     requested_fields = set()
 
@@ -130,17 +128,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         requested_fields.update([f.strip() for f in field_response.split(",") if f.strip()])
     requested_fields = requested_fields.union(core_fields)
 
-    # --- Step 2: Fetch those fields from Hostaway ---
     listing_obj = fetch_hostaway_listing(listing_id) or {}
     listing = listing_obj.get("result", {})
     property_details = {k: listing.get(k, "") for k in requested_fields if k in listing}
 
-    # --- Step 3: Compose answer prompt ---
     property_str = "\n".join([f"{k}: {v}" for k, v in property_details.items() if v])
     if not property_str:
         property_str = "(no extra details available)"
 
-    # Build the context
     convo = fetch_hostaway_conversation(conv_id) or {}
     msgs = convo.get("conversationMessages", [])
     context = "\n".join([f"{'Guest' if m['isIncoming'] else 'Host'}: {m['body']}" for m in msgs[-MAX_THREAD_MESSAGES:]])
@@ -175,34 +170,34 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error(f"❌ OpenAI answer generation error: {e}")
         ai_reply = "(Error generating reply.)"
 
-    payload_meta = {
+    # --- ONLY store IDs (not giant strings) in button values! ---
+    button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
-        "guest_message": guest_msg,
-        "ai_suggestion": ai_reply,
-        "type": communication_type,
         "guest_id": guest_id,
+        "type": communication_type,
         "guest_name": guest_name
     }
+    # All context for modals is in private_metadata!
+    modal_metadata = {
+        **button_meta_minimal,
+        "guest_message": guest_msg,
+        "ai_suggestion": ai_reply,
+    }
 
-    # Only used if you still want clarification modals
-    if needs_clarification(ai_reply):
-        # You might want to route a message to the host here
-        return {"status": "clarification_requested"}
-
-    header = f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"
+    # Button values now small and safe!
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Listing:* {listing.get('name', 'Unknown listing')}" }},
-        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
         {
             "type": "actions",
             "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**payload_meta, "reply": ai_reply}), "action_id": "send"},
-                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**payload_meta, "draft": ai_reply}), "action_id": "edit"},
-                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps(payload_meta), "action_id": "write_own"},
-                {"type": "button", "text": {"type": "plain_text", "text": "🤔 Clarify"}, "value": json.dumps(payload_meta), "action_id": "clarify_request"}
+                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
+                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
+                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"},
+                {"type": "button", "text": {"type": "plain_text", "text": "🤔 Clarify"}, "value": json.dumps({**button_meta_minimal, "action": "clarify_request"}), "action_id": "clarify_request"}
             ]
         }
     ]
@@ -210,7 +205,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     from slack_sdk import WebClient
     slack_client = WebClient(token=SLACK_BOT_TOKEN)
     try:
-        slack_client.chat_postMessage(channel=SLACK_CHANNEL, blocks=blocks, text="New message from guest")
+        # For modals, pass full context in private_metadata, not in button value!
+        slack_client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            blocks=blocks,
+            text="New message from guest",
+            metadata={"private_metadata": json.dumps(modal_metadata)}  # <-- optional, can be used if needed
+        )
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
 
