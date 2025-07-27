@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
 from utils import (
     send_reply_to_hostaway,
+    fetch_hostaway_resource,
     store_learning_example,
     get_similar_learning_examples,
     store_clarification_log,
@@ -21,6 +22,34 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+def clean_ai_reply(reply: str, property_type="home"):
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
+        "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    for signoff in bad_signoffs:
+        reply = reply.replace(signoff, "")
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.lower().startswith(s.lower().replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+    reply = ' '.join(filtered_lines)
+    address_patterns = [
+        r"(at\s+)?\d{3,} [A-Za-z0-9 .]+, [A-Za-z ]+",
+        r"(the\s+)?house at [\d]+ [^,]+, [A-Za-z ]+",
+        r"at [\d]+ [\w .]+, [\w ]+"
+    ]
+    for pattern in address_patterns:
+        reply = re.sub(pattern, f"at the {property_type}", reply, flags=re.IGNORECASE)
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    return reply.rstrip(",. ")
 
 def needs_clarification(reply: str) -> bool:
     return any(phrase in reply.lower() for phrase in [
@@ -94,21 +123,19 @@ async def slack_actions(request: Request):
         # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
-            guest_name = meta.get("guest_name", "")
-            guest_message = meta.get("guest_message", "")
+            guest_name = meta.get("guest_name", "Guest")
+            guest_msg = meta.get("guest_message", "")
             modal = {
                 "type": "modal",
-                "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
+                "title": {"type": "plain_text", "text": "Write Your Reply", "emoji": True},
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": json.dumps(meta),
                 "blocks": [
                     {
-                        "type": "context",
-                        "elements": [
-                            {"type": "mrkdwn", "text": f"*Guest:* {guest_name or 'Guest'}"},
-                            {"type": "mrkdwn", "text": f"*Message:* {guest_message}"}
-                        ]
+                        "type": "section",
+                        "block_id": "guest_message_section",
+                        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}
                     },
                     {
                         "type": "input",
@@ -138,15 +165,15 @@ async def slack_actions(request: Request):
                     }
                 ]
             }
-            slack_open_or_push(payload, trigger_id, modal)
+            slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
         # --- EDIT ---
         if action_id == "edit":
             meta = get_meta_from_action(action)
-            ai_suggestion = meta.get("draft", "") or meta.get("ai_suggestion", "")
-            guest_name = meta.get("guest_name", "")
-            guest_message = meta.get("guest_message", "")
+            guest_name = meta.get("guest_name", "Guest")
+            guest_msg = meta.get("guest_message", "")
+            ai_suggestion = meta.get("draft", meta.get("ai_suggestion", ""))
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Edit AI Reply", "emoji": True},
@@ -155,16 +182,14 @@ async def slack_actions(request: Request):
                 "private_metadata": json.dumps(meta),
                 "blocks": [
                     {
-                        "type": "context",
-                        "elements": [
-                            {"type": "mrkdwn", "text": f"*Guest:* {guest_name or 'Guest'}"},
-                            {"type": "mrkdwn", "text": f"*Message:* {guest_message}"}
-                        ]
+                        "type": "section",
+                        "block_id": "guest_message_section",
+                        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}
                     },
                     {
                         "type": "input",
                         "block_id": "reply_input",
-                        "label": {"type": "plain_text", "text": "Edit the reply below:", "emoji": True},
+                        "label": {"type": "plain_text", "text": "Edit below:", "emoji": True},
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "reply",
@@ -196,31 +221,25 @@ async def slack_actions(request: Request):
         # --- CLARIFY ---
         if action_id == "clarify_request":
             meta = get_meta_from_action(action)
-            guest_name = meta.get("guest_name", "")
+            guest_name = meta.get("guest_name", "Guest")
             guest_message = meta.get("guest_message", "")
             ai_suggestion = meta.get("ai_suggestion", "")
             modal = {
                 "type": "modal",
-                "title": {"type": "plain_text", "text": "Clarify or Correct for AI", "emoji": True},
+                "title": {"type": "plain_text", "text": "Clarify for AI", "emoji": True},
                 "submit": {"type": "plain_text", "text": "Teach AI", "emoji": True},
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": json.dumps(meta),
                 "blocks": [
                     {
-                        "type": "context",
-                        "elements": [
-                            {"type": "mrkdwn", "text": f"*Guest:* {guest_name or 'Guest'}"},
-                            {"type": "mrkdwn", "text": f"*Message:* {guest_message}"}
-                        ]
-                    },
-                    {
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"*AI suggested:*\n>{ai_suggestion}"}
+                        "block_id": "guest_message_section",
+                        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_message}\n*AI Suggested*: {ai_suggestion}"}
                     },
                     {
                         "type": "input",
                         "block_id": "clarify_input",
-                        "label": {"type": "plain_text", "text": "Your correct/clarifying reply for this situation", "emoji": True},
+                        "label": {"type": "plain_text", "text": "Your correct/clarifying reply", "emoji": True},
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "clarify_text",
@@ -230,7 +249,7 @@ async def slack_actions(request: Request):
                     {
                         "type": "input",
                         "block_id": "clarify_tag",
-                        "label": {"type": "plain_text", "text": "Tag (wifi, checkin, pet policy...)", "emoji": True},
+                        "label": {"type": "plain_text", "text": "Tag (wifi, checkin...)", "emoji": True},
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "clarify_tag_input"
@@ -248,9 +267,10 @@ async def slack_actions(request: Request):
             reply_block = state.get("reply_input", {})
             edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
 
+            # Get guest context from private_metadata for display in improved modal
             meta = json.loads(view.get("private_metadata", "{}"))
-            guest_name = meta.get("guest_name", "")
-            guest_message = meta.get("guest_message", "")
+            guest_name = meta.get("guest_name", "Guest")
+            guest_msg = meta.get("guest_message", "")
 
             logging.info(f"Improve with AI clicked. view_id: {view.get('id')}, hash: {view.get('hash')}")
 
@@ -275,17 +295,15 @@ async def slack_actions(request: Request):
 
             new_modal = {
                 "type": "modal",
-                "title": {"type": "plain_text", "text": "AI Improved Reply 🚀", "emoji": True},
+                "title": {"type": "plain_text", "text": "AI Improved Reply", "emoji": True},
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": view.get("private_metadata"),
                 "blocks": [
                     {
-                        "type": "context",
-                        "elements": [
-                            {"type": "mrkdwn", "text": f"*Guest:* {guest_name or 'Guest'}"},
-                            {"type": "mrkdwn", "text": f"*Message:* {guest_message}"}
-                        ]
+                        "type": "section",
+                        "block_id": "guest_message_section",
+                        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}
                     },
                     {
                         "type": "input",
@@ -389,4 +407,3 @@ async def slack_actions(request: Request):
             return JSONResponse({"response_action": "clear"})
 
     return JSONResponse({"status": "ok"})
-
