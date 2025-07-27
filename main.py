@@ -158,17 +158,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error(f"❌ OpenAI error: {e}")
         ai_reply = "(Error generating reply.)"
 
+    # <-- HERE IS THE META INCLUDING guest_name!
     payload_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
         "guest_message": guest_msg,
         "ai_suggestion": ai_reply,
         "type": communication_type,
-        "guest_id": guest_id
+        "guest_id": guest_id,
+        "guest_name": guest_name,  # <--- added here!
     }
 
     if needs_clarification(ai_reply):
-        ask_host_for_clarification(guest_msg, payload_meta, trigger_id=None)
+        # Optionally: Pass guest_name to clarification logic here if needed.
+        # ask_host_for_clarification(guest_msg, payload_meta, trigger_id=None)
         return {"status": "clarification_requested"}
 
     header = f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"
