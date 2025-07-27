@@ -77,15 +77,8 @@ def generate_reply_with_clarification(guest_msg, host_clarification):
         logging.error(f"Clarify AI generation failed: {e}")
         return "(Error generating response from clarification.)"
 
-def slack_open_or_push(payload, trigger_id, modal):
-    """Open or Push modal based on whether action is from message or modal."""
-    container = payload.get("container", {})
-    if container.get("type") == "message":
-        slack_client.views_open(trigger_id=trigger_id, view=modal)
-        logging.info("Opened modal with views_open.")
-    else:
-        slack_client.views_push(trigger_id=trigger_id, view=modal)
-        logging.info("Pushed modal with views_push.")
+def truncate_message(msg, max_len=400):
+    return msg if len(msg) <= max_len else msg[:max_len-3] + '...'
 
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
@@ -123,6 +116,8 @@ async def slack_actions(request: Request):
         # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
+            guest_name = meta.get('guest_name', 'Guest')
+            guest_message = truncate_message(meta.get('guest_message', ''))
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Own Reply", "emoji": True},
@@ -130,6 +125,14 @@ async def slack_actions(request: Request):
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": json.dumps(meta),
                 "blocks": [
+                    {
+                        "type": "section",
+                        "block_id": "guest_info",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Guest*: {guest_name}\n*Message*: {guest_message}"
+                        }
+                    },
                     {
                         "type": "input",
                         "block_id": "reply_input",
@@ -164,6 +167,8 @@ async def slack_actions(request: Request):
         # --- EDIT ---
         if action_id == "edit":
             meta = get_meta_from_action(action)
+            guest_name = meta.get('guest_name', 'Guest')
+            guest_message = truncate_message(meta.get('guest_message', ''))
             ai_suggestion = meta.get("ai_suggestion", "")
             modal = {
                 "type": "modal",
@@ -172,6 +177,14 @@ async def slack_actions(request: Request):
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": json.dumps(meta),
                 "blocks": [
+                    {
+                        "type": "section",
+                        "block_id": "guest_info",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Guest*: {guest_name}\n*Message*: {guest_message}"
+                        }
+                    },
                     {
                         "type": "input",
                         "block_id": "reply_input",
@@ -201,13 +214,14 @@ async def slack_actions(request: Request):
                     }
                 ]
             }
-            slack_open_or_push(payload, trigger_id, modal)
+            slack_client.views_push(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
         # --- CLARIFY ---
         if action_id == "clarify_request":
             meta = get_meta_from_action(action)
-            guest_message = meta.get("guest_message", "")
+            guest_name = meta.get('guest_name', 'Guest')
+            guest_message = truncate_message(meta.get('guest_message', ''))
             ai_suggestion = meta.get("ai_suggestion", "")
             modal = {
                 "type": "modal",
@@ -218,7 +232,11 @@ async def slack_actions(request: Request):
                 "blocks": [
                     {
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"*Guest asked:*\n>{guest_message}\n\n*AI suggested:*\n>{ai_suggestion}"}
+                        "block_id": "guest_info",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Guest*: {guest_name}\n*Message*: {guest_message}\n\n*AI suggested:*\n>{ai_suggestion}"
+                        }
                     },
                     {
                         "type": "input",
@@ -241,13 +259,17 @@ async def slack_actions(request: Request):
                     }
                 ]
             }
-            slack_open_or_push(payload, trigger_id, modal)
+            slack_client.views_push(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
         # --- IMPROVE WITH AI ---
         if action_id == "improve_with_ai":
             view = payload.get("view", {})
             state = view.get("state", {}).get("values", {})
+            private_metadata = json.loads(view.get("private_metadata", "{}"))
+            guest_name = private_metadata.get('guest_name', 'Guest')
+            guest_message = truncate_message(private_metadata.get('guest_message', ''))
+
             reply_block = state.get("reply_input", {})
             edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
 
@@ -255,7 +277,7 @@ async def slack_actions(request: Request):
 
             prompt = (
                 "Take this guest message reply and improve it. "
-                "Make it clear, concise, polite, informal, and ensure it makes sense. "
+                "Make it clear, concise, polite, and ensure it makes sense. "
                 "Do not add extra content. Return only the improved version.\n\n"
                 f"{edited_text}"
             )
@@ -279,6 +301,14 @@ async def slack_actions(request: Request):
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": view.get("private_metadata"),
                 "blocks": [
+                    {
+                        "type": "section",
+                        "block_id": "guest_info",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Guest*: {guest_name}\n*Message*: {guest_message}"
+                        }
+                    },
                     {
                         "type": "input",
                         "block_id": "reply_input",
@@ -313,8 +343,11 @@ async def slack_actions(request: Request):
                 ]
             }
 
-            slack_client.views_push(trigger_id=trigger_id, view=new_modal)
-            logging.info("Slack views_push sent new AI modal.")
+            try:
+                slack_client.views_push(trigger_id=trigger_id, view=new_modal)
+                logging.info("Slack views_push sent new AI modal.")
+            except Exception as e:
+                logging.error(f"Slack views_push failed: {e}")
 
             return JSONResponse({})
 
@@ -337,6 +370,9 @@ async def slack_actions(request: Request):
             improved = generate_reply_with_clarification(guest_msg, clarification_text)
             store_learning_example(guest_msg, "", improved, listing_id, guest_id)
 
+            guest_name = meta.get('guest_name', 'Guest')
+            guest_message = truncate_message(meta.get('guest_message', ''))
+
             return JSONResponse({
                 "response_action": "update",
                 "view": {
@@ -346,6 +382,14 @@ async def slack_actions(request: Request):
                     "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                     "private_metadata": json.dumps(meta),
                     "blocks": [
+                        {
+                            "type": "section",
+                            "block_id": "guest_info",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"*Guest*: {guest_name}\n*Message*: {guest_message}"
+                            }
+                        },
                         {
                             "type": "input",
                             "block_id": "reply_input",
