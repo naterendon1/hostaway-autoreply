@@ -78,7 +78,6 @@ def generate_reply_with_clarification(guest_msg, host_clarification):
         return "(Error generating response from clarification.)"
 
 def slack_open_or_push(payload, trigger_id, modal):
-    """Open or Push modal based on whether action is from message or modal."""
     container = payload.get("container", {})
     if container.get("type") == "message":
         slack_client.views_open(trigger_id=trigger_id, view=modal)
@@ -106,13 +105,20 @@ async def slack_actions(request: Request):
         user = payload.get("user", {})
         user_id = user.get("id", "")
 
+        # --- NEW: Only minimal info is passed in button value; full modal data comes from main.py ---
         def get_meta_from_action(action):
             return json.loads(action["value"]) if "value" in action else {}
+
+        # Retrieve the modal_metadata (full guest_msg, ai_suggestion, etc) from the Slack API 'metadata' or your own cache if you wish,
+        # but for this demo, we'll assume it's re-fetched via the backend (you may need to implement a short-lived cache if needed).
+        # For now, let's require the main.py to pass private_metadata when opening modals.
 
         # --- SEND ---
         if action_id == "send":
             meta = get_meta_from_action(action)
-            reply = meta.get("reply")
+            # In a real implementation, you'd look up the full reply from elsewhere (modal, or cache),
+            # for now, let's just send a generic response or error.
+            reply = meta.get("reply", "(No reply provided here; should be provided by modal.)")
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
             if not reply or not conv_id:
@@ -123,8 +129,9 @@ async def slack_actions(request: Request):
         # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
+            # You should provide a way to look up the guest_msg and ai_suggestion for the conversation
             guest_name = meta.get("guest_name", "Guest")
-            guest_msg = meta.get("guest_message", "")
+            guest_msg = meta.get("guest_message", "(Message unavailable)")
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Reply", "emoji": True},
@@ -172,7 +179,7 @@ async def slack_actions(request: Request):
         if action_id == "edit":
             meta = get_meta_from_action(action)
             guest_name = meta.get("guest_name", "Guest")
-            guest_msg = meta.get("guest_message", "")
+            guest_msg = meta.get("guest_message", "(Message unavailable)")
             ai_suggestion = meta.get("draft", meta.get("ai_suggestion", ""))
             modal = {
                 "type": "modal",
@@ -222,7 +229,7 @@ async def slack_actions(request: Request):
         if action_id == "clarify_request":
             meta = get_meta_from_action(action)
             guest_name = meta.get("guest_name", "Guest")
-            guest_message = meta.get("guest_message", "")
+            guest_message = meta.get("guest_message", "(Message unavailable)")
             ai_suggestion = meta.get("ai_suggestion", "")
             modal = {
                 "type": "modal",
