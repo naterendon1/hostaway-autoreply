@@ -1,8 +1,21 @@
 import sqlite3
 from datetime import datetime
 import requests
+import os
+import openai
 
 DB_PATH = "custom_responses.db"
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+SYSTEM_PROMPT_ANSWER = (
+    "You are a helpful, informal, and friendly vacation rental host. "
+    "Reply to guests as if texting a peer—clear, concise, and casual (think millennial tone). "
+    "Don’t restate info the guest already sees. Only mention a property detail if it answers their question. "
+    "Never say you’re checking or following up unless they *explicitly* ask about availability or something unknown. "
+    "No formal greetings, no copy-paste listing descriptions, and keep it under 200 characters unless the question needs more. "
+    "Use contractions, skip filler, and just answer what’s needed. Never restate the guest's message."
+)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -83,6 +96,24 @@ def fetch_hostaway_listing(listing_id: int) -> dict:
     response = requests.get(url)
     response.raise_for_status()
     return response.json()
+
+def make_ai_reply(prompt: str, previous_examples=None) -> str:
+    examples_text = ""
+    if previous_examples:
+        examples_text = "\n\n".join([
+            f"Guest: {q}\nReply: {r}" for (_, q, r) in previous_examples if r
+        ])
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_ANSWER},
+        {"role": "user", "content": f"{examples_text}\n\n{prompt}" if examples_text else prompt},
+    ]
+    response = openai.chat.completions.create(
+        model="gpt-4",
+        messages=messages,
+        temperature=0.5,
+        max_tokens=400,
+    )
+    return response.choices[0].message.content.strip()
 
 # Export aliases for compatibility with existing imports
 store_learning_example = save_learning_example
