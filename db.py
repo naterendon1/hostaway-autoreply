@@ -1,5 +1,3 @@
-# db.py
-
 import sqlite3
 from datetime import datetime
 
@@ -23,15 +21,6 @@ def init_db():
 def save_custom_response(listing_id, question, response):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
-    # Deduplication check
-    c.execute("""
-        SELECT id FROM custom_responses WHERE listing_id = ? AND question_text = ?
-    """, (listing_id, question))
-    if c.fetchone():
-        conn.close()
-        return  # Already saved
-
     c.execute("""
         INSERT INTO custom_responses (listing_id, question_text, response_text, created_at)
         VALUES (?, ?, ?, ?)
@@ -47,7 +36,6 @@ def get_similar_response(listing_id, question, threshold=0.6):
     """, (listing_id,))
     results = c.fetchall()
     conn.close()
-
     question_words = set(question.lower().split())
     for prev_q, prev_resp in results:
         prev_words = set(prev_q.lower().split())
@@ -57,3 +45,34 @@ def get_similar_response(listing_id, question, threshold=0.6):
         if len(overlap) / max(len(prev_words), 1) >= threshold:
             return prev_resp
     return None
+
+def save_learning_example(listing_id, question, corrected_reply):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO custom_responses (listing_id, question_text, response_text, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (listing_id, question, corrected_reply, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+def save_ai_feedback(conv_id, question, answer, rating, user):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT,
+            question TEXT,
+            ai_answer TEXT,
+            rating TEXT,
+            user TEXT,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        INSERT INTO ai_feedback (conversation_id, question, ai_answer, rating, user, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (conv_id, question, answer, rating, user, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
