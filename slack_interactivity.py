@@ -1,11 +1,10 @@
 import os
 import logging
 import json
-import re
-from fastapi import FastAPI, Request
+import datetime
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from slack_interactivity import router as slack_router, needs_clarification
-from pydantic import BaseModel
+from slack_sdk import WebClient
 from openai import OpenAI
 from utils import (
     fetch_hostaway_listing,
@@ -14,9 +13,11 @@ from utils import (
     get_cancellation_policy_summary,
     get_similar_learning_examples,
     get_property_info,
-    store_ai_feedback
+    store_ai_feedback,
+    send_reply_to_hostaway,
+    store_clarification_log,
+    store_learning_example
 )
-from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 router = APIRouter()
