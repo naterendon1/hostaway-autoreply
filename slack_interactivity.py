@@ -5,8 +5,8 @@ from fastapi.responses import JSONResponse
 from slack_sdk.web import WebClient
 from utils import (
     save_ai_feedback,
-    store_learning_example,
-    store_custom_response,
+    save_learning_example,
+    save_custom_response,
     notify_admin_of_custom_response
 )
 
@@ -32,9 +32,9 @@ async def slack_actions(request: Request):
     guest_name = metadata.get("guest_name")
 
     if action_id == "rate_up":
-        store_ai_feedback(conv_id, guest_msg, ai_suggestion, rating="up", user=user)
+        save_ai_feedback(conv_id, guest_msg, ai_suggestion, rating="up", user=user)
     elif action_id == "rate_down":
-        store_ai_feedback(conv_id, guest_msg, ai_suggestion, rating="down", user=user)
+        save_ai_feedback(conv_id, guest_msg, ai_suggestion, rating="down", user=user)
     elif action_id == "edit":
         return JSONResponse(
             content={
@@ -99,10 +99,10 @@ async def slack_interactive(request: Request):
     reply_text = ""
     if "edit_block" in state:
         reply_text = state["edit_block"]["edit_input"]["value"]
-        store_learning_example(metadata["listing_id"], metadata["guest_message"], reply_text)
+        save_learning_example(metadata["listing_id"], metadata["guest_message"], reply_text)
     elif "write_block" in state:
         reply_text = state["write_block"]["write_input"]["value"]
-        store_custom_response(metadata["listing_id"], metadata["guest_message"], reply_text)
+        save_custom_response(metadata["listing_id"], metadata["guest_message"], reply_text)
         notify_admin_of_custom_response(metadata, reply_text)
 
     return {"response_action": "clear"}
