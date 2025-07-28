@@ -1,3 +1,4 @@
+# main.py
 import os
 import logging
 import json
@@ -9,10 +10,9 @@ from openai import OpenAI
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
-    fetch_hostaway_conversation,
     get_cancellation_policy_summary,
     get_similar_learning_examples,
-    get_property_info,
+    make_ai_reply,
     store_ai_feedback
 )
 from db import get_similar_response, init_db
@@ -41,25 +41,13 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-SYSTEM_PROMPT_ANSWER = (
-    "You are a helpful, informal, and friendly vacation rental host. "
-    "Reply to guests as if texting a peer—clear, concise, and casual (think millennial tone). "
-    "Don’t restate info the guest already sees. Only mention a property detail if it answers their question. "
-    "Never say you’re checking or following up unless they *explicitly* ask about availability or something unknown. "
-    "No formal greetings, no copy-paste listing descriptions, and keep it under 200 characters unless the question needs more. "
-    "Use contractions, skip filler, and just answer what’s needed. Never restate the guest's message."
-)
-
 def strip_emojis(text: str) -> str:
     text = re.sub(r':[a-zA-Z0-9_+-]+:', '', text)
     text = re.sub(r'[^\w\s,.!?\'\"-]', '', text)
     return text
 
 def clean_ai_reply(reply: str) -> str:
-    bad_signoffs = [
-        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
-        "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
-    ]
+    bad_signoffs = ["Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"]
     for signoff in bad_signoffs:
         reply = reply.replace(signoff, "")
     lines = reply.split('\n')
@@ -115,29 +103,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    core_fields = {"name", "description", "city"}
-    requested_fields = set(core_fields)
-
     listing_obj = fetch_hostaway_listing(listing_id) or {}
     listing = listing_obj.get("result", {})
-    property_details = {k: listing.get(k, "") for k in requested_fields if k in listing}
 
-    property_str = "\n".join([f"{k}: {v}" for k, v in property_details.items() if v])
-    if not property_str:
-        property_str = "(no extra details available)"
-
-    convo = fetch_hostaway_conversation(conv_id) or {}
-    msgs = convo.get("conversationMessages", [])
-    context = "\n".join([f"{'Guest' if m['isIncoming'] else 'Host'}: {m['body']}" for m in msgs[-MAX_THREAD_MESSAGES:]])
+    core_fields = {"name", "description", "city"}
+    property_details = {k: listing.get(k, "") for k in core_fields}
+    property_str = "\n".join([f"{k}: {v}" for k, v in property_details.items() if v]) or "(no extra details available)"
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
-
-    prev_answer = ""
-    if prev_examples and prev_examples[0][2]:
-        prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
+    prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n" if prev_examples and prev_examples[0][2] else ""
 
     cancellation = get_cancellation_policy_summary(listing, res)
-
     ai_prompt = (
         f"Guest name: {guest_name}\n"
         f"Guest message: \"{guest_msg}\"\n"
@@ -149,10 +125,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     )
 
     custom_response = get_similar_response(listing_id, guest_msg)
-    if custom_response:
-        ai_reply = clean_ai_reply(custom_response)
-    else:
-        ai_reply = clean_ai_reply(make_ai_reply(ai_prompt, previous_examples=prev_examples))
+    ai_reply = clean_ai_reply(custom_response) if custom_response else clean_ai_reply(make_ai_reply(ai_prompt, previous_examples=prev_examples))
 
     button_meta_minimal = {
         "conv_id": conv_id,
