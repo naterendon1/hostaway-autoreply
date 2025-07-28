@@ -4,6 +4,21 @@ import requests
 
 DB_PATH = "custom_responses.db"
 
+def get_similar_learning_examples(listing_id: int) -> list[tuple[str, str]]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT question_text, response_text 
+        FROM custom_responses 
+        WHERE listing_id = ?
+        ORDER BY created_at DESC
+        LIMIT 5
+    """, (listing_id,))
+    results = c.fetchall()
+    conn.close()
+    return results
+
+
 def get_cancellation_policy_summary(listing: dict, reservation: dict) -> str:
     return "Flexible cancellation policy. Full refund 5 days prior."
 
