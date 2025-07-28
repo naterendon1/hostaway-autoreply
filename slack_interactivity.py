@@ -1,16 +1,20 @@
 import os
 import logging
 import json
-import datetime
-from fastapi import APIRouter, Request
+import re
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from slack_sdk import WebClient
+from slack_interactivity import router as slack_router, needs_clarification
+from pydantic import BaseModel
+from openai import OpenAI
 from utils import (
-    send_reply_to_hostaway,
-    fetch_hostaway_resource,
-    store_learning_example,
+    fetch_hostaway_listing,
+    fetch_hostaway_reservation,
+    fetch_hostaway_conversation,
+    get_cancellation_policy_summary,
     get_similar_learning_examples,
-    store_clarification_log,
+    get_property_info,
+    store_ai_feedback
 )
 from openai import OpenAI
 
@@ -437,5 +441,36 @@ async def slack_actions(request: Request):
             except Exception as e:
                 logging.error(f"Slack regular send error: {e}")
             return JSONResponse({"response_action": "clear"})
+
+    return JSONResponse({"status": "ok"})
+
+@router.post("/slack/actions")
+async def slack_actions(request: Request):
+    logging.info("🎯 /slack/actions endpoint hit!")
+    form = await request.form()
+    payload_raw = form.get("payload")
+    if not payload_raw:
+        logging.error("No payload found in Slack actions request!")
+        return JSONResponse({})
+
+    payload = json.loads(payload_raw)
+    logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
+
+    if payload.get("type") == "block_actions":
+        action = payload["actions"][0]
+        action_id = action.get("action_id")
+
+        def get_meta_from_action(action):
+            return json.loads(action["value"]) if "value" in action else {}
+
+        # 👍👎 Feedback Rating Handler
+        if action_id in ["rate_up", "rate_down"]:
+            meta = get_meta_from_action(action)
+            rating = "up" if action_id == "rate_up" else "down"
+            reply = meta.get("ai_suggestion", "")
+            listing_id = meta.get("listing_id")
+            guest_id = meta.get("guest_id")
+            store_ai_feedback(reply, rating, listing_id, guest_id)
+            return JSONResponse({"text": "📊 Thanks for your feedback!"})
 
     return JSONResponse({"status": "ok"})
