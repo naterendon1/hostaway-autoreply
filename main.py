@@ -12,6 +12,7 @@ from utils import (
     fetch_hostaway_conversation,
     get_cancellation_policy_summary,
     get_similar_learning_examples,
+    get_property_info,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +28,6 @@ app = FastAPI()
 app.include_router(slack_router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
 MAX_THREAD_MESSAGES = 10
 
 class HostawayUnifiedWebhook(BaseModel):
@@ -39,18 +39,30 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-SYSTEM_PROMPT_FIELD_SELECTION = (
-    "You are a friendly, modern property host. When you get a guest’s message, first decide which property details you need. "
-    "If you need info, reply ONLY with a comma-separated list of fields (like wifiPassword, bedroomsNumber, etc). "
-    "If you have all you need, just reply: ready. Wait for the property info before answering the guest."
+# --- The most important system prompt ---
+SYSTEM_PROMPT_ANSWER = (
+    "You are a helpful, informal, and friendly vacation rental host. "
+    "Reply to guests as if texting a peer—clear, concise, and casual (think millennial tone). "
+    "Don’t restate info the guest already sees. Only mention a property detail if it answers their question. "
+    "Never say you’re checking or following up unless they *explicitly* ask about availability or something unknown. "
+    "No formal greetings, no copy-paste listing descriptions, and keep it under 200 characters unless the question needs more. "
+    "Use contractions, skip filler, and just answer what’s needed. Never restate the guest's message."
 )
 
-SYSTEM_PROMPT_ANSWER = (
-    "You are a friendly, modern property host. Respond to the guest as if you’re texting a friend. "
-    "Keep replies short (max 250 characters unless more detail is needed), clear, and casual. "
-    "Never mention listings, databases, or house rules unless specifically asked. Greet the guest by first name only if it sounds natural. "
-    "Only share property details if they answer the question directly. No formalities, just friendly help."
-)
+# --- Use this for ALL AI generations, including clarify/improve_with_ai ---
+def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"❌ OpenAI error: {e}")
+        return "(Error generating reply.)"
 
 def clean_ai_reply(reply: str):
     bad_signoffs = [
@@ -106,34 +118,24 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Step 1: Let AI decide which fields are needed ---
-    try:
-        field_response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_FIELD_SELECTION},
-                {"role": "user", "content": f'Guest message: "{guest_msg}"'}
-            ]
-        ).choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"❌ OpenAI field selection error: {e}")
-        field_response = "ready"
-
+    # --- Decide what fields to use, but ALWAYS add 'name', 'description', 'city' ---
     core_fields = {"name", "description", "city"}
-    requested_fields = set()
-    if field_response.lower() != "ready":
-        requested_fields.update([f.strip() for f in field_response.split(",") if f.strip()])
-    requested_fields = requested_fields.union(core_fields)
+    requested_fields = set(core_fields)
+
+    # Optionally, you can make an AI call to pick extra fields based on the guest message if you wish
+    # For brevity, we'll stick to core and only fetch extra as needed
 
     listing_obj = fetch_hostaway_listing(listing_id) or {}
     listing = listing_obj.get("result", {})
     property_details = {k: listing.get(k, "") for k in requested_fields if k in listing}
+
     property_str = "\n".join([f"{k}: {v}" for k, v in property_details.items() if v])
     if not property_str:
         property_str = "(no extra details available)"
 
     convo = fetch_hostaway_conversation(conv_id) or {}
     msgs = convo.get("conversationMessages", [])
+    # Only the last 10, for context (optional, not shown to the guest)
     context = "\n".join([f"{'Guest' if m['isIncoming'] else 'Host'}: {m['body']}" for m in msgs[-MAX_THREAD_MESSAGES:]])
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
@@ -150,30 +152,19 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         f"Property details:\n{property_str}\n"
         f"Reservation Info:\n{json.dumps(res)}\n"
         f"Cancellation: {cancellation}\n"
-        "---\nWrite a warm, clear, and helpful reply as the host, using the info above. If a detail is missing, say you'll check and follow up. Do not mention 'listing' or 'database'."
+        "---\nWrite a reply to the guest. Remember: clear, concise, informal, millennial tone. No listing details unless needed. No restating guest's message."
     )
 
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_ANSWER},
-                {"role": "user", "content": ai_prompt}
-            ]
-        )
-        ai_reply = clean_ai_reply(response.choices[0].message.content.strip())
-    except Exception as e:
-        logging.error(f"❌ OpenAI answer generation error: {e}")
-        ai_reply = "(Error generating reply.)"
+    ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
-    # --- Pass guest_message and ai_suggestion in all button meta! ---
+    # --- Button/meta block only contains IDs! ---
     button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
         "guest_id": guest_id,
         "type": communication_type,
         "guest_name": guest_name,
-        "guest_message": guest_msg,
+        "guest_message": guest_msg,  # Pass for modals!
         "ai_suggestion": ai_reply,
     }
 
