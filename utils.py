@@ -3,6 +3,10 @@ import sqlite3
 from datetime import datetime
 import requests
 
+# === Hostaway API Credentials ===
+HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
+HOSTAWAY_ACCESS_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")
+
 DB_PATH = "custom_responses.db"
 
 def init_db():
@@ -82,8 +86,8 @@ def save_ai_feedback(conv_id, question, answer, rating, user):
 def fetch_hostaway_listing(listing_id: int) -> dict:
     url = f"https://api.hostaway.com/listings/{listing_id}"
     headers = {
-        "Authorization": f"Bearer {os.getenv('HOSTAWAY_API_KEY')}",
-        "Content-Type": "application/json"
+        "X-Client-Id": HOSTAWAY_CLIENT_ID,
+        "X-Client-Secret": HOSTAWAY_ACCESS_TOKEN
     }
     response = requests.get(url, headers=headers)
     response.raise_for_status()
@@ -92,31 +96,18 @@ def fetch_hostaway_listing(listing_id: int) -> dict:
 def fetch_hostaway_reservation(reservation_id: int) -> dict:
     url = f"https://api.hostaway.com/reservations/{reservation_id}"
     headers = {
-        "Authorization": f"Bearer {os.getenv('HOSTAWAY_API_KEY')}",
-        "Content-Type": "application/json"
+        "X-Client-Id": HOSTAWAY_CLIENT_ID,
+        "X-Client-Secret": HOSTAWAY_ACCESS_TOKEN
     }
     response = requests.get(url, headers=headers)
     response.raise_for_status()
     return response.json()
 
-def get_similar_learning_examples(listing_id, question, limit=3):
-    # Placeholder logic – return most recent N examples for fallback
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT question_text, response_text FROM custom_responses
-        WHERE listing_id = ?
-        ORDER BY created_at DESC LIMIT ?
-    """, (listing_id, limit))
-    results = c.fetchall()
-    conn.close()
-    return [{"question": r[0], "answer": r[1]} for r in results]
-
 # Export aliases
 store_learning_example = save_learning_example
 store_ai_feedback = save_ai_feedback
 
-# Dummy placeholders
+# Placeholder fallbacks
 def notify_admin_of_custom_response(metadata, reply_text):
     pass
 
