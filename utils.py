@@ -119,7 +119,6 @@ def get_cancellation_policy_summary(listing_result, reservation_result):
     }
     return desc.get(policy, f"Policy: {policy}")
 
-# --- SQLite Learning Functions ---
 def _init_learning_db():
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
@@ -240,3 +239,35 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
     except Exception as e:
         logging.error(f"❌ Retrieval error: {e}")
         return None
+
+def store_ai_feedback(reply_text, rating, listing_id, guest_id):
+    _init_learning_db()
+    try:
+        conn = sqlite3.connect(LEARNING_DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS ai_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reply_text TEXT,
+                rating TEXT,
+                listing_id TEXT,
+                guest_id TEXT,
+                created_at TEXT
+            )
+        ''')
+        c.execute(
+            '''INSERT INTO ai_feedback (reply_text, rating, listing_id, guest_id, created_at)
+               VALUES (?, ?, ?, ?, ?)''',
+            (
+                reply_text or "",
+                rating or "",
+                str(listing_id) if listing_id else "",
+                str(guest_id) if guest_id else "",
+                datetime.utcnow().isoformat()
+            )
+        )
+        conn.commit()
+        conn.close()
+        logging.info("[FEEDBACK] Rating stored.")
+    except Exception as e:
+        logging.error(f"❌ Feedback DB error: {e}")
