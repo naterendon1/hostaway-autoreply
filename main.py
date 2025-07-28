@@ -11,7 +11,6 @@ from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     get_cancellation_policy_summary,
-    get_similar_learning_examples,
     make_ai_reply,
     store_ai_feedback
 )
@@ -110,14 +109,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     property_details = {k: listing.get(k, "") for k in core_fields}
     property_str = "\n".join([f"{k}: {v}" for k, v in property_details.items() if v]) or "(no extra details available)"
 
-    prev_examples = get_similar_learning_examples(guest_msg, listing_id)
-    prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n" if prev_examples and prev_examples[0][2] else ""
-
     cancellation = get_cancellation_policy_summary(listing, res)
     ai_prompt = (
         f"Guest name: {guest_name}\n"
         f"Guest message: \"{guest_msg}\"\n"
-        f"{prev_answer}"
         f"Property details:\n{property_str}\n"
         f"Reservation Info:\n{json.dumps(res)}\n"
         f"Cancellation: {cancellation}\n"
@@ -125,7 +120,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     )
 
     custom_response = get_similar_response(listing_id, guest_msg)
-    ai_reply = clean_ai_reply(custom_response) if custom_response else clean_ai_reply(make_ai_reply(ai_prompt, previous_examples=prev_examples))
+    ai_reply = clean_ai_reply(custom_response) if custom_response else clean_ai_reply(make_ai_reply(ai_prompt))
 
     button_meta_minimal = {
         "conv_id": conv_id,
