@@ -5,7 +5,7 @@ import requests
 
 # === Hostaway API Credentials ===
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
-HOSTAWAY_ACCESS_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")
+HOSTAWAY_API_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")
 
 DB_PATH = "custom_responses.db"
 
@@ -95,10 +95,7 @@ def fetch_hostaway_listing(listing_id: int) -> dict:
 
 def fetch_hostaway_reservation(reservation_id: int) -> dict:
     url = f"https://api.hostaway.com/reservations/{reservation_id}"
-    headers = {
-        "X-Client-Id": HOSTAWAY_CLIENT_ID,
-        "X-Client-Secret": HOSTAWAY_ACCESS_TOKEN
-    }
+    headers = {"Authorization": f"Bearer {HOSTAWAY_API_TOKEN}"}
     response = requests.get(url, headers=headers)
     response.raise_for_status()
     return response.json()
