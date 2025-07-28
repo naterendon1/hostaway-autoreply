@@ -1,8 +1,6 @@
 fastapi
-uvicorn
-openai
 slack_sdk
-requests
-PyYAML
-python-multipart
+openai
 pydantic
+requests
+sqlite3
