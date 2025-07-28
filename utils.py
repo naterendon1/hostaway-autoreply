@@ -1,40 +1,9 @@
+import os
 import sqlite3
 from datetime import datetime
 import requests
 
 DB_PATH = "custom_responses.db"
-
-def make_ai_reply(prompt: str, previous_examples: list = None) -> str:
-    # Fallback AI reply function
-    return f"Auto-response: {prompt}"
-
-def get_similar_learning_examples(listing_id: int) -> list[tuple[str, str]]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT question_text, response_text 
-        FROM custom_responses 
-        WHERE listing_id = ?
-        ORDER BY created_at DESC
-        LIMIT 5
-    """, (listing_id,))
-    results = c.fetchall()
-    conn.close()
-    return results
-
-
-def get_cancellation_policy_summary(listing: dict, reservation: dict) -> str:
-    return "Flexible cancellation policy. Full refund 5 days prior."
-
-def fetch_hostaway_reservation(reservation_id: int) -> dict:
-    url = f"https://api.hostaway.com/reservations/{reservation_id}"
-    headers = {
-        "Authorization": f"Bearer {YOUR_API_KEY}",  # Replace YOUR_API_KEY with a valid token
-        "Content-Type": "application/json"
-    }
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json()
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -111,15 +80,35 @@ def save_ai_feedback(conv_id, question, answer, rating, user):
     conn.close()
 
 def fetch_hostaway_listing(listing_id: int) -> dict:
-    url = f"https://api.hostaway.com/listings/{listing_id}"  # Replace with your real API endpoint
-    response = requests.get(url)
+    url = f"https://api.hostaway.com/listings/{listing_id}"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('HOSTAWAY_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    response = requests.get(url, headers=headers)
     response.raise_for_status()
     return response.json()
 
-# Export aliases for compatibility with existing imports
+def fetch_hostaway_reservation(reservation_id: int) -> dict:
+    url = f"https://api.hostaway.com/reservations/{reservation_id}"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('HOSTAWAY_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+# Export aliases
 store_learning_example = save_learning_example
 store_ai_feedback = save_ai_feedback
 
-# Dummy admin notifier placeholder to prevent import error
+# Dummy placeholders
 def notify_admin_of_custom_response(metadata, reply_text):
     pass
+
+def make_ai_reply(prompt: str, previous_examples: list = None) -> str:
+    return f"Auto-response: {prompt}"
+
+def get_cancellation_policy_summary(listing: dict, reservation: dict) -> str:
+    return "Flexible cancellation policy. Full refund 5 days prior."
