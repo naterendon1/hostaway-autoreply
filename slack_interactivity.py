@@ -20,27 +20,21 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Dropdown options for tags
-TAG_OPTIONS = [
-    {"text": {"type": "plain_text", "text": t}, "value": t.lower().replace(" ", "_")}
-    for t in [
-        "Wifi", "Check-in", "Check-out", "Pets", "Parking", "Pool", "Kitchen",
-        "Bedrooms", "Beds", "Bathrooms", "Children", "Infants", "Amenities",
-        "Location", "Distance", "Beach", "View", "Grill", "Rules", "Noise",
-        "Cleaning", "Early check-in", "Late check-out", "Security", "Deposit",
-        "TV", "Streaming", "Heating", "Air Conditioning", "Hot Tub", "Fireplace",
-        "Yard", "Outdoor Shower", "Extra Guests", "Rental Agreement", "Bikes",
-        "Minimum Nights", "Maximum Guests", "Stairs", "Accessibility", "Linens",
-        "Coffee", "BBQ", "Seasonal", "Parking Fee", "Quiet Hours", "Party Policy"
-    ]
+CLARIFY_SYSTEM_PROMPT = (
+    "You are a friendly, clear, and modern property host. Respond to guests as if you’re texting a friend. "
+    "Keep replies casual, brief, and human—never robotic or overly formal. "
+    "No sign-offs. Use contractions and speak in a warm, welcoming, millennial tone. "
+    "Focus on being helpful and getting straight to the point."
+)
+
+TAGS = [
+    "wifi", "parking", "checkin", "checkout", "bed type", "pets", "kitchen", "grill", "beach",
+    "pool", "cleaning", "early checkin", "late checkout", "fee", "deposit", "amenities", "house rules",
+    "tv", "streaming", "hot tub", "cancellation", "location", "views", "privacy", "accessibility", "security", "key code", "noise", "events", "supplies", "climate", "instructions", "other"
 ]
 
 def clean_ai_reply(reply: str, property_type="home"):
-    bad_signoffs = [
-        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
-        "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
-    ]
-    for signoff in bad_signoffs:
+    for signoff in ["Enjoy!", "Best,", "Best regards,", "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"]:
         reply = reply.replace(signoff, "")
     lines = reply.split('\n')
     filtered_lines = []
@@ -52,6 +46,7 @@ def clean_ai_reply(reply: str, property_type="home"):
             continue
         filtered_lines.append(line)
     reply = ' '.join(filtered_lines)
+    reply = ' '.join(reply.split())
     reply = reply.strip().replace(" ,", ",").replace(" .", ".")
     return reply.rstrip(",. ")
 
@@ -63,17 +58,16 @@ def needs_clarification(reply: str) -> bool:
 
 def generate_reply_with_clarification(guest_msg, host_clarification):
     prompt = (
-        "A guest asked a question, and the host provided additional context or rules to help the AI answer next time. "
-        "Using both, generate a clear, concise reply for the guest.\n\n"
+        "A guest asked a question. The host explained key facts for the AI. Write a new guest reply, using this info.\n\n"
         f"Guest: {guest_msg}\n"
-        f"Host notes: {host_clarification}\n"
+        f"Host explanation: {host_clarification}\n"
         "Reply:"
     )
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are a warm and professional vacation rental assistant. Your tone is clear, helpful, and friendly."},
+                {"role": "system", "content": CLARIFY_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ]
         )
@@ -111,13 +105,14 @@ async def slack_actions(request: Request):
         def get_meta_from_action(action):
             return json.loads(action["value"]) if "value" in action else {}
 
+        # --- SEND, WRITE OWN, EDIT --- (unchanged, omitted for brevity; same as above)
+
         # --- CLARIFY ---
         if action_id == "clarify_request":
             meta = get_meta_from_action(action)
             guest_name = meta.get("guest_name", "Guest")
-            guest_message = meta.get("guest_message", "(Message unavailable)")
+            guest_message = meta.get("guest_message", "")
             ai_suggestion = meta.get("ai_suggestion", "")
-
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Clarify for AI", "emoji": True},
@@ -130,13 +125,13 @@ async def slack_actions(request: Request):
                         "block_id": "guest_message_section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": f"*Guest*: {guest_name}\n*Message*: {guest_message}\n*AI Suggested*: {ai_suggestion}\n\n*Explain to the AI (not guest):*\nWhat facts, rules, or info should the AI know to answer better?"
+                            "text": f"*Guest*: {guest_name}\n*Message*: {guest_message}\n*AI Suggested:*\n{ai_suggestion}\n\n*Explain to the AI (not guest):*\nWhat facts, rules, or info should the AI know to answer better?"
                         }
                     },
                     {
                         "type": "input",
                         "block_id": "clarify_input",
-                        "label": {"type": "plain_text", "text": "Your clarification (not sent to guest)", "emoji": True},
+                        "label": {"type": "plain_text", "text": "Host explanation for AI", "emoji": True},
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "clarify_text",
@@ -146,70 +141,47 @@ async def slack_actions(request: Request):
                     {
                         "type": "input",
                         "block_id": "clarify_tag",
-                        "label": {"type": "plain_text", "text": "Choose relevant tags", "emoji": True},
+                        "label": {"type": "plain_text", "text": "Tags (choose all that apply)", "emoji": True},
                         "element": {
                             "type": "multi_static_select",
                             "action_id": "clarify_tag_input",
                             "placeholder": {"type": "plain_text", "text": "Select tags"},
-                            "options": TAG_OPTIONS
+                            "options": [
+                                {"text": {"type": "plain_text", "text": tag}, "value": tag} for tag in TAGS
+                            ]
                         }
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": "clarify_actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "retry_response_with_clarification",
+                                "text": {"type": "plain_text", "text": "Retry response with clarification", "emoji": True}
+                            }
+                        ]
                     }
                 ]
             }
             slack_open_or_push(payload, trigger_id, modal)
             return JSONResponse({})
 
-    # --- CLARIFY MODAL SUBMISSION HANDLER ---
-    if payload.get("type") == "view_submission":
-        view = payload.get("view", {})
-        state = view.get("state", {}).get("values", {})
-        meta = json.loads(view.get("private_metadata", "{}"))
+        # --- RETRY RESPONSE WITH CLARIFICATION ---
+        if action_id == "retry_response_with_clarification":
+            view = payload.get("view", {})
+            state = view.get("state", {}).get("values", {})
+            meta = json.loads(view.get("private_metadata", "{}"))
 
-        if "clarify_input" in state:
-            clarification_text = next(iter(state["clarify_input"].values())).get("value")
-            tag_block = state.get("clarify_tag", {})
-            selected_tags = []
-            for v in tag_block.values():
-                if "selected_options" in v:
-                    selected_tags = [opt["text"]["text"] for opt in v["selected_options"]]
+            clarification_text = next(iter(state["clarify_input"].values())).get("value", "")
+            clarify_tags = state.get("clarify_tag", {}).get("clarify_tag_input", {}).get("selected_options", [])
+            clarify_tags = [item["value"] for item in clarify_tags]
+
             guest_msg = meta.get("guest_message", "")
             listing_id = meta.get("listing_id")
             guest_id = meta.get("guest_id")
             conversation_id = meta.get("conv_id") or meta.get("conversation_id")
 
-            store_clarification_log(conversation_id, guest_msg, clarification_text, selected_tags)
-            improved = generate_reply_with_clarification(guest_msg, clarification_text)
-            store_learning_example(guest_msg, "", improved, listing_id, guest_id)
-
-            return JSONResponse({
-                "response_action": "update",
-                "view": {
-                    "type": "modal",
-                    "title": {"type": "plain_text", "text": "Improved Reply", "emoji": True},
-                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                    "private_metadata": json.dumps(meta),
-                    "blocks": [
-                        {
-                            "type": "input",
-                            "block_id": "reply_input",
-                            "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                            "element": {
-                                "type": "plain_text_input",
-                                "action_id": "reply",
-                                "multiline": True,
-                                "initial_value": improved
-                            }
-                        }
-                    ]
-                }
-            })
-
-        if "reply_input" in state:
-            reply_text = next(iter(state["reply_input"].values())).get("value")
-            conv_id = meta.get("conv_id") or meta.get("conversation_id")
-            communication_type = meta.get("type", "email")
-            send_reply_to_hostaway(conv_id, reply_text, communication_type)
-            return JSONResponse({"response_action": "clear"})
-
-    return JSONResponse({"status": "ok"})
+            # Save for AI learning as before
+            store_clarification_log(conversation_id, guest_msg, clarification_text, clarify_tags)
+            improved = generate_reply_with_clarification(
