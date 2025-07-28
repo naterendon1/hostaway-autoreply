@@ -99,6 +99,19 @@ def fetch_hostaway_reservation(reservation_id: int) -> dict:
     response.raise_for_status()
     return response.json()
 
+def get_similar_learning_examples(listing_id, question, limit=3):
+    # Placeholder logic – return most recent N examples for fallback
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT question_text, response_text FROM custom_responses
+        WHERE listing_id = ?
+        ORDER BY created_at DESC LIMIT ?
+    """, (listing_id, limit))
+    results = c.fetchall()
+    conn.close()
+    return [{"question": r[0], "answer": r[1]} for r in results]
+
 # Export aliases
 store_learning_example = save_learning_example
 store_ai_feedback = save_ai_feedback
