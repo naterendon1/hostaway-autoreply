@@ -16,6 +16,17 @@ def init_db():
             created_at TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT,
+            question TEXT,
+            ai_answer TEXT,
+            rating TEXT,
+            user TEXT,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -61,17 +72,6 @@ def save_ai_feedback(conv_id, question, answer, rating, user):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        CREATE TABLE IF NOT EXISTS ai_feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT,
-            question TEXT,
-            ai_answer TEXT,
-            rating TEXT,
-            user TEXT,
-            created_at TEXT
-        )
-    """)
-    c.execute("""
         INSERT INTO ai_feedback (conversation_id, question, ai_answer, rating, user, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
     """, (conv_id, question, answer, rating, user, datetime.utcnow().isoformat()))
@@ -83,3 +83,11 @@ def fetch_hostaway_listing(listing_id: int) -> dict:
     response = requests.get(url)
     response.raise_for_status()
     return response.json()
+
+# Export aliases for compatibility with existing imports
+store_learning_example = save_learning_example
+store_ai_feedback = save_ai_feedback
+
+# Dummy admin notifier placeholder to prevent import error
+def notify_admin_of_custom_response(metadata, reply_text):
+    pass
