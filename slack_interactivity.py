@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import JSONResponse
 from slack_sdk.web import WebClient
 from utils import (
-    store_ai_feedback,
+    save_ai_feedback,
     store_learning_example,
     store_custom_response,
     notify_admin_of_custom_response
