@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime
+import requests
 
 DB_PATH = "custom_responses.db"
 
@@ -76,3 +77,13 @@ def save_ai_feedback(conv_id, question, answer, rating, user):
     """, (conv_id, question, answer, rating, user, datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
+
+def fetch_hostaway_listing(listing_id: int) -> dict:
+    url = f"https://api.hostaway.com/listings/{listing_id}"  # Replace with your real API endpoint
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+# Export aliases for compatibility with existing imports
+store_learning_example = save_learning_example
+store_ai_feedback = save_ai_feedback
