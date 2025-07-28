@@ -3,4 +3,3 @@ slack_sdk
 openai
 pydantic
 requests
-sqlite3
