@@ -4,6 +4,9 @@ import requests
 
 DB_PATH = "custom_responses.db"
 
+def get_cancellation_policy_summary(listing: dict, reservation: dict) -> str:
+    return "Flexible cancellation policy. Full refund 5 days prior."
+
 def fetch_hostaway_reservation(reservation_id: int) -> dict:
     url = f"https://api.hostaway.com/reservations/{reservation_id}"
     response = requests.get(url)
