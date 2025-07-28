@@ -1,108 +1,51 @@
+# slack_interactivity.py
+
+import os
 import json
-import logging
-from fastapi import APIRouter, Request, Form
-from fastapi.responses import JSONResponse
-from slack_sdk.web import WebClient
+from fastapi import APIRouter, Request
+from slack_sdk import WebClient
+from slack_sdk.signature import SignatureVerifier
 from utils import (
-    save_ai_feedback,
-    save_learning_example,
-    save_custom_response,
-    notify_admin_of_custom_response
+    store_learning_example,
+    store_ai_feedback,
 )
 
 router = APIRouter()
-slack_client = WebClient()
 
-@router.post("/slack/actions")
-async def slack_actions(request: Request):
-    logging.info("🎯 /slack/actions endpoint hit!")
-    form = await request.form()
-    payload = json.loads(form["payload"])
-    action_id = payload["actions"][0]["action_id"]
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+verifier = SignatureVerifier(signing_secret=SLACK_SIGNING_SECRET)
+
+@router.post("/slack/interactivity")
+async def handle_interactivity(request: Request):
+    body = await request.body()
+    if not verifier.is_valid_request(body, request.headers):
+        return {"status": "invalid request"}
+
+    payload = json.loads(request.form()['payload'])
+    action = payload.get("actions", [{}])[0]
+    action_id = action.get("action_id")
+    value = json.loads(action.get("value", "{}"))
     user = payload.get("user", {}).get("username", "unknown")
+    response_url = payload.get("response_url")
 
-    action_value = payload["actions"][0].get("value")
-    metadata = json.loads(action_value)
-    conv_id = metadata.get("conv_id")
-    listing_id = metadata.get("listing_id")
-    guest_msg = metadata.get("guest_message")
-    ai_suggestion = metadata.get("ai_suggestion")
-    guest_id = metadata.get("guest_id")
-    reply_type = metadata.get("type")
-    guest_name = metadata.get("guest_name")
+    conv_id = value.get("conv_id")
+    guest_msg = value.get("guest_message", "")
+    ai_reply = value.get("ai_suggestion", "")
+    action_type = value.get("action")
 
-    if action_id == "rate_up":
-        save_ai_feedback(conv_id, guest_msg, ai_suggestion, rating="up", user=user)
-    elif action_id == "rate_down":
-        save_ai_feedback(conv_id, guest_msg, ai_suggestion, rating="down", user=user)
+    if action_id == "send":
+        slack_client.chat_postMessage(channel=value["conv_id"], text=ai_reply)
     elif action_id == "edit":
-        return JSONResponse(
-            content={
-                "response_action": "push",
-                "view": {
-                    "type": "modal",
-                    "callback_id": "edit_modal",
-                    "title": {"type": "plain_text", "text": "Edit Reply"},
-                    "submit": {"type": "plain_text", "text": "Save"},
-                    "blocks": [
-                        {
-                            "type": "input",
-                            "block_id": "edit_block",
-                            "label": {"type": "plain_text", "text": "Update the AI reply"},
-                            "element": {
-                                "type": "plain_text_input",
-                                "action_id": "edit_input",
-                                "multiline": True,
-                                "initial_value": ai_suggestion
-                            }
-                        }
-                    ],
-                    "private_metadata": json.dumps(metadata)
-                }
-            }
-        )
+        slack_client.chat_postMessage(channel=value["conv_id"], text="Please edit and resend manually.")
     elif action_id == "write_own":
-        return JSONResponse(
-            content={
-                "response_action": "push",
-                "view": {
-                    "type": "modal",
-                    "callback_id": "write_modal",
-                    "title": {"type": "plain_text", "text": "Write Your Own"},
-                    "submit": {"type": "plain_text", "text": "Save"},
-                    "blocks": [
-                        {
-                            "type": "input",
-                            "block_id": "write_block",
-                            "label": {"type": "plain_text", "text": "Write a better reply"},
-                            "element": {
-                                "type": "plain_text_input",
-                                "action_id": "write_input",
-                                "multiline": True
-                            }
-                        }
-                    ],
-                    "private_metadata": json.dumps(metadata)
-                }
-            }
-        )
+        slack_client.chat_postMessage(channel=value["conv_id"], text="You chose to write your own response.")
+    elif action_id == "rate_up":
+        store_ai_feedback(conv_id, guest_msg, ai_reply, "up", user)
+        slack_client.chat_postMessage(channel=value["conv_id"], text="👍 Thanks for the feedback!")
+    elif action_id == "rate_down":
+        store_ai_feedback(conv_id, guest_msg, ai_reply, "down", user)
+        slack_client.chat_postMessage(channel=value["conv_id"], text="👎 Thanks, we'll try to improve!")
+
     return {"status": "ok"}
-
-@router.post("/slack/interactive")
-async def slack_interactive(request: Request):
-    form = await request.form()
-    payload = json.loads(form["payload"])
-    callback_id = payload["view"]["callback_id"]
-    metadata = json.loads(payload["view"].get("private_metadata", "{}"))
-    state = payload["view"]["state"]["values"]
-
-    reply_text = ""
-    if "edit_block" in state:
-        reply_text = state["edit_block"]["edit_input"]["value"]
-        save_learning_example(metadata["listing_id"], metadata["guest_message"], reply_text)
-    elif "write_block" in state:
-        reply_text = state["write_block"]["write_input"]["value"]
-        save_custom_response(metadata["listing_id"], metadata["guest_message"], reply_text)
-        notify_admin_of_custom_response(metadata, reply_text)
-
-    return {"response_action": "clear"}
