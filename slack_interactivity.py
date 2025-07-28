@@ -184,4 +184,46 @@ async def slack_actions(request: Request):
 
             # Save for AI learning as before
             store_clarification_log(conversation_id, guest_msg, clarification_text, clarify_tags)
-            improved = generate_reply_with_clarification(
+            improved = generate_reply_with_clarification(guest_msg, clarification_text)
+            store_learning_example(guest_msg, "", improved, listing_id, guest_id)
+
+            # Push a new modal with the improved reply, ready to send
+            return JSONResponse({
+                "response_action": "update",
+                "view": {
+                    "type": "modal",
+                    "title": {"type": "plain_text", "text": "AI New Reply", "emoji": True},
+                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                    "private_metadata": json.dumps(meta),
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "reply_input",
+                            "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "reply",
+                                "multiline": True,
+                                "initial_value": improved
+                            }
+                        }
+                    ]
+                }
+            })
+
+    # --- Modal Submission: Normal Reply, Clarify, etc. ---
+    if payload.get("type") == "view_submission":
+        view = payload.get("view", {})
+        state = view.get("state", {}).get("values", {})
+        meta = json.loads(view.get("private_metadata", "{}"))
+
+        # Normal reply send (from improved modal)
+        if "reply_input" in state:
+            reply_text = next(iter(state["reply_input"].values())).get("value")
+            conv_id = meta.get("conv_id") or meta.get("conversation_id")
+            communication_type = meta.get("type", "email")
+            send_reply_to_hostaway(conv_id, reply_text, communication_type)
+            return JSONResponse({"response_action": "clear"})
+
+    return JSONResponse({"status": "ok"})
