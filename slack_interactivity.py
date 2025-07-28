@@ -399,4 +399,43 @@ async def slack_actions(request: Request):
                         {
                             "type": "section",
                             "block_id": "guest_message_section",
-                            "text": {"type": "mrkdwn", "text": f"*Guest*: {meta.get('guest_name', 'Guest')}\n*Message
+                            "text": {"type": "mrkdwn", "text": f"*Guest*: {meta.get('guest_name', 'Guest')}\n*Message*: {guest_msg}"}
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "reply_input",
+                            "label": {"type": "plain_text", "text": "AI reply (edit as needed):", "emoji": True},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "reply",
+                                "multiline": True,
+                                "initial_value": improved
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "block_id": "improve_ai_block",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "action_id": "improve_with_ai",
+                                    "text": {"type": "plain_text", "text": ":rocket: Improve with AI", "emoji": True}
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })
+
+        # Regular reply submission handler
+        if "reply_input" in state:
+            reply_text = next(iter(state["reply_input"].values())).get("value")
+            conv_id = meta.get("conv_id") or meta.get("conversation_id")
+            communication_type = meta.get("type", "email")
+            try:
+                send_reply_to_hostaway(conv_id, reply_text, communication_type)
+            except Exception as e:
+                logging.error(f"Slack regular send error: {e}")
+            return JSONResponse({"response_action": "clear"})
+
+    return JSONResponse({"status": "ok"})
