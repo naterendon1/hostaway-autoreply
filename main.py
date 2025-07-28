@@ -2,7 +2,7 @@ import os
 import logging
 import json
 import re
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from slack_interactivity import router as slack_router, needs_clarification
 from pydantic import BaseModel
 from openai import OpenAI
@@ -13,7 +13,9 @@ from utils import (
     get_cancellation_policy_summary,
     get_similar_learning_examples,
     get_property_info,
+    store_ai_feedback
 )
+from db import get_similar_response
 
 logging.basicConfig(level=logging.INFO)
 
@@ -154,7 +156,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "---\nWrite a reply to the guest. Remember: clear, concise, informal, millennial tone. No listing details unless needed. No restating guest's message."
     )
 
-    ai_reply = clean_ai_reply(make_ai_reply(ai_prompt, previous_examples=prev_examples))
+    custom_response = get_similar_response(listing_id, guest_msg)
+    if custom_response:
+        ai_reply = clean_ai_reply(custom_response)
+    else:
+        ai_reply = clean_ai_reply(make_ai_reply(ai_prompt, previous_examples=prev_examples))
 
     button_meta_minimal = {
         "conv_id": conv_id,
