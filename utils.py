@@ -28,7 +28,11 @@ def get_cancellation_policy_summary(listing: dict, reservation: dict) -> str:
 
 def fetch_hostaway_reservation(reservation_id: int) -> dict:
     url = f"https://api.hostaway.com/reservations/{reservation_id}"
-    response = requests.get(url)
+    headers = {
+        "Authorization": f"Bearer {YOUR_API_KEY}",  # Replace YOUR_API_KEY with a valid token
+        "Content-Type": "application/json"
+    }
+    response = requests.get(url, headers=headers)
     response.raise_for_status()
     return response.json()
 
