@@ -39,7 +39,6 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-# --- The most important system prompt ---
 SYSTEM_PROMPT_ANSWER = (
     "You are a helpful, informal, and friendly vacation rental host. "
     "Reply to guests as if texting a peer—clear, concise, and casual (think millennial tone). "
@@ -49,15 +48,19 @@ SYSTEM_PROMPT_ANSWER = (
     "Use contractions, skip filler, and just answer what’s needed. Never restate the guest's message."
 )
 
-# --- Use this for ALL AI generations, including clarify/improve_with_ai ---
-def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
+def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER, previous_examples=None):
     try:
+        messages = [{"role": "system", "content": system_prompt}]
+        if previous_examples:
+            for guest_q, _, user_a in previous_examples:
+                if guest_q and user_a:
+                    messages.append({"role": "user", "content": guest_q})
+                    messages.append({"role": "assistant", "content": user_a})
+        messages.append({"role": "user", "content": prompt})
+
         response = openai_client.chat.completions.create(
             model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ]
+            messages=messages
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -118,12 +121,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Decide what fields to use, but ALWAYS add 'name', 'description', 'city' ---
     core_fields = {"name", "description", "city"}
     requested_fields = set(core_fields)
-
-    # Optionally, you can make an AI call to pick extra fields based on the guest message if you wish
-    # For brevity, we'll stick to core and only fetch extra as needed
 
     listing_obj = fetch_hostaway_listing(listing_id) or {}
     listing = listing_obj.get("result", {})
@@ -135,10 +134,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     convo = fetch_hostaway_conversation(conv_id) or {}
     msgs = convo.get("conversationMessages", [])
-    # Only the last 10, for context (optional, not shown to the guest)
     context = "\n".join([f"{'Guest' if m['isIncoming'] else 'Host'}: {m['body']}" for m in msgs[-MAX_THREAD_MESSAGES:]])
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
+
     prev_answer = ""
     if prev_examples and prev_examples[0][2]:
         prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
@@ -155,16 +154,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "---\nWrite a reply to the guest. Remember: clear, concise, informal, millennial tone. No listing details unless needed. No restating guest's message."
     )
 
-    ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
+    ai_reply = clean_ai_reply(make_ai_reply(ai_prompt, previous_examples=prev_examples))
 
-    # --- Button/meta block only contains IDs! ---
     button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
         "guest_id": guest_id,
         "type": communication_type,
         "guest_name": guest_name,
-        "guest_message": guest_msg,  # Pass for modals!
+        "guest_message": guest_msg,
         "ai_suggestion": ai_reply,
     }
 
@@ -180,6 +178,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
                 {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"},
                 {"type": "button", "text": {"type": "plain_text", "text": "🤔 Clarify"}, "value": json.dumps({**button_meta_minimal, "action": "clarify_request"}), "action_id": "clarify_request"}
+            ]
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "👍 Helpful"}, "value": json.dumps({**button_meta_minimal, "rating": "up"}), "action_id": "rate_up"},
+                {"type": "button", "text": {"type": "plain_text", "text": "👎 Unhelpful"}, "value": json.dumps({**button_meta_minimal, "rating": "down"}), "action_id": "rate_down"}
             ]
         }
     ]
