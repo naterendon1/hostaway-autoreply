@@ -90,14 +90,19 @@ def fetch_hostaway_reservation(reservation_id: int) -> dict:
     response.raise_for_status()
     return response.json()
 
+def fetch_hostaway_conversation(conversation_id: int) -> dict:
+    url = f"https://api.hostaway.com/conversations/{conversation_id}"
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
 def make_ai_reply(prompt: str, previous_examples: list = None) -> str:
-    # Dummy fallback response generator (placeholder)
     return f"Auto-response: {prompt}"
 
 # Export aliases for compatibility with existing imports
 store_learning_example = save_learning_example
 store_ai_feedback = save_ai_feedback
 
-# Dummy admin notifier placeholder to prevent import error
+# Dummy admin notifier placeholder
 def notify_admin_of_custom_response(metadata, reply_text):
     pass
