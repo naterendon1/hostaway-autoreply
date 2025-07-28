@@ -4,6 +4,12 @@ import requests
 
 DB_PATH = "custom_responses.db"
 
+def fetch_hostaway_reservation(reservation_id: int) -> dict:
+    url = f"https://api.hostaway.com/reservations/{reservation_id}"
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
