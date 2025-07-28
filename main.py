@@ -15,7 +15,7 @@ from utils import (
     get_property_info,
     store_ai_feedback
 )
-from db import get_similar_response
+from db import get_similar_response, save_custom_response
 
 logging.basicConfig(level=logging.INFO)
 
@@ -203,6 +203,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             blocks=blocks,
             text="New message from guest"
         )
+
+        # Auto-save AI reply as custom response
+        if not custom_response:
+            save_custom_response(listing_id, guest_msg, ai_reply)
+
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
 
