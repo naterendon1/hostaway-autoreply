@@ -1,27 +1,85 @@
-import logging
-from db import save_custom_response, save_learning_example, save_ai_feedback
+import sqlite3
+from datetime import datetime
+import requests
 
-# Logs thumbs up/down feedback from user
+DB_PATH = "custom_responses.db"
 
-def store_ai_feedback(conv_id, question, answer, rating, user):
-    logging.info(f"📥 Feedback: [{rating.upper()}] by {user} on conv {conv_id}")
-    save_ai_feedback(conv_id, question, answer, rating, user)
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS custom_responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            listing_id INTEGER,
+            question_text TEXT,
+            response_text TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# Stores rewritten AI reply from Edit modal
+def save_custom_response(listing_id, question, response):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO custom_responses (listing_id, question_text, response_text, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (listing_id, question, response, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
 
-def store_learning_example(listing_id, guest_question, corrected_reply):
-    logging.info("💡 Storing learning example from EDIT")
-    save_learning_example(listing_id, guest_question, corrected_reply)
+def get_similar_response(listing_id, question, threshold=0.6):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT question_text, response_text FROM custom_responses WHERE listing_id = ?
+    """, (listing_id,))
+    results = c.fetchall()
+    conn.close()
+    question_words = set(question.lower().split())
+    for prev_q, prev_resp in results:
+        prev_words = set(prev_q.lower().split())
+        if not prev_words:
+            continue
+        overlap = question_words & prev_words
+        if len(overlap) / max(len(prev_words), 1) >= threshold:
+            return prev_resp
+    return None
 
-# Stores full custom user-written response
+def save_learning_example(listing_id, question, corrected_reply):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO custom_responses (listing_id, question_text, response_text, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (listing_id, question, corrected_reply, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
 
-def store_custom_response(listing_id, guest_question, custom_reply):
-    logging.info("📝 Storing custom response from WRITE YOUR OWN")
-    save_custom_response(listing_id, guest_question, custom_reply)
+def save_ai_feedback(conv_id, question, answer, rating, user):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT,
+            question TEXT,
+            ai_answer TEXT,
+            rating TEXT,
+            user TEXT,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        INSERT INTO ai_feedback (conversation_id, question, ai_answer, rating, user, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (conv_id, question, answer, rating, user, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
 
-# Alert sent to admin when user writes their own reply (optional)
-
-def notify_admin_of_custom_response(metadata, reply):
-    logging.info("📣 Admin notified of custom reply")
-    # Placeholder: could trigger Slack or email notification
-    return
+def fetch_hostaway_listing(listing_id: int) -> dict:
+    url = f"https://api.hostaway.com/listings/{listing_id}"  # Replace with your real API endpoint
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
