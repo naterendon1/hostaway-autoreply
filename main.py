@@ -40,19 +40,16 @@ class HostawayUnifiedWebhook(BaseModel):
     date: str = None
 
 SYSTEM_PROMPT_FIELD_SELECTION = (
-    "You are a knowledgeable, friendly property host. When you receive a guest’s question, first decide which property details you need. "
-    "If you need info, respond only with a comma-separated list of fields (e.g., wifiUsername, wifiPassword, bedroomsNumber). "
-    "If you have all info you need, reply with \"ready\". Wait for the property info, then write your reply as if you know the house personally. "
-    "Never mention “listing,” “database,” or where info came from—just answer as the host. Keep it warm, concise, and use the guest’s name."
+    "You are a friendly, modern property host. When you get a guest’s message, first decide which property details you need. "
+    "If you need info, reply ONLY with a comma-separated list of fields (like wifiPassword, bedroomsNumber, etc). "
+    "If you have all you need, just reply: ready. Wait for the property info before answering the guest."
 )
 
 SYSTEM_PROMPT_ANSWER = (
-    "You are a knowledgeable, friendly property host. When replying to guests, be brief, warm, and informal. "
-    "Greet guests by their first name only if it sounds natural. Only include property details if they directly answer a question. "
-    "Avoid formalities like \"Dear\" or \"delighted to hear\". Never restate the guest’s message. "
-    "Write as if texting a friend—keep replies clear, concise, and focused on what the guest needs now. "
-    "Never mention listings, databases, or house rules unless specifically asked. "
-    "Keep replies under 250 characters unless extra details are required."
+    "You are a friendly, modern property host. Respond to the guest as if you’re texting a friend. "
+    "Keep replies short (max 250 characters unless more detail is needed), clear, and casual. "
+    "Never mention listings, databases, or house rules unless specifically asked. Greet the guest by first name only if it sounds natural. "
+    "Only share property details if they answer the question directly. No formalities, just friendly help."
 )
 
 def clean_ai_reply(reply: str):
@@ -124,7 +121,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     core_fields = {"name", "description", "city"}
     requested_fields = set()
-
     if field_response.lower() != "ready":
         requested_fields.update([f.strip() for f in field_response.split(",") if f.strip()])
     requested_fields = requested_fields.union(core_fields)
@@ -132,7 +128,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_obj = fetch_hostaway_listing(listing_id) or {}
     listing = listing_obj.get("result", {})
     property_details = {k: listing.get(k, "") for k in requested_fields if k in listing}
-
     property_str = "\n".join([f"{k}: {v}" for k, v in property_details.items() if v])
     if not property_str:
         property_str = "(no extra details available)"
@@ -171,15 +166,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error(f"❌ OpenAI answer generation error: {e}")
         ai_reply = "(Error generating reply.)"
 
-    # --- Button/modal metadata: always store guest_message and ai_suggestion! ---
-    modal_metadata = {
+    # --- Pass guest_message and ai_suggestion in all button meta! ---
+    button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
         "guest_id": guest_id,
         "type": communication_type,
         "guest_name": guest_name,
-        "guest_message": guest_msg,    # <-- IMPORTANT!
-        "ai_suggestion": ai_reply
+        "guest_message": guest_msg,
+        "ai_suggestion": ai_reply,
     }
 
     blocks = [
@@ -190,10 +185,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         {
             "type": "actions",
             "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**modal_metadata, "action": "send"}), "action_id": "send"},
-                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**modal_metadata, "action": "edit"}), "action_id": "edit"},
-                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**modal_metadata, "action": "write_own"}), "action_id": "write_own"},
-                {"type": "button", "text": {"type": "plain_text", "text": "🤔 Clarify"}, "value": json.dumps({**modal_metadata, "action": "clarify_request"}), "action_id": "clarify_request"}
+                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
+                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
+                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"},
+                {"type": "button", "text": {"type": "plain_text", "text": "🤔 Clarify"}, "value": json.dumps({**button_meta_minimal, "action": "clarify_request"}), "action_id": "clarify_request"}
             ]
         }
     ]
