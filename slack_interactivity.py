@@ -23,13 +23,17 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Dropdown tag options
 CLARIFY_TAG_OPTIONS = [
     "wifi", "parking", "checkin", "checkout", "pets", "kids", "beds", "grill", "amenities",
     "pool", "security", "tv", "kitchen", "access", "cleaning", "fees", "view", "distance",
     "capacity", "rules", "damage deposit", "cancellation", "house manual", "location",
     "noise", "late checkout", "early checkin", "beach", "lake", "mountain", "city", "hot tub",
-    "ac", "heating", "coffee", "laundry", "linens", "directions", "transport", "parking",
-    "discount", "events", "guests", "infants", "children", "supplies", "appliances"
+    "ac", "heating", "coffee", "laundry", "linens", "directions", "transport", "discount", "events",
+    "guests", "infants", "children", "supplies", "appliances"
+]
+CLARIFY_TAG_SLACK_OPTIONS = [
+    {"text": {"type": "plain_text", "text": tag}, "value": tag} for tag in CLARIFY_TAG_OPTIONS
 ]
 
 def clean_ai_reply(reply: str, property_type="home"):
@@ -68,22 +72,22 @@ def needs_clarification(reply: str) -> bool:
 
 def generate_reply_with_clarification(guest_msg, host_clarification):
     prompt = (
-        "A guest asked a question. The host provided a clarification (not a guest-facing response), just facts or business rules. "
-        "Write a warm, clear, and brief reply for the guest, using the clarification as extra info. "
-        "Reply in less than 250 characters, and never mention the clarification or training, just answer like a helpful host.\n\n"
-        f"Guest message: {guest_msg}\n"
-        f"Host clarification for AI: {host_clarification}\n"
-        "Guest reply:"
+        "A guest asked a question about a vacation rental property, and the host explained to the AI some extra facts, rules, or details to answer better. "
+        "Using the guest's question and the host's explanation, write a warm, clear, brief response for the guest. "
+        "Do not mention that the info was just clarified—just answer as if you knew it all along.\n\n"
+        f"Guest: {guest_msg}\n"
+        f"Host's explanation for AI: {host_clarification}\n"
+        "Reply:"
     )
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are a warm, helpful, and informal vacation rental host."},
+                {"role": "system", "content": "You are a warm and professional vacation rental assistant. Your tone is clear, helpful, and friendly."},
                 {"role": "user", "content": prompt}
             ]
         )
-        return clean_ai_reply(response.choices[0].message.content.strip())
+        return response.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"Clarify AI generation failed: {e}")
         return "(Error generating response from clarification.)"
@@ -113,6 +117,8 @@ async def slack_actions(request: Request):
         action = payload["actions"][0]
         action_id = action.get("action_id")
         trigger_id = payload.get("trigger_id")
+        user = payload.get("user", {})
+        user_id = user.get("id", "")
 
         def get_meta_from_action(action):
             return json.loads(action["value"]) if "value" in action else {}
@@ -232,7 +238,6 @@ async def slack_actions(request: Request):
             guest_name = meta.get("guest_name", "Guest")
             guest_message = meta.get("guest_message", "(Message unavailable)")
             ai_suggestion = meta.get("ai_suggestion", "")
-            tags_list_str = ", ".join(CLARIFY_TAG_OPTIONS)
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Clarify for AI", "emoji": True},
@@ -259,11 +264,12 @@ async def slack_actions(request: Request):
                     {
                         "type": "input",
                         "block_id": "clarify_tag",
-                        "label": {"type": "plain_text", "text": f"Tags (comma-separated, e.g. wifi, beds, kids...)\nOptions: {tags_list_str}", "emoji": True},
+                        "label": {"type": "plain_text", "text": "Select one or more tags for this clarification", "emoji": True},
                         "element": {
-                            "type": "plain_text_input",
+                            "type": "multi_static_select",
                             "action_id": "clarify_tag_input",
-                            "placeholder": {"type": "plain_text", "text": "wifi, checkin, beds, parking, etc"}
+                            "placeholder": {"type": "plain_text", "text": "Choose tags..."},
+                            "options": CLARIFY_TAG_SLACK_OPTIONS
                         }
                     }
                 ]
@@ -360,20 +366,21 @@ async def slack_actions(request: Request):
         state = view.get("state", {}).get("values", {})
         meta = json.loads(view.get("private_metadata", "{}"))
 
-        # Clarification modal submission (for AI learning, and now: AI retries with clarification!)
+        # Clarification modal submission (for AI learning & retry with AI!)
         if "clarify_input" in state:
             clarification_text = next(iter(state["clarify_input"].values())).get("value")
-            clarification_tag = next(iter(state["clarify_tag"].values())).get("value")
+            tag_element = next(iter(state["clarify_tag"].values()))
+            selected_tags = tag_element.get("selected_options", [])
+            clarification_tags = [tag['value'] for tag in selected_tags]
             guest_msg = meta.get("guest_message", "")
             listing_id = meta.get("listing_id")
             guest_id = meta.get("guest_id")
             conversation_id = meta.get("conv_id") or meta.get("conversation_id")
 
-            store_clarification_log(conversation_id, guest_msg, clarification_text, [clarification_tag])
+            store_clarification_log(conversation_id, guest_msg, clarification_text, clarification_tags)
             improved = generate_reply_with_clarification(guest_msg, clarification_text)
             store_learning_example(guest_msg, "", improved, listing_id, guest_id)
 
-            # After clarifying, show the new AI reply in a new modal for review/sending
             return JSONResponse({
                 "response_action": "update",
                 "view": {
