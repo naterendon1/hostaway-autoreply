@@ -69,7 +69,14 @@ def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER, previous_examples=
         logging.error(f"❌ OpenAI error: {e}")
         return "(Error generating reply.)"
 
-def clean_ai_reply(reply: str):
+import re
+
+def strip_emojis(text: str) -> str:
+    text = re.sub(r':[a-zA-Z0-9_+-]+:', '', text)  # Slack-style
+    text = re.sub(r'[^\w\s,.!?\'\"-]', '', text)   # Unicode emojis (optional)
+    return text
+
+def clean_ai_reply(reply: str) -> str:
     bad_signoffs = [
         "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
         "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
@@ -88,8 +95,9 @@ def clean_ai_reply(reply: str):
     reply = ' '.join(filtered_lines)
     reply = ' '.join(reply.split())
     reply = reply.strip().replace(" ,", ",").replace(" .", ".")
-    return reply.rstrip(",. ")
-
+    reply = reply.rstrip(",. ")
+    reply = strip_emojis(reply)
+    return reply
 @app.on_event("startup")
 def startup_event():
     init_db()
