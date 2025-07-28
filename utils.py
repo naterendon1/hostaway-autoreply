@@ -4,6 +4,10 @@ import requests
 
 DB_PATH = "custom_responses.db"
 
+def make_ai_reply(prompt: str, previous_examples: list = None) -> str:
+    # Fallback AI reply function
+    return f"Auto-response: {prompt}"
+
 def get_similar_learning_examples(listing_id: int) -> list[tuple[str, str]]:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
