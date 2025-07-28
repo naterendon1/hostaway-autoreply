@@ -3,3 +3,4 @@ slack_sdk
 openai
 pydantic
 requests
+uvicorn
