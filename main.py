@@ -15,7 +15,7 @@ from utils import (
     get_property_info,
     store_ai_feedback
 )
-from db import get_similar_response, save_custom_response
+from db import get_similar_response, init_db
 
 logging.basicConfig(level=logging.INFO)
 
@@ -90,6 +90,10 @@ def clean_ai_reply(reply: str):
     reply = reply.strip().replace(" ,", ",").replace(" .", ".")
     return reply.rstrip(",. ")
 
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
@@ -107,7 +111,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if payload.data.get("attachments"):
             logging.info("📷 Skipping image-only message.")
         else:
-            logging.info("🧾 Empty message skipped.")
+            logging.info("🗞 Empty message skipped.")
         return {"status": "ignored"}
 
     reservation = fetch_hostaway_reservation(reservation_id) or {}
@@ -203,11 +207,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             blocks=blocks,
             text="New message from guest"
         )
-
-        # Auto-save AI reply as custom response
-        if not custom_response:
-            save_custom_response(listing_id, guest_msg, ai_reply)
-
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
 
@@ -216,3 +215,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Auto-Reply API is running"}
