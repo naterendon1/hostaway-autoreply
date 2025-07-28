@@ -12,7 +12,6 @@ from utils import (
     fetch_hostaway_conversation,
     get_cancellation_policy_summary,
     get_similar_learning_examples,
-    get_property_info,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -172,14 +171,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error(f"❌ OpenAI answer generation error: {e}")
         ai_reply = "(Error generating reply.)"
 
-    # --- Pass full modal context on all buttons ---
+    # --- Button/modal metadata: always store guest_message and ai_suggestion! ---
     modal_metadata = {
         "conv_id": conv_id,
         "listing_id": listing_id,
         "guest_id": guest_id,
         "type": communication_type,
         "guest_name": guest_name,
-        "guest_message": guest_msg,
+        "guest_message": guest_msg,    # <-- IMPORTANT!
         "ai_suggestion": ai_reply
     }
 
