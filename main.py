@@ -3,7 +3,7 @@ import logging
 import json
 import re
 from fastapi import FastAPI, Request
-from slack_interactivity import router as slack_router, needs_clarification
+from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
@@ -50,30 +50,9 @@ SYSTEM_PROMPT_ANSWER = (
     "Use contractions, skip filler, and just answer what’s needed. Never restate the guest's message."
 )
 
-def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER, previous_examples=None):
-    try:
-        messages = [{"role": "system", "content": system_prompt}]
-        if previous_examples:
-            for guest_q, _, user_a in previous_examples:
-                if guest_q and user_a:
-                    messages.append({"role": "user", "content": guest_q})
-                    messages.append({"role": "assistant", "content": user_a})
-        messages.append({"role": "user", "content": prompt})
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=messages
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"❌ OpenAI error: {e}")
-        return "(Error generating reply.)"
-
-import re
-
 def strip_emojis(text: str) -> str:
-    text = re.sub(r':[a-zA-Z0-9_+-]+:', '', text)  # Slack-style
-    text = re.sub(r'[^\w\s,.!?\'\"-]', '', text)   # Unicode emojis (optional)
+    text = re.sub(r':[a-zA-Z0-9_+-]+:', '', text)
+    text = re.sub(r'[^\w\s,.!?\'\"-]', '', text)
     return text
 
 def clean_ai_reply(reply: str) -> str:
@@ -98,6 +77,7 @@ def clean_ai_reply(reply: str) -> str:
     reply = reply.rstrip(",. ")
     reply = strip_emojis(reply)
     return reply
+
 @app.on_event("startup")
 def startup_event():
     init_db()
@@ -185,7 +165,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     }
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Listing:* {listing.get('name', 'Unknown listing')}" }},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Listing:* {listing.get('name', 'Unknown listing')}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
@@ -194,8 +174,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "elements": [
                 {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
                 {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
-                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"},
-                {"type": "button", "text": {"type": "plain_text", "text": "🤔 Clarify"}, "value": json.dumps({**button_meta_minimal, "action": "clarify_request"}), "action_id": "clarify_request"}
+                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
             ]
         },
         {
