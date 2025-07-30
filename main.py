@@ -3,7 +3,7 @@ import logging
 import json
 import re
 from fastapi import FastAPI
-from slack_interactivity import router as slack_router, needs_clarification
+from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
@@ -13,9 +13,22 @@ from utils import (
     get_cancellation_policy_summary,
     get_similar_learning_examples,
     get_property_info,
+    clean_ai_reply,
 )
 
 logging.basicConfig(level=logging.INFO)
+
+# --- ENVIRONMENT VARIABLE CHECKS ---
+REQUIRED_ENV_VARS = [
+    "HOSTAWAY_CLIENT_ID",
+    "HOSTAWAY_CLIENT_SECRET",
+    "OPENAI_API_KEY",
+    "SLACK_CHANNEL",
+    "SLACK_BOT_TOKEN"
+]
+missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
+if missing:
+    raise RuntimeError(f"Missing required environment variables: {missing}")
 
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
@@ -28,7 +41,7 @@ app = FastAPI()
 app.include_router(slack_router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-MAX_THREAD_MESSAGES = 10
+MAX_THREAD_MESSAGES = 10  # how many to include for context
 
 class HostawayUnifiedWebhook(BaseModel):
     object: str
@@ -39,17 +52,17 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-# --- The most important system prompt ---
+# --- System prompt: clear, modern, friendly, concise, but not forced millennial ---
 SYSTEM_PROMPT_ANSWER = (
-    "You are a helpful, informal, and friendly vacation rental host. "
-    "Reply to guests as if texting a peer—clear, concise, and casual (think millennial tone). "
-    "Don’t restate info the guest already sees. Only mention a property detail if it answers their question. "
-    "Never say you’re checking or following up unless they *explicitly* ask about availability or something unknown. "
-    "No formal greetings, no copy-paste listing descriptions, and keep it under 200 characters unless the question needs more. "
-    "Use contractions, skip filler, and just answer what’s needed. Never restate the guest's message."
+    "You are a helpful, friendly vacation rental host. "
+    "Reply as if texting a peer—modern, clear, and informal, but professional. "
+    "Avoid emojis, do not restate the guest's message, and keep replies concise (preferably under 200 characters unless necessary). "
+    "Mention property details only if they directly answer the question. "
+    "Don't use copy-paste listing descriptions or formal closings. "
+    "Never say you're checking or following up unless the guest asks for something unknown. "
+    "Only answer what's needed, no filler."
 )
 
-# --- Use this for ALL AI generations, including clarify/improve_with_ai ---
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
     try:
         response = openai_client.chat.completions.create(
@@ -57,33 +70,13 @@ def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            timeout=20  # Always set timeout
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
         return "(Error generating reply.)"
-
-def clean_ai_reply(reply: str):
-    bad_signoffs = [
-        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
-        "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
-    ]
-    for signoff in bad_signoffs:
-        reply = reply.replace(signoff, "")
-    lines = reply.split('\n')
-    filtered_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if any(stripped.lower().startswith(s.lower().replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
-            continue
-        if "[Your Name]" in stripped:
-            continue
-        filtered_lines.append(line)
-    reply = ' '.join(filtered_lines)
-    reply = ' '.join(reply.split())
-    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
-    return reply.rstrip(",. ")
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -118,12 +111,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Decide what fields to use, but ALWAYS add 'name', 'description', 'city' ---
     core_fields = {"name", "description", "city"}
     requested_fields = set(core_fields)
-
-    # Optionally, you can make an AI call to pick extra fields based on the guest message if you wish
-    # For brevity, we'll stick to core and only fetch extra as needed
 
     listing_obj = fetch_hostaway_listing(listing_id) or {}
     listing = listing_obj.get("result", {})
@@ -133,10 +122,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not property_str:
         property_str = "(no extra details available)"
 
-    convo = fetch_hostaway_conversation(conv_id) or {}
-    msgs = convo.get("conversationMessages", [])
-    # Only the last 10, for context (optional, not shown to the guest)
-    context = "\n".join([f"{'Guest' if m['isIncoming'] else 'Host'}: {m['body']}" for m in msgs[-MAX_THREAD_MESSAGES:]])
+    # --- Fetch message thread for full context ---
+    convo_obj = fetch_hostaway_conversation(conv_id) or {}
+    msgs = []
+    if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
+        msgs = convo_obj["result"]["conversationMessages"]
+    # Compose conversation thread (last N messages), newest last
+    conversation_context = []
+    for m in msgs[-MAX_THREAD_MESSAGES:]:
+        sender = "Guest" if m.get("isIncoming") else "Host"
+        body = m.get("body", "")
+        if not body:
+            continue
+        conversation_context.append(f"{sender}: {body}")
+    context_str = "\n".join(conversation_context)
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
     prev_answer = ""
@@ -145,14 +144,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     cancellation = get_cancellation_policy_summary(listing, res)
 
+    # --- Improved AI prompt with thread context ---
     ai_prompt = (
-        f"Guest name: {guest_name}\n"
-        f"Guest message: \"{guest_msg}\"\n"
+        f"Here is the most recent message thread with a guest (newest last):\n"
+        f"{context_str}\n\n"
         f"{prev_answer}"
         f"Property details:\n{property_str}\n"
         f"Reservation Info:\n{json.dumps(res)}\n"
         f"Cancellation: {cancellation}\n"
-        "---\nWrite a reply to the guest. Remember: clear, concise, informal, millennial tone. No listing details unless needed. No restating guest's message."
+        "---\nWrite a clear, modern, friendly, concise reply to the most recent guest message."
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
@@ -178,8 +178,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "elements": [
                 {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
                 {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
-                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"},
-                {"type": "button", "text": {"type": "plain_text", "text": "🤔 Clarify"}, "value": json.dumps({**button_meta_minimal, "action": "clarify_request"}), "action_id": "clarify_request"}
+                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
             ]
         }
     ]
