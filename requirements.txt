@@ -1,7 +1,7 @@
 fastapi
-slack_sdk
 openai
 pydantic
-requests
-uvicorn
 python-multipart
+requests
+slack_sdk
+uvicorn
