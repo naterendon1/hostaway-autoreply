@@ -10,9 +10,7 @@ from difflib import get_close_matches
 # --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
-    "HOSTAWAY_CLIENT_SECRET",
-    "HOSTAWAY_API_BASE",
-    "LEARNING_DB_PATH"
+    "HOSTAWAY_CLIENT_SECRET"
 ]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
