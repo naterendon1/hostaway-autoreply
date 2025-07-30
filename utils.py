@@ -1,17 +1,37 @@
 import os
-import json
 import requests
 import logging
 import sqlite3
+import json
+import time
 from datetime import datetime
 from difflib import get_close_matches
 
+# --- ENVIRONMENT VARIABLE CHECKS ---
+REQUIRED_ENV_VARS = [
+    "HOSTAWAY_CLIENT_ID",
+    "HOSTAWAY_CLIENT_SECRET",
+    "HOSTAWAY_API_BASE",
+    "LEARNING_DB_PATH"
+]
+missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
+if missing:
+    raise RuntimeError(f"Missing required environment variables: {missing}")
+
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
-HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
+HOSTAWAY_API_BASE = os.getenv("HOSTAWAY_API_BASE", "https://api.hostaway.com/v1")
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 
+# --- HOSTAWAY TOKEN CACHE ---
+_HOSTAWAY_TOKEN_CACHE = {"access_token": None, "expires_at": 0}
+
 def get_hostaway_access_token() -> str:
+    global _HOSTAWAY_TOKEN_CACHE
+    now = time.time()
+    if _HOSTAWAY_TOKEN_CACHE["access_token"] and now < _HOSTAWAY_TOKEN_CACHE["expires_at"]:
+        return _HOSTAWAY_TOKEN_CACHE["access_token"]
+
     url = f"{HOSTAWAY_API_BASE}/accessTokens"
     data = {
         "grant_type": "client_credentials",
@@ -22,7 +42,11 @@ def get_hostaway_access_token() -> str:
     try:
         r = requests.post(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
         r.raise_for_status()
-        return r.json().get("access_token")
+        resp = r.json()
+        _HOSTAWAY_TOKEN_CACHE["access_token"] = resp.get("access_token")
+        # Hostaway tokens typically last an hour, use 58 mins to be safe
+        _HOSTAWAY_TOKEN_CACHE["expires_at"] = now + 3480
+        return _HOSTAWAY_TOKEN_CACHE["access_token"]
     except Exception as e:
         logging.error(f"❌ Token error: {e}")
         return None
@@ -84,8 +108,8 @@ def fetch_hostaway_conversation(conversation_id):
 
 def fetch_conversation_messages(conversation_id):
     obj = fetch_hostaway_conversation(conversation_id)
-    if obj and "conversationMessages" in obj:
-        return obj["conversationMessages"]
+    if obj and "result" in obj and "conversationMessages" in obj["result"]:
+        return obj["result"]["conversationMessages"]
     return []
 
 def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_type: str = "email") -> bool:
@@ -122,6 +146,31 @@ def get_cancellation_policy_summary(listing_result, reservation_result):
     }
     return desc.get(policy, f"Policy: {policy}")
 
+# --- CENTRALIZED AI REPLY CLEANING ---
+def clean_ai_reply(reply: str):
+    bad_signoffs = [
+        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
+        "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
+    ]
+    for signoff in bad_signoffs:
+        reply = reply.replace(signoff, "")
+    lines = reply.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.lower().startswith(s.lower().replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
+            continue
+        if "[Your Name]" in stripped:
+            continue
+        filtered_lines.append(line)
+    reply = ' '.join(filtered_lines)
+    reply = ' '.join(reply.split())
+    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
+    # Remove trailing punctuation and any emojis
+    reply = reply.rstrip(",. ")
+    reply = ''.join(c for c in reply if c.isprintable() and (ord(c) < 0x1F300 or ord(c) > 0x1FAD6)) # crude emoji filter
+    return reply
+
 # --- SQLite Learning Functions ---
 def _init_learning_db():
     try:
@@ -153,8 +202,10 @@ def _init_learning_db():
     except Exception as e:
         logging.error(f"❌ DB init error: {e}")
 
+# Initialize DB only once at import
+_init_learning_db()
+
 def store_learning_example(guest_message, ai_suggestion, user_reply, listing_id, guest_id):
-    _init_learning_db()
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
         c = conn.cursor()
@@ -177,7 +228,6 @@ def store_learning_example(guest_message, ai_suggestion, user_reply, listing_id,
         logging.error(f"❌ DB save error: {e}")
 
 def store_clarification_log(conversation_id, guest_message, clarification, tags):
-    _init_learning_db()
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
         c = conn.cursor()
@@ -199,7 +249,6 @@ def store_clarification_log(conversation_id, guest_message, clarification, tags)
         logging.error(f"❌ Clarification DB error: {e}")
 
 def get_similar_learning_examples(guest_message, listing_id):
-    _init_learning_db()
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
         c = conn.cursor()
@@ -217,7 +266,6 @@ def get_similar_learning_examples(guest_message, listing_id):
         return []
 
 def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8):
-    _init_learning_db()
     try:
         conn = sqlite3.connect(LEARNING_DB_PATH)
         c = conn.cursor()
