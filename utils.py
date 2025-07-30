@@ -74,7 +74,9 @@ def fetch_hostaway_conversation(conversation_id):
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
         logging.info(f"✅ Conversation {conversation_id} fetched with messages.")
-        return r.json()
+        resp_json = r.json()
+        logging.info(f"[DEBUG] Full conversation object: {json.dumps(resp_json, indent=2)}")
+        return resp_json
     except Exception as e:
         logging.error(f"❌ Fetch conversation error: {e}")
         return None
