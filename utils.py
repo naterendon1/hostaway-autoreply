@@ -270,28 +270,23 @@ def get_cancellation_policy_summary(listing_result, reservation_result):
     return desc.get(policy, f"Policy: {policy}")
 
 # --- CENTRALIZED AI REPLY CLEANING ---
+from datetime import datetime
+
 def clean_ai_reply(reply: str):
-    bad_signoffs = [
-        "Enjoy your meal", "Enjoy your meals", "Enjoy!", "Best,", "Best regards,",
-        "Cheers,", "Sincerely,", "[Your Name]", "Best", "Sincerely"
-    ]
-    for signoff in bad_signoffs:
-        reply = reply.replace(signoff, "")
-    lines = reply.split('\n')
-    filtered_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if any(stripped.lower().startswith(s.lower().replace(",", "")) for s in ["Best", "Cheers", "Sincerely"]):
-            continue
-        if "[Your Name]" in stripped:
-            continue
-        filtered_lines.append(line)
-    reply = ' '.join(filtered_lines)
-    reply = ' '.join(reply.split())
-    reply = reply.strip().replace(" ,", ",").replace(" .", ".")
-    # Remove trailing punctuation and any emojis
+    # ...all your existing logic here...
     reply = reply.rstrip(",. ")
-    reply = ''.join(c for c in reply if c.isprintable() and (ord(c) < 0x1F300 or ord(c) > 0x1FAD6)) # crude emoji filter
+    reply = ''.join(c for c in reply if c.isprintable() and (ord(c) < 0x1F300 or ord(c) > 0x1FAD6)) # emoji filter
+
+    # Only allow holiday wishes if it's actually holiday season (December)
+    lower_reply = reply.lower()
+    holiday_terms = ["enjoy your holidays", "merry christmas", "happy holidays", "happy new year"]
+    if any(term in lower_reply for term in holiday_terms):
+        if datetime.now().month != 12:
+            # Remove those lines/phrases
+            for term in holiday_terms:
+                reply = re.sub(term, "", reply, flags=re.IGNORECASE)
+            reply = ' '.join(reply.split())
+            reply = reply.strip()
     return reply
 
 # --- SQLite Learning Functions ---
