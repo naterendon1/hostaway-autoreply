@@ -40,24 +40,28 @@ def fetch_hostaway_calendar(listing_id, start_date, end_date):
         return None
 
 def is_date_available(calendar_json, date_str):
+    """
+    Returns True if the date is available to book (status == 'available').
+    Returns False otherwise (blocked, reserved, pending, etc.).
+    """
     days = calendar_json.get("result", {}).get("calendar", [])
     for day in days:
         if day.get("date") == date_str:
-            # Prefer 'isAvailable' if present, else fallback to 'status'
-            if "isAvailable" in day:
-                return day["isAvailable"]
             return day.get("status", "") == "available"
-    return False  # If date not found, assume not available
+    return False  # Date not found, assume not available
 
 def next_available_dates(calendar_json, days=5):
-    """Return up to N upcoming available dates as strings."""
+    """
+    Returns up to N upcoming available dates as strings.
+    """
     available = []
     for day in calendar_json.get("result", {}).get("calendar", []):
-        if ("isAvailable" in day and day["isAvailable"]) or (day.get("status", "") == "available"):
+        if day.get("status", "") == "available":
             available.append(day["date"])
             if len(available) >= days:
                 break
     return available
+
 
 def get_hostaway_access_token() -> str:
     global _HOSTAWAY_TOKEN_CACHE
