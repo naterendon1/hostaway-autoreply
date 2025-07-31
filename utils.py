@@ -6,6 +6,9 @@ import json
 import time
 from datetime import datetime
 from difflib import get_close_matches
+from datetime import datetime, timedelta
+from utils import fetch_hostaway_calendar, is_date_available
+
 
 # --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
