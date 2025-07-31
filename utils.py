@@ -40,40 +40,39 @@ def fetch_hostaway_calendar(listing_id, start_date, end_date):
         logging.error(f"❌ Fetch calendar error: {e}")
         return None
 
+def _extract_days(calendar_json):
+    """
+    Hostaway calendar endpoint is inconsistent:
+    - Sometimes {"result": {"calendar": [...]}}
+    - Sometimes {"result": [ ... ]}
+    - Sometimes just a list!
+    This helper returns the list of day dicts, or [].
+    """
+    if not calendar_json:
+        return []
+    # If it’s a direct list:
+    if isinstance(calendar_json, list):
+        return calendar_json
+    # If result is present
+    result = calendar_json.get("result")
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        return result.get("calendar", [])
+    return []
+
 def is_date_available(calendar_json, date_str):
-    """
-    Returns True if the specified date is available in the calendar_json.
-    Handles both list and dict root structures.
-    """
-    if calendar_json is None:
-        logging.error("[is_date_available] calendar_json is None")
-        return False
-    if isinstance(calendar_json, dict):
-        days = calendar_json.get("result", {}).get("calendar", [])
-    elif isinstance(calendar_json, list):
-        days = calendar_json
-    else:
-        logging.error(f"[is_date_available] Unexpected calendar_json: {type(calendar_json)} | Value: {calendar_json}")
-        return False
+    days = _extract_days(calendar_json)
     for day in days:
         if day.get("date") == date_str:
             # Prefer 'isAvailable' if present, else fallback to 'status'
             if "isAvailable" in day:
                 return bool(day["isAvailable"])
             return day.get("status", "") == "available"
-    return False  # If date not found, assume not available
+    return False
 
 def next_available_dates(calendar_json, days_wanted=5):
-    if calendar_json is None:
-        logging.error("[next_available_dates] calendar_json is None")
-        return []
-    if isinstance(calendar_json, dict):
-        days = calendar_json.get("result", {}).get("calendar", [])
-    elif isinstance(calendar_json, list):
-        days = calendar_json
-    else:
-        logging.error(f"[next_available_dates] Unexpected calendar_json: {type(calendar_json)} | Value: {calendar_json}")
-        return []
+    days = _extract_days(calendar_json)
     available = []
     for day in days:
         if ("isAvailable" in day and day["isAvailable"]) or (day.get("status", "") == "available"):
