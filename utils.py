@@ -24,6 +24,41 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 # --- HOSTAWAY TOKEN CACHE ---
 _HOSTAWAY_TOKEN_CACHE = {"access_token": None, "expires_at": 0}
 
+from datetime import datetime, timedelta
+
+def fetch_hostaway_calendar(listing_id, start_date, end_date):
+    token = get_hostaway_access_token()
+    if not token:
+        return None
+    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}/calendar?startDate={start_date}&endDate={end_date}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logging.error(f"❌ Fetch calendar error: {e}")
+        return None
+
+def is_date_available(calendar_json, date_str):
+    days = calendar_json.get("result", {}).get("calendar", [])
+    for day in days:
+        if day.get("date") == date_str:
+            # Prefer 'isAvailable' if present, else fallback to 'status'
+            if "isAvailable" in day:
+                return day["isAvailable"]
+            return day.get("status", "") == "available"
+    return False  # If date not found, assume not available
+
+def next_available_dates(calendar_json, days=5):
+    """Return up to N upcoming available dates as strings."""
+    available = []
+    for day in calendar_json.get("result", {}).get("calendar", []):
+        if ("isAvailable" in day and day["isAvailable"]) or (day.get("status", "") == "available"):
+            available.append(day["date"])
+            if len(available) >= days:
+                break
+    return available
+
 def get_hostaway_access_token() -> str:
     global _HOSTAWAY_TOKEN_CACHE
     now = time.time()
