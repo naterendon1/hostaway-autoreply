@@ -5,17 +5,17 @@ from fastapi import FastAPI
 from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
-from datetime import datetime, timedelta
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
-    fetch_hostaway_calendar,
-    is_date_available,
     get_cancellation_policy_summary,
     get_similar_learning_examples,
-    get_property_info,
     clean_ai_reply,
+    extract_date_range_from_message,
+    fetch_hostaway_calendar,
+    is_date_available,
+    next_available_dates,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -40,9 +40,8 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 app = FastAPI()
 app.include_router(slack_router)
-
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-MAX_THREAD_MESSAGES = 10  # how many to include for context
+MAX_THREAD_MESSAGES = 10
 
 class HostawayUnifiedWebhook(BaseModel):
     object: str
@@ -53,16 +52,13 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-# --- System prompt ---
 SYSTEM_PROMPT_ANSWER = (
     "You are a helpful, friendly vacation rental host. "
     "Reply as if texting a peer—modern, clear, and informal, but professional. "
     "Avoid emojis, do not restate the guest's message, and keep replies concise (preferably under 200 characters unless necessary). "
     "Mention property details only if they directly answer the question. "
-    "Don't use copy-paste listing descriptions or formal closings. "
     "Never say you're checking or following up unless the guest asks for something unknown. "
-    "If the guest asks about extending or date availability, answer ONLY if the calendar info below confirms it's possible. "
-    "Only answer what's needed, no filler."
+    "If the guest asks about dates or availability, check the live calendar info provided below and only confirm what is available."
 )
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
@@ -73,7 +69,7 @@ def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            timeout=20  # Always set timeout
+            timeout=20
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -113,24 +109,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    core_fields = {"name", "description", "city"}
-    requested_fields = set(core_fields)
-
-    listing_obj = fetch_hostaway_listing(listing_id) or {}
-    listing = listing_obj.get("result", {})
-    property_details = {k: listing.get(k, "") for k in requested_fields if k in listing}
-
-    property_str = "\n".join([f"{k}: {v}" for k, v in property_details.items() if v])
-    if not property_str:
-        property_str = "(no extra details available)"
-
     # --- Fetch message thread for full context ---
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"]
-
-    # Compose conversation thread (last N messages), newest last
     conversation_context = []
     for m in msgs[-MAX_THREAD_MESSAGES:]:
         sender = "Guest" if m.get("isIncoming") else "Host"
@@ -145,56 +128,60 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if prev_examples and prev_examples[0][2]:
         prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
 
-    cancellation = get_cancellation_policy_summary(listing, res)
+    cancellation = get_cancellation_policy_summary({}, res)
 
-    # --- Calendar extension/availability check ---
-    calendar_summary = ""  # Default: nothing
-    extension_keywords = [
-        "extend", "stay longer", "add night", "extra night", "stay an extra", 
-        "another night", "check out late", "can we stay", "can I stay", "available", "availability"
+    # -------------- CALENDAR INTENT & LIVE CHECK --------------
+    calendar_keywords = [
+        "available", "availability", "book", "open", "stay", "dates", "night", "reserve", "weekend",
+        "extend", "extra night", "holiday", "christmas", "spring break", "july", "august", "september", "october",
+        "november", "december", "january", "february", "march", "april", "may", "june"
     ]
-    if any(kw in guest_msg.lower() for kw in extension_keywords):
-        try:
-            req_date = (datetime.strptime(check_out, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-        except Exception:
-            req_date = check_out  # fallback
-        calendar_json = fetch_hostaway_calendar(listing_id, req_date, req_date)
-        if calendar_json:
-            available = is_date_available(calendar_json, req_date)
-            if available:
-                calendar_summary = f"The night of {req_date} is available if you'd like to extend."
-            else:
-                calendar_summary = f"Sorry, the night of {req_date} is already booked."
-        else:
-            calendar_summary = "Calendar information is currently unavailable."
+    should_check_calendar = any(word in guest_msg.lower() for word in calendar_keywords)
+    calendar_summary = ""
 
-    # --- Final AI prompt ---
+    if should_check_calendar:
+        start_date, end_date = extract_date_range_from_message(guest_msg, res)
+        calendar_days = fetch_hostaway_calendar(listing_id, start_date, end_date)
+        if calendar_days:
+            available_days = [d["date"] for d in calendar_days if ("isAvailable" in d and d["isAvailable"]) or (d.get("status") == "available")]
+            unavailable_days = [d["date"] for d in calendar_days if not (("isAvailable" in d and d["isAvailable"]) or (d.get("status") == "available"))]
+            if available_days:
+                calendar_summary = (
+                    f"Calendar checked for {start_date} to {end_date}. "
+                    f"Available nights: {', '.join(available_days)}."
+                )
+                if unavailable_days:
+                    calendar_summary += f" Unavailable: {', '.join(unavailable_days)}."
+            else:
+                calendar_summary = f"No available nights between {start_date} and {end_date}."
+        else:
+            calendar_summary = "Unable to retrieve calendar data for the requested dates."
+    # ----------------------------------------------------------
+
     ai_prompt = (
         f"Here is the most recent message thread with a guest (newest last):\n"
         f"{context_str}\n\n"
         f"{prev_answer}"
-        f"Property details:\n{property_str}\n"
         f"Reservation Info:\n{json.dumps(res)}\n"
         f"Cancellation: {cancellation}\n"
         f"Calendar Info: {calendar_summary}\n"
-        "---\nWrite a clear, modern, friendly, concise reply to the most recent guest message. "
-        "If the guest asks about extending or date availability, answer ONLY if the calendar info above confirms it's possible."
+        "---\nWrite a clear, modern, friendly, concise reply to the most recent guest message. If calendar info above is available, use it for accuracy."
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
+    # --- Button/meta block only contains IDs! ---
     button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
         "guest_id": guest_id,
         "type": communication_type,
         "guest_name": guest_name,
-        "guest_message": guest_msg,  # Pass for modals!
+        "guest_message": guest_msg,
         "ai_suggestion": ai_reply,
     }
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Listing:* {listing.get('name', 'Unknown listing')}" }},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
