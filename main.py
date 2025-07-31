@@ -144,6 +144,48 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     cancellation = get_cancellation_policy_summary(listing, res)
 
+    # ...after loading guest_msg, reservation (res), listing_id, check_in, check_out, etc.
+
+calendar_summary = ""  # Default: nothing
+
+# Define extension/availability keywords
+extension_keywords = [
+    "extend", "stay longer", "add night", "extra night", "stay an extra", 
+    "another night", "check out late", "can we stay", "can I stay", "available", "availability"
+]
+
+# Simple extension/availability intent detection
+if any(kw in guest_msg.lower() for kw in extension_keywords):
+    # Attempt to fetch the NEXT day after checkout for extension request
+    try:
+        req_date = (datetime.strptime(check_out, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        req_date = check_out  # fallback
+    calendar_json = fetch_hostaway_calendar(listing_id, req_date, req_date)
+    if calendar_json:
+        available = is_date_available(calendar_json, req_date)
+        if available:
+            calendar_summary = f"The night of {req_date} is available if you'd like to extend."
+        else:
+            calendar_summary = f"Sorry, the night of {req_date} is already booked."
+    else:
+        calendar_summary = "Calendar information is currently unavailable."
+else:
+    calendar_summary = ""
+
+# Pass this info to your AI prompt:
+ai_prompt = (
+    f"Guest name: {guest_name}\n"
+    f"Guest message: \"{guest_msg}\"\n"
+    f"{prev_answer}"
+    f"Property details:\n{property_str}\n"
+    f"Reservation Info:\n{json.dumps(res)}\n"
+    f"Cancellation: {cancellation}\n"
+    f"Calendar Info: {calendar_summary}\n"  # <<<<<<<<<<
+    "---\nWrite a reply to the guest. Answer based on all context above. Do not confirm dates unless calendar info above confirms it."
+)
+
+
     # --- Improved AI prompt with thread context ---
     ai_prompt = (
         f"Here is the most recent message thread with a guest (newest last):\n"
