@@ -6,6 +6,7 @@ import json
 import time
 from datetime import datetime, timedelta
 from difflib import get_close_matches
+import re
 
 # --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
@@ -24,6 +25,29 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 # --- HOSTAWAY TOKEN CACHE ---
 _HOSTAWAY_TOKEN_CACHE = {"access_token": None, "expires_at": 0}
 
+def get_hostaway_access_token() -> str:
+    global _HOSTAWAY_TOKEN_CACHE
+    now = time.time()
+    if _HOSTAWAY_TOKEN_CACHE["access_token"] and now < _HOSTAWAY_TOKEN_CACHE["expires_at"]:
+        return _HOSTAWAY_TOKEN_CACHE["access_token"]
+
+    url = f"{HOSTAWAY_API_BASE}/accessTokens"
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": HOSTAWAY_CLIENT_ID,
+        "client_secret": HOSTAWAY_CLIENT_SECRET,
+        "scope": "general"
+    }
+    try:
+        r = requests.post(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        r.raise_for_status()
+        resp = r.json()
+        _HOSTAWAY_TOKEN_CACHE["access_token"] = resp.get("access_token")
+        _HOSTAWAY_TOKEN_CACHE["expires_at"] = now + 3480
+        return _HOSTAWAY_TOKEN_CACHE["access_token"]
+    except Exception as e:
+        logging.error(f"❌ Token error: {e}")
+        return None
 
 def fetch_hostaway_calendar(listing_id, start_date, end_date):
     token = get_hostaway_access_token()
@@ -33,53 +57,97 @@ def fetch_hostaway_calendar(listing_id, start_date, end_date):
     try:
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
-        calendar_data = r.json()
-        logging.info(f"[fetch_hostaway_calendar] Response type: {type(calendar_data)}; Sample: {str(calendar_data)[:300]}")
-        return calendar_data
+        data = r.json()
+        # Defensive: Sometimes Hostaway gives a list, sometimes dict with 'result' key
+        if isinstance(data, dict) and "result" in data and isinstance(data["result"], list):
+            return data["result"]
+        elif isinstance(data, dict) and "result" in data and isinstance(data["result"], dict):
+            return data["result"].get("calendar", [])
+        elif isinstance(data, list):
+            return data
+        else:
+            return []
     except Exception as e:
         logging.error(f"❌ Fetch calendar error: {e}")
-        return None
-
-def _extract_days(calendar_json):
-    """
-    Hostaway calendar endpoint is inconsistent:
-    - Sometimes {"result": {"calendar": [...]}}
-    - Sometimes {"result": [ ... ]}
-    - Sometimes just a list!
-    This helper returns the list of day dicts, or [].
-    """
-    if not calendar_json:
         return []
-    # If it’s a direct list:
-    if isinstance(calendar_json, list):
-        return calendar_json
-    # If result is present
-    result = calendar_json.get("result")
-    if isinstance(result, list):
-        return result
-    if isinstance(result, dict):
-        return result.get("calendar", [])
-    return []
 
-def is_date_available(calendar_json, date_str):
-    days = _extract_days(calendar_json)
-    for day in days:
+def is_date_available(calendar_days, date_str):
+    for day in calendar_days:
         if day.get("date") == date_str:
-            # Prefer 'isAvailable' if present, else fallback to 'status'
             if "isAvailable" in day:
                 return bool(day["isAvailable"])
             return day.get("status", "") == "available"
     return False
 
-def next_available_dates(calendar_json, days_wanted=5):
-    days = _extract_days(calendar_json)
+def next_available_dates(calendar_days, days_wanted=5):
     available = []
-    for day in days:
+    for day in calendar_days:
         if ("isAvailable" in day and day["isAvailable"]) or (day.get("status", "") == "available"):
             available.append(day["date"])
             if len(available) >= days_wanted:
                 break
     return available
+
+# --- NEW: Extract date ranges or calendar intent from guest messages ---
+def extract_date_range_from_message(message, reservation=None):
+    """
+    Attempts to extract a date range from a guest message.
+    Returns (start_date, end_date) as YYYY-MM-DD or (None, None) if not found.
+    """
+    # MM/DD/YYYY - MM/DD/YYYY or Month D - Month D
+    date_patterns = [
+        r'(\d{1,2}/\d{1,2}/\d{4})\s*(?:to|-|through|until)\s*(\d{1,2}/\d{1,2}/\d{4})',
+        r'([A-Za-z]+ \d{1,2})\s*(?:to|-|through|until)\s*([A-Za-z]+ \d{1,2})',
+        r'from ([A-Za-z]+ \d{1,2}) to ([A-Za-z]+ \d{1,2})',
+    ]
+    msg = message.lower()
+    for pat in date_patterns:
+        m = re.search(pat, msg)
+        if m:
+            try:
+                start, end = m.group(1), m.group(2)
+                # Try parsing with/without year
+                try:
+                    start_date = datetime.strptime(start, "%m/%d/%Y")
+                    end_date = datetime.strptime(end, "%m/%d/%Y")
+                except:
+                    now = datetime.now()
+                    year = now.year
+                    start_date = datetime.strptime(f"{start} {year}", "%B %d %Y")
+                    end_date = datetime.strptime(f"{end} {year}", "%B %d %Y")
+                return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+            except Exception:
+                continue
+    # Holidays (simple)
+    if "christmas" in msg or "xmas" in msg:
+        year = datetime.now().year
+        return f"{year}-12-20", f"{year}-12-27"
+    if "new year" in msg:
+        year = datetime.now().year
+        return f"{year}-12-28", f"{year+1}-01-03"
+    if "spring break" in msg:
+        year = datetime.now().year
+        return f"{year}-03-10", f"{year}-03-20"
+    if "next weekend" in msg:
+        today = datetime.now()
+        days_ahead = 5 - today.weekday()  # Next Saturday
+        if days_ahead <= 0: days_ahead += 7
+        start = today + timedelta(days=days_ahead)
+        end = start + timedelta(days=2)
+        return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    if reservation and any(w in msg for w in ["extend", "extra night", "stay longer"]):
+        check_out = reservation.get("departureDate")
+        if check_out:
+            dt = datetime.strptime(check_out, "%Y-%m-%d")
+            return check_out, (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    # Default: next 14 days
+    today = datetime.now().strftime("%Y-%m-%d")
+    week = (datetime.now() + timedelta(days=13)).strftime("%Y-%m-%d")
+    return today, week
+
+# --- Rest of your utils (fetch_hostaway_listing, fetch_hostaway_reservation, etc.) unchanged ---
+# ... (keep your existing code here)
+
 
 def get_hostaway_access_token() -> str:
     global _HOSTAWAY_TOKEN_CACHE
