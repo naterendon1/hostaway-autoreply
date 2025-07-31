@@ -1,15 +1,17 @@
 import os
 import logging
 import json
-import re
 from fastapi import FastAPI
 from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
+from datetime import datetime, timedelta
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
+    fetch_hostaway_calendar,
+    is_date_available,
     get_cancellation_policy_summary,
     get_similar_learning_examples,
     get_property_info,
@@ -18,7 +20,6 @@ from utils import (
 
 logging.basicConfig(level=logging.INFO)
 
-# --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
@@ -52,7 +53,7 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-# --- System prompt: clear, modern, friendly, concise, but not forced millennial ---
+# --- System prompt ---
 SYSTEM_PROMPT_ANSWER = (
     "You are a helpful, friendly vacation rental host. "
     "Reply as if texting a peer—modern, clear, and informal, but professional. "
@@ -60,6 +61,7 @@ SYSTEM_PROMPT_ANSWER = (
     "Mention property details only if they directly answer the question. "
     "Don't use copy-paste listing descriptions or formal closings. "
     "Never say you're checking or following up unless the guest asks for something unknown. "
+    "If the guest asks about extending or date availability, answer ONLY if the calendar info below confirms it's possible. "
     "Only answer what's needed, no filler."
 )
 
@@ -127,6 +129,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"]
+
     # Compose conversation thread (last N messages), newest last
     conversation_context = []
     for m in msgs[-MAX_THREAD_MESSAGES:]:
@@ -144,49 +147,28 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     cancellation = get_cancellation_policy_summary(listing, res)
 
-    # ...after loading guest_msg, reservation (res), listing_id, check_in, check_out, etc.
-
-calendar_summary = ""  # Default: nothing
-
-# Define extension/availability keywords
-extension_keywords = [
-    "extend", "stay longer", "add night", "extra night", "stay an extra", 
-    "another night", "check out late", "can we stay", "can I stay", "available", "availability"
-]
-
-# Simple extension/availability intent detection
-if any(kw in guest_msg.lower() for kw in extension_keywords):
-    # Attempt to fetch the NEXT day after checkout for extension request
-    try:
-        req_date = (datetime.strptime(check_out, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-    except Exception:
-        req_date = check_out  # fallback
-    calendar_json = fetch_hostaway_calendar(listing_id, req_date, req_date)
-    if calendar_json:
-        available = is_date_available(calendar_json, req_date)
-        if available:
-            calendar_summary = f"The night of {req_date} is available if you'd like to extend."
+    # --- Calendar extension/availability check ---
+    calendar_summary = ""  # Default: nothing
+    extension_keywords = [
+        "extend", "stay longer", "add night", "extra night", "stay an extra", 
+        "another night", "check out late", "can we stay", "can I stay", "available", "availability"
+    ]
+    if any(kw in guest_msg.lower() for kw in extension_keywords):
+        try:
+            req_date = (datetime.strptime(check_out, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        except Exception:
+            req_date = check_out  # fallback
+        calendar_json = fetch_hostaway_calendar(listing_id, req_date, req_date)
+        if calendar_json:
+            available = is_date_available(calendar_json, req_date)
+            if available:
+                calendar_summary = f"The night of {req_date} is available if you'd like to extend."
+            else:
+                calendar_summary = f"Sorry, the night of {req_date} is already booked."
         else:
-            calendar_summary = f"Sorry, the night of {req_date} is already booked."
-    else:
-        calendar_summary = "Calendar information is currently unavailable."
-else:
-    calendar_summary = ""
+            calendar_summary = "Calendar information is currently unavailable."
 
-# Pass this info to your AI prompt:
-ai_prompt = (
-    f"Guest name: {guest_name}\n"
-    f"Guest message: \"{guest_msg}\"\n"
-    f"{prev_answer}"
-    f"Property details:\n{property_str}\n"
-    f"Reservation Info:\n{json.dumps(res)}\n"
-    f"Cancellation: {cancellation}\n"
-    f"Calendar Info: {calendar_summary}\n"  # <<<<<<<<<<
-    "---\nWrite a reply to the guest. Answer based on all context above. Do not confirm dates unless calendar info above confirms it."
-)
-
-
-    # --- Improved AI prompt with thread context ---
+    # --- Final AI prompt ---
     ai_prompt = (
         f"Here is the most recent message thread with a guest (newest last):\n"
         f"{context_str}\n\n"
@@ -194,12 +176,13 @@ ai_prompt = (
         f"Property details:\n{property_str}\n"
         f"Reservation Info:\n{json.dumps(res)}\n"
         f"Cancellation: {cancellation}\n"
-        "---\nWrite a clear, modern, friendly, concise reply to the most recent guest message."
+        f"Calendar Info: {calendar_summary}\n"
+        "---\nWrite a clear, modern, friendly, concise reply to the most recent guest message. "
+        "If the guest asks about extending or date availability, answer ONLY if the calendar info above confirms it's possible."
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
-    # --- Button/meta block only contains IDs! ---
     button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
