@@ -4,9 +4,8 @@ import logging
 import sqlite3
 import json
 import time
-from datetime import datetime
-from difflib import get_close_matches
 from datetime import datetime, timedelta
+from difflib import get_close_matches
 
 # --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
@@ -25,7 +24,6 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 # --- HOSTAWAY TOKEN CACHE ---
 _HOSTAWAY_TOKEN_CACHE = {"access_token": None, "expires_at": 0}
 
-from datetime import datetime, timedelta
 
 def fetch_hostaway_calendar(listing_id, start_date, end_date):
     token = get_hostaway_access_token()
@@ -35,31 +33,47 @@ def fetch_hostaway_calendar(listing_id, start_date, end_date):
     try:
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
-        return r.json()
+        calendar_data = r.json()
+        logging.info(f"[fetch_hostaway_calendar] Response type: {type(calendar_data)}; Sample: {str(calendar_data)[:300]}")
+        return calendar_data
     except Exception as e:
         logging.error(f"❌ Fetch calendar error: {e}")
         return None
 
 def is_date_available(calendar_json, date_str):
-    # Accept either dict or list at root
-    days = []
+    """
+    Returns True if the specified date is available in the calendar_json.
+    Handles both list and dict root structures.
+    """
+    if calendar_json is None:
+        logging.error("[is_date_available] calendar_json is None")
+        return False
     if isinstance(calendar_json, dict):
         days = calendar_json.get("result", {}).get("calendar", [])
     elif isinstance(calendar_json, list):
         days = calendar_json
+    else:
+        logging.error(f"[is_date_available] Unexpected calendar_json: {type(calendar_json)} | Value: {calendar_json}")
+        return False
     for day in days:
         if day.get("date") == date_str:
+            # Prefer 'isAvailable' if present, else fallback to 'status'
             if "isAvailable" in day:
-                return day["isAvailable"]
+                return bool(day["isAvailable"])
             return day.get("status", "") == "available"
     return False  # If date not found, assume not available
 
 def next_available_dates(calendar_json, days_wanted=5):
-    days = []
+    if calendar_json is None:
+        logging.error("[next_available_dates] calendar_json is None")
+        return []
     if isinstance(calendar_json, dict):
         days = calendar_json.get("result", {}).get("calendar", [])
     elif isinstance(calendar_json, list):
         days = calendar_json
+    else:
+        logging.error(f"[next_available_dates] Unexpected calendar_json: {type(calendar_json)} | Value: {calendar_json}")
+        return []
     available = []
     for day in days:
         if ("isAvailable" in day and day["isAvailable"]) or (day.get("status", "") == "available"):
@@ -142,7 +156,7 @@ def fetch_hostaway_conversation(conversation_id):
         r.raise_for_status()
         logging.info(f"✅ Conversation {conversation_id} fetched with messages.")
         resp_json = r.json()
-        logging.info(f"[DEBUG] Full conversation object: {json.dumps(resp_json, indent=2)}")
+        logging.info(f"[DEBUG] Full conversation object: {json.dumps(resp_json, indent=2)[:1000]}")
         return resp_json
     except Exception as e:
         logging.error(f"❌ Fetch conversation error: {e}")
