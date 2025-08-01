@@ -409,3 +409,41 @@ def retrieve_learned_answer(guest_message, listing_id, guest_id=None, cutoff=0.8
     except Exception as e:
         logging.error(f"❌ Retrieval error: {e}")
         return None
+
+def get_listing_amenities(listing_id):
+    """
+    Returns a list of amenity names for a given Hostaway listing.
+    Returns [] on error or if no amenities.
+    """
+    from . import get_hostaway_access_token, fetch_hostaway_listing  # adjust import if not in utils.py
+
+    # 1. Fetch the listing to get amenities IDs
+    listing = fetch_hostaway_listing(listing_id)
+    if not listing or "result" not in listing:
+        logging.error(f"[AMENITY] Failed to fetch listing {listing_id}")
+        return []
+    amenities_ids = listing["result"].get("amenities", [])
+    if not isinstance(amenities_ids, list):
+        logging.warning(f"[AMENITY] Amenities in listing {listing_id} not a list: {amenities_ids}")
+        return []
+
+    # 2. Fetch all available amenities from Hostaway
+    token = get_hostaway_access_token()
+    if not token:
+        logging.error("[AMENITY] No Hostaway API token")
+        return []
+    try:
+        url = "https://api.hostaway.com/v1/amenities"
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        amenities_list = resp.json()
+    except Exception as e:
+        logging.error(f"[AMENITY] Fetch error: {e}")
+        return []
+
+    # 3. Map amenity IDs to names
+    id_to_name = {int(a["id"]): a["name"] for a in amenities_list if "id" in a and "name" in a}
+    amenity_names = [id_to_name.get(int(aid), f"ID:{aid}") for aid in amenities_ids if isinstance(aid, int) or str(aid).isdigit()]
+
+    return amenity_names
