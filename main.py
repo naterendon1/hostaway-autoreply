@@ -171,35 +171,35 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
     # --- Button/meta block only contains IDs! ---
-    button_meta_minimal = {
-        "conv_id": conv_id,
-        "listing_id": listing_id,
-        "guest_id": guest_id,
-        "type": communication_type,
-        "guest_name": guest_name,
-        "guest_message": guest_msg,
-        "ai_suggestion": ai_reply,
-        "channel": slack_channel,    # <--- new!
-        "ts": slack_ts,              # <--- new!
-}
+    # ... (everything up to ai_reply is the same)
 
-
-    blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
-        {
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
-                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
-                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
-            ]
-        }
-    ]
-
-    from slack_sdk import WebClient
+from slack_sdk import WebClient
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
+
+# First, post the message (without channel/ts in button meta yet)
+prelim_button_meta = {
+    "conv_id": conv_id,
+    "listing_id": listing_id,
+    "guest_id": guest_id,
+    "type": communication_type,
+    "guest_name": guest_name,
+    "guest_message": guest_msg,
+    "ai_suggestion": ai_reply,
+    # don't include channel/ts yet
+}
+blocks = [
+    {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
+    {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+    {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+    {
+        "type": "actions",
+        "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**prelim_button_meta, "action": "send"}), "action_id": "send"},
+            {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**prelim_button_meta, "action": "edit"}), "action_id": "edit"},
+            {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**prelim_button_meta, "action": "write_own"}), "action_id": "write_own"}
+        ]
+    }
+]
 slack_ts = None
 slack_channel_id = None
 try:
@@ -213,7 +213,7 @@ try:
 except Exception as e:
     logging.error(f"❌ Slack send error: {e}")
 
-# Now build the button meta *after* getting channel/ts
+# Optionally, update the message with channel/ts in the button meta:
 button_meta_minimal = {
     "conv_id": conv_id,
     "listing_id": listing_id,
@@ -225,7 +225,6 @@ button_meta_minimal = {
     "channel": slack_channel_id,
     "ts": slack_ts,
 }
-# Now (re)build your blocks with this updated button_meta_minimal
 blocks = [
     {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
     {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
@@ -239,11 +238,16 @@ blocks = [
         ]
     }
 ]
-# (Optionally, if you want, update the Slack message with new blocks here - but not required unless you need to "refresh" the buttons)
+if slack_ts and slack_channel_id:
+    try:
+        slack_client.chat_update(
+            channel=slack_channel_id,
+            ts=slack_ts,
+            blocks=blocks,
+            text="New message from guest"
+        )
+    except Exception as e:
+        logging.error(f"❌ Slack update error: {e}")
 
 return {"status": "ok"}
 
-
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
