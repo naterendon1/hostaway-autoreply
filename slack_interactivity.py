@@ -45,13 +45,11 @@ async def slack_actions(request: Request):
             return json.loads(action["value"]) if "value" in action else {}
 
         # --- SEND ---
-                # --- SEND ---
         if action_id == "send":
             meta = get_meta_from_action(action)
             reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
-            # ADD: get channel and ts if present
             channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
             ts = meta.get("ts") or payload.get("message", {}).get("ts")
 
@@ -64,25 +62,25 @@ async def slack_actions(request: Request):
                 logging.error(f"Slack SEND error: {e}")
                 success = False
 
-            # --- Update the Slack message block to "Sent!" ---
+            # --- Update the Slack message, replacing the buttons with "Reply sent" ---
             if ts and channel:
-                sent_blocks = [
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{clean_ai_reply(reply)}"}
-                    },
-                    {
-                        "type": "context",
-                        "elements": [
-                            {"type": "mrkdwn", "text": ":white_check_mark: *Reply sent to guest!*" if success else ":x: *Failed to send reply.*"}
-                        ]
+                # Get the original message blocks
+                original_blocks = payload.get("message", {}).get("blocks", [])
+                # Remove the actions block(s)
+                new_blocks = [block for block in original_blocks if block.get("type") != "actions"]
+                # Add a confirmation section at the end
+                new_blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": ":white_check_mark: *Reply sent to guest!*" if success else ":x: *Failed to send reply.*"
                     }
-                ]
+                })
                 try:
                     slack_client.chat_update(
                         channel=channel,
                         ts=ts,
-                        blocks=sent_blocks,
+                        blocks=new_blocks,
                         text="Reply sent to guest!" if success else "Failed to send reply."
                     )
                 except Exception as e:
