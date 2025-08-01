@@ -179,7 +179,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "guest_name": guest_name,
         "guest_message": guest_msg,
         "ai_suggestion": ai_reply,
-    }
+        "channel": slack_channel,    # <--- new!
+        "ts": slack_ts,              # <--- new!
+}
+
 
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
@@ -198,11 +201,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     from slack_sdk import WebClient
     slack_client = WebClient(token=SLACK_BOT_TOKEN)
     try:
-        slack_client.chat_postMessage(
-            channel=SLACK_CHANNEL,
-            blocks=blocks,
-            text="New message from guest"
-        )
+        slack_resp = slack_client.chat_postMessage(
+    channel=SLACK_CHANNEL,
+    blocks=blocks,
+    text="New message from guest"
+)
+slack_ts = slack_resp["ts"]
+slack_channel = slack_resp["channel"]
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
 
