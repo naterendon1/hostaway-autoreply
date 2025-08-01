@@ -45,18 +45,49 @@ async def slack_actions(request: Request):
             return json.loads(action["value"]) if "value" in action else {}
 
         # --- SEND ---
+                # --- SEND ---
         if action_id == "send":
             meta = get_meta_from_action(action)
             reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
+            # ADD: get channel and ts if present
+            channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
+            ts = meta.get("ts") or payload.get("message", {}).get("ts")
+
             if not reply or not conv_id:
                 return JSONResponse({"text": "Missing reply or conversation ID."})
+
             try:
                 success = send_reply_to_hostaway(conv_id, reply, communication_type)
             except Exception as e:
                 logging.error(f"Slack SEND error: {e}")
-                return JSONResponse({"text": "Slack send failed."})
+                success = False
+
+            # --- Update the Slack message block to "Sent!" ---
+            if ts and channel:
+                sent_blocks = [
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{clean_ai_reply(reply)}"}
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {"type": "mrkdwn", "text": ":white_check_mark: *Reply sent to guest!*" if success else ":x: *Failed to send reply.*"}
+                        ]
+                    }
+                ]
+                try:
+                    slack_client.chat_update(
+                        channel=channel,
+                        ts=ts,
+                        blocks=sent_blocks,
+                        text="Reply sent to guest!" if success else "Failed to send reply."
+                    )
+                except Exception as e:
+                    logging.error(f"Slack chat_update error: {e}")
+
             return JSONResponse({"text": "Reply sent to guest!" if success else "Failed to send reply to guest."})
 
         # --- WRITE OWN ---
