@@ -199,19 +199,50 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     ]
 
     from slack_sdk import WebClient
-    slack_client = WebClient(token=SLACK_BOT_TOKEN)
-    try:
-        slack_resp = slack_client.chat_postMessage(
-    channel=SLACK_CHANNEL,
-    blocks=blocks,
-    text="New message from guest"
-)
-slack_ts = slack_resp["ts"]
-slack_channel = slack_resp["channel"]
-    except Exception as e:
-        logging.error(f"❌ Slack send error: {e}")
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+slack_ts = None
+slack_channel_id = None
+try:
+    resp = slack_client.chat_postMessage(
+        channel=SLACK_CHANNEL,
+        blocks=blocks,
+        text="New message from guest"
+    )
+    slack_ts = resp["ts"]
+    slack_channel_id = resp["channel"]
+except Exception as e:
+    logging.error(f"❌ Slack send error: {e}")
 
-    return {"status": "ok"}
+# Now build the button meta *after* getting channel/ts
+button_meta_minimal = {
+    "conv_id": conv_id,
+    "listing_id": listing_id,
+    "guest_id": guest_id,
+    "type": communication_type,
+    "guest_name": guest_name,
+    "guest_message": guest_msg,
+    "ai_suggestion": ai_reply,
+    "channel": slack_channel_id,
+    "ts": slack_ts,
+}
+# Now (re)build your blocks with this updated button_meta_minimal
+blocks = [
+    {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
+    {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+    {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+    {
+        "type": "actions",
+        "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
+            {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
+            {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
+        ]
+    }
+]
+# (Optionally, if you want, update the Slack message with new blocks here - but not required unless you need to "refresh" the buttons)
+
+return {"status": "ok"}
+
 
 @app.get("/ping")
 def ping():
