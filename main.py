@@ -18,8 +18,6 @@ from utils import (
     next_available_dates,
 )
 
-from slack_sdk import WebClient
-
 logging.basicConfig(level=logging.INFO)
 
 REQUIRED_ENV_VARS = [
@@ -54,14 +52,17 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
+### --------- AI SYSTEM PROMPT: HUMAN, HELPFUL, USE CONTEXT, LEARN ---------
 SYSTEM_PROMPT_ANSWER = (
-    "You are a helpful, friendly vacation rental host. "
-    "Reply as if texting a peer—modern, clear, and informal, but professional and make the messages make sense. "
-    "Avoid emojis and any generic cheerful sign-offs or pleasantries (like 'Enjoy!' or 'Happy brewing!'). "
-    "Only answer the guest’s actual question, and be concise (preferably under 200 characters unless necessary). "
-    "Mention property details only if they directly answer the question. "
-    "Never say you're checking or following up unless the guest asks for something unknown. "
-    "If the guest asks about dates or availability, check the live calendar info provided below and only confirm what is available."
+    "You are a smart, friendly human host for a vacation rental property. "
+    "Respond as if you’re texting a guest you want to welcome back: clear, warm, and relaxed—but always accurate. "
+    "Never sound robotic. Use natural, casual language. "
+    "If the guest asks something about the house, always use any info available from amenities, house rules, calendar, or learning examples. "
+    "If you’re not sure, say so, or ask for clarification, instead of guessing. "
+    "Never restate the guest’s question. Don’t use emojis. "
+    "Use the provided message thread (with roles labeled), reservation details, listing info, and any previous similar questions+answers to help construct the best possible reply. "
+    "If a previous reply exists for a similar question, adapt and reuse as context—but ensure accuracy for THIS guest and THIS reservation. "
+    "Keep answers under 240 characters unless more detail is needed."
 )
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
@@ -112,7 +113,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Fetch message thread for full context ---
+    # --- Fetch message thread for context ---
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
@@ -126,10 +127,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         conversation_context.append(f"{sender}: {body}")
     context_str = "\n".join(conversation_context)
 
+    # --- Surface learned answers if available ---
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
     prev_answer = ""
     if prev_examples and prev_examples[0][2]:
-        prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
+        prev_answer = (
+            f"Reference answer to a similar question in the past:\n\"{prev_examples[0][2]}\"\n"
+            f"Use it as context, but ensure accuracy for this guest.\n"
+        )
 
     cancellation = get_cancellation_policy_summary({}, res)
 
@@ -161,37 +166,31 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             calendar_summary = "Unable to retrieve calendar data for the requested dates."
     # ----------------------------------------------------------
 
+    # --- Amenities summary for AI (optional: if you have get_listing_amenities in utils) ---
+    try:
+        from utils import get_listing_amenities
+        amenities = get_listing_amenities(listing_id)
+        amenities_str = f"Amenities: {', '.join(amenities)}" if amenities else ""
+    except Exception:
+        amenities_str = ""
+
+    # -------------- AI PROMPT --------------
     ai_prompt = (
-        f"Here is the most recent message thread with a guest (newest last):\n"
+        f"Recent conversation (last 10 messages, newest last):\n"
         f"{context_str}\n\n"
         f"{prev_answer}"
-        f"Reservation Info:\n{json.dumps(res)}\n"
+        f"Reservation:\n{json.dumps(res)}\n"
         f"Cancellation: {cancellation}\n"
-        f"Calendar Info: {calendar_summary}\n"
-        "---\nWrite a clear, modern, friendly, concise reply to the most recent guest message. If calendar info above is available, use it for accuracy."
+        f"Calendar: {calendar_summary}\n"
+        f"{amenities_str}\n"
+        "---\n"
+        "Write the best possible reply for the latest guest message, using everything above as context. "
+        "Sound human, friendly, clear, and helpful."
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
-    slack_client = WebClient(token=SLACK_BOT_TOKEN)
-    slack_ts = None
-    slack_channel_id = None
-    try:
-        # 1. Send message to Slack and get ts/channel (post placeholder, so we get metadata)
-        resp = slack_client.chat_postMessage(
-            channel=SLACK_CHANNEL,
-            blocks=[
-                {"type": "section", "text": {"type": "mrkdwn", "text": "Loading..."}}
-            ],
-            text="New message from guest"
-        )
-        slack_ts = resp["ts"]
-        slack_channel_id = resp["channel"]
-    except Exception as e:
-        logging.error(f"❌ Slack send error: {e}")
-        return {"status": "error"}
-
-    # 2. Now build your meta WITH the channel/ts and real blocks
+    # --- Button/meta block only contains IDs! ---
     button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -200,8 +199,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "guest_name": guest_name,
         "guest_message": guest_msg,
         "ai_suggestion": ai_reply,
-        "channel": slack_channel_id,
-        "ts": slack_ts,
     }
 
     blocks = [
@@ -218,19 +215,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         }
     ]
 
-    # 3. Update the Slack message with the real blocks
+    from slack_sdk import WebClient
+    slack_client = WebClient(token=SLACK_BOT_TOKEN)
     try:
-        slack_client.chat_update(
-            channel=slack_channel_id,
-            ts=slack_ts,
+        slack_client.chat_postMessage(
+            channel=SLACK_CHANNEL,
             blocks=blocks,
             text="New message from guest"
         )
     except Exception as e:
-        logging.error(f"❌ Slack update error: {e}")
+        logging.error(f"❌ Slack send error: {e}")
 
     return {"status": "ok"}
-
 
 @app.get("/ping")
 def ping():
