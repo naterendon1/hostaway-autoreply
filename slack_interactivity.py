@@ -22,6 +22,55 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+def get_modal_blocks(guest_name, guest_msg, action_id, ai_suggestion=""):
+    """Shared blocks for both write_own and edit modals, with checkbox"""
+    reply_block = {
+        "type": "input",
+        "block_id": "reply_input",
+        "label": {"type": "plain_text", "text": "Your reply:" if action_id == "write_own" else "Edit below:", "emoji": True},
+        "element": {
+            "type": "plain_text_input",
+            "action_id": "reply",
+            "multiline": True,
+        }
+    }
+    if action_id == "edit":
+        reply_block["element"]["initial_value"] = ai_suggestion
+
+    return [
+        {
+            "type": "section",
+            "block_id": "guest_message_section",
+            "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}
+        },
+        reply_block,
+        {
+            "type": "actions",
+            "block_id": "improve_ai_block",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "improve_with_ai",
+                    "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}
+                }
+            ]
+        },
+        {
+            "type": "input",
+            "block_id": "save_answer_block",
+            "element": {
+                "type": "checkboxes",
+                "action_id": "save_answer",
+                "options": [{
+                    "text": {"type": "plain_text", "text": "Save this answer for next time", "emoji": True},
+                    "value": "save"
+                }]
+            },
+            "label": {"type": "plain_text", "text": "Learning", "emoji": True},
+            "optional": True
+        }
+    ]
+
 @router.post("/slack/actions")
 async def slack_actions(request: Request):
     logging.info("🎯 /slack/actions endpoint hit!")
@@ -64,11 +113,8 @@ async def slack_actions(request: Request):
 
             # --- Update the Slack message, replacing the buttons with "Reply sent" ---
             if ts and channel:
-                # Get the original message blocks
                 original_blocks = payload.get("message", {}).get("blocks", [])
-                # Remove the actions block(s)
                 new_blocks = [block for block in original_blocks if block.get("type") != "actions"]
-                # Add a confirmation section at the end
                 new_blocks.append({
                     "type": "section",
                     "text": {
@@ -99,34 +145,7 @@ async def slack_actions(request: Request):
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": json.dumps(meta),
-                "blocks": [
-                    {
-                        "type": "section",
-                        "block_id": "guest_message_section",
-                        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "reply_input",
-                        "label": {"type": "plain_text", "text": "Your reply:", "emoji": True},
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "reply",
-                            "multiline": True
-                        }
-                    },
-                    {
-                        "type": "actions",
-                        "block_id": "improve_ai_block",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "action_id": "improve_with_ai",
-                                "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}
-                            }
-                        ]
-                    }
-                ]
+                "blocks": get_modal_blocks(guest_name, guest_msg, action_id="write_own")
             }
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
@@ -143,37 +162,8 @@ async def slack_actions(request: Request):
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": json.dumps(meta),
-                "blocks": [
-                    {
-                        "type": "section",
-                        "block_id": "guest_message_section",
-                        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "reply_input",
-                        "label": {"type": "plain_text", "text": "Edit below:", "emoji": True},
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "reply",
-                            "multiline": True,
-                            "initial_value": ai_suggestion
-                        }
-                    },
-                    {
-                        "type": "actions",
-                        "block_id": "improve_ai_block",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "action_id": "improve_with_ai",
-                                "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}
-                            }
-                        ]
-                    }
-                ]
+                "blocks": get_modal_blocks(guest_name, guest_msg, action_id="edit", ai_suggestion=ai_suggestion)
             }
-            # Use views_push if already in a modal, else views_open
             container = payload.get("container", {})
             try:
                 if container.get("type") == "message":
@@ -217,50 +207,24 @@ async def slack_actions(request: Request):
                 logging.error(f"OpenAI error in 'improve_with_ai': {e}")
                 improved = "(Error generating improved message.)"
 
+            # Re-open modal with improved text, keep checkbox state if possible
+            prev_checkbox = []
+            state_save = state.get("save_answer_block", {})
+            if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
+                prev_checkbox = state_save["save_answer"]["selected_options"]
+            new_blocks = get_modal_blocks(guest_name, guest_msg, action_id="edit", ai_suggestion=improved)
+            # Preserve checkbox if previously checked
+            if prev_checkbox:
+                for block in new_blocks:
+                    if block.get("block_id") == "save_answer_block":
+                        block["element"]["initial_options"] = prev_checkbox
             new_modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "AI Improved Reply", "emoji": True},
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": view.get("private_metadata"),
-                "blocks": [
-                    {
-                        "type": "section",
-                        "block_id": "guest_message_section",
-                        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "reply_input",
-                        "label": {"type": "plain_text", "text": "Your improved reply:", "emoji": True},
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "reply",
-                            "multiline": True,
-                            "initial_value": improved
-                        }
-                    },
-                    {
-                        "type": "actions",
-                        "block_id": "improve_ai_block",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "action_id": "improve_with_ai",
-                                "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}
-                            }
-                        ]
-                    },
-                    {
-                        "type": "context",
-                        "elements": [
-                            {
-                                "type": "plain_text",
-                                "text": f"Last AI improvement: {datetime.datetime.now().isoformat()}"
-                            }
-                        ]
-                    }
-                ]
+                "blocks": new_blocks
             }
 
             try:
@@ -276,14 +240,31 @@ async def slack_actions(request: Request):
         state = view.get("state", {}).get("values", {})
         meta = json.loads(view.get("private_metadata", "{}"))
 
-        if "reply_input" in state:
-            reply_text = next(iter(state["reply_input"].values())).get("value")
-            conv_id = meta.get("conv_id") or meta.get("conversation_id")
-            communication_type = meta.get("type", "email")
-            try:
-                send_reply_to_hostaway(conv_id, reply_text, communication_type)
-            except Exception as e:
-                logging.error(f"Slack regular send error: {e}")
-            return JSONResponse({"response_action": "clear"})
+        # Get reply text
+        reply_text = None
+        for block in state.values():
+            if "reply" in block:
+                reply_text = block["reply"]["value"]
+
+        # Get checkbox state
+        save_for_next_time = False
+        for block in state.values():
+            if "save_answer" in block and block["save_answer"].get("selected_options"):
+                save_for_next_time = True
+
+        conv_id = meta.get("conv_id") or meta.get("conversation_id")
+        communication_type = meta.get("type", "email")
+        guest_message = meta.get("guest_message", "")
+        ai_suggestion = meta.get("ai_suggestion", "")
+
+        try:
+            send_reply_to_hostaway(conv_id, reply_text, communication_type)
+            if save_for_next_time:
+                listing_id = meta.get("listing_id")
+                guest_id = meta.get("guest_id")
+                store_learning_example(guest_message, ai_suggestion, reply_text, listing_id, guest_id)
+        except Exception as e:
+            logging.error(f"Slack regular send error: {e}")
+        return JSONResponse({"response_action": "clear"})
 
     return JSONResponse({"status": "ok"})
