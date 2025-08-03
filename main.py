@@ -53,16 +53,15 @@ class HostawayUnifiedWebhook(BaseModel):
     date: str = None
 
 SYSTEM_PROMPT_ANSWER = (
-    "You are a helpful, *human-like* vacation rental host. "
-    "Reply to guests in a warm, friendly, millenial, and *natural text message* tone. "
-    "Be brief—avoid greetings or sign-offs unless truly needed. "
-    "Don’t say 'Hello [name]' or 'Thank you for your understanding' unless context demands. "
-    "Never break lines or add unnecessary whitespace. "
-    "Reply as if texting from your phone: straight to the point, modern, and approachable. "
-    "Use only the facts provided (reservation, calendar, amenities, etc). "
-    "Do not make promises or apologies unless truly necessary. "
-    "Your reply will be sent *directly* to the guest, as-is. "
-    "Do not add a name, sign-off, or closing. No emojis."
+    "You are a helpful, human, and context-aware vacation rental host. "
+    "Reply to the guest in a friendly, concise text message, as if you were texting from your phone. "
+    "Do NOT repeat what the guest just said or already confirmed—only reply with new, helpful info if needed. "
+    "If the guest already gave the answer, simply acknowledge or skip a reply unless clarification is needed. "
+    "Do NOT add greetings or sign-offs. "
+    "Always use the prior conversation (thread), reservation info, and calendar. "
+    "Don’t invent facts. "
+    "If the guest confirms something, you can just say 'Great, thanks for confirming!' or say nothing if no reply is needed. "
+    "Replies are sent to the guest as-is. No emojis."
 )
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
@@ -164,16 +163,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # --- AI PROMPT CONSTRUCTION ---
     ai_prompt = (
-        f"Conversation (latest 10):\n"
-        f"{context_str}\n\n"
-        f"{prev_answer}"
-        f"Reservation:\n{json.dumps(res)}\n"
-        f"Cancellation: {cancellation}\n"
-        f"Calendar: {calendar_summary}\n"
-        "---\nWrite a clear, warm, direct, ready-to-send reply for the most recent guest message above. "
-        "Use the calendar data if available. If not available, say so. Do not use placeholders. Do not sign with 'Best,' or '[Your Name]'."
-    )
-
+    f"Here is the conversation thread so far (newest last):\n"
+    f"{context_str}\n"
+    f"Reservation Info:\n{json.dumps(res)}\n"
+    f"Calendar Info: {calendar_summary}\n"
+    "---\n"
+    "Write a brief, human reply to the most recent guest message above, using the full context. "
+    "Do NOT repeat what the guest just said or already confirmed."
+)
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
     # --- SLACK BLOCK CONSTRUCTION ---
