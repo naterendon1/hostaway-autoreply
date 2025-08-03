@@ -52,17 +52,15 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-### --------- AI SYSTEM PROMPT: HUMAN, HELPFUL, USE CONTEXT, LEARN ---------
 SYSTEM_PROMPT_ANSWER = (
-    "You are a smart, friendly human host for a vacation rental property. "
-    "Respond as if you’re texting a guest you want to welcome back: clear, warm, and relaxed—but always accurate. "
-    "Never sound robotic. Use natural, casual language. "
-    "If the guest asks something about the house, always use any info available from amenities, house rules, calendar, or learning examples. "
-    "If you’re not sure, say so, or ask for clarification, instead of guessing. "
-    "Never restate the guest’s question. Don’t use emojis. "
-    "Use the provided message thread (with roles labeled), reservation details, listing info, and any previous similar questions+answers to help construct the best possible reply. "
-    "If a previous reply exists for a similar question, adapt and reuse as context—but ensure accuracy for THIS guest and THIS reservation. "
-    "Keep answers under 240 characters unless more detail is needed."
+    "You are a real vacation rental host. Use the data provided below. "
+    "If calendar info is available, always use it to answer any availability/date questions. "
+    "If dates are unavailable, say so directly. "
+    "Do NOT invent details or say you'll check or follow up unless the guest specifically asks. "
+    "NEVER sign with a placeholder or 'Best, [Your Name]'. "
+    "Never restate the guest's message. "
+    "Be warm, helpful, and direct. If you do not know the answer, say so plainly: 'I don’t have that info right now.' "
+    "Your reply should be ready to send, with no placeholders or unnecessary sign-offs."
 )
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
@@ -113,7 +111,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Fetch message thread for context ---
+    # --- Fetch message thread for full context ---
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
@@ -127,22 +125,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         conversation_context.append(f"{sender}: {body}")
     context_str = "\n".join(conversation_context)
 
-    # --- Surface learned answers if available ---
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
     prev_answer = ""
     if prev_examples and prev_examples[0][2]:
-        prev_answer = (
-            f"Reference answer to a similar question in the past:\n\"{prev_examples[0][2]}\"\n"
-            f"Use it as context, but ensure accuracy for this guest.\n"
-        )
+        prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
 
     cancellation = get_cancellation_policy_summary({}, res)
 
-    # -------------- CALENDAR INTENT & LIVE CHECK --------------
+    # --- CALENDAR INTENT & LIVE CHECK ---
     calendar_keywords = [
         "available", "availability", "book", "open", "stay", "dates", "night", "reserve", "weekend",
         "extend", "extra night", "holiday", "christmas", "spring break", "july", "august", "september", "october",
-        "november", "december", "january", "february", "march", "april", "may", "june"
+        "november", "december", "january", "february", "march", "april", "may", "june", "thanksgiving"
     ]
     should_check_calendar = any(word in guest_msg.lower() for word in calendar_keywords)
     calendar_summary = ""
@@ -155,42 +149,32 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             unavailable_days = [d["date"] for d in calendar_days if not (("isAvailable" in d and d["isAvailable"]) or (d.get("status") == "available"))]
             if available_days:
                 calendar_summary = (
-                    f"Calendar checked for {start_date} to {end_date}. "
-                    f"Available nights: {', '.join(available_days)}."
+                    f"For {start_date} to {end_date}: Available nights: {', '.join(available_days)}."
                 )
                 if unavailable_days:
                     calendar_summary += f" Unavailable: {', '.join(unavailable_days)}."
             else:
                 calendar_summary = f"No available nights between {start_date} and {end_date}."
         else:
-            calendar_summary = "Unable to retrieve calendar data for the requested dates."
-    # ----------------------------------------------------------
+            calendar_summary = "Calendar data not available for these dates."
+    else:
+        calendar_summary = "No calendar check for this inquiry."
 
-    # --- Amenities summary for AI (optional: if you have get_listing_amenities in utils) ---
-    try:
-        from utils import get_listing_amenities
-        amenities = get_listing_amenities(listing_id)
-        amenities_str = f"Amenities: {', '.join(amenities)}" if amenities else ""
-    except Exception:
-        amenities_str = ""
-
-    # -------------- AI PROMPT --------------
+    # --- AI PROMPT CONSTRUCTION ---
     ai_prompt = (
-        f"Recent conversation (last 10 messages, newest last):\n"
+        f"Conversation (latest 10):\n"
         f"{context_str}\n\n"
         f"{prev_answer}"
         f"Reservation:\n{json.dumps(res)}\n"
         f"Cancellation: {cancellation}\n"
         f"Calendar: {calendar_summary}\n"
-        f"{amenities_str}\n"
-        "---\n"
-        "Write the best possible reply for the latest guest message, using everything above as context. "
-        "Sound human, friendly, clear, and helpful."
+        "---\nWrite a clear, warm, direct, ready-to-send reply for the most recent guest message above. "
+        "Use the calendar data if available. If not available, say so. Do not use placeholders. Do not sign with 'Best,' or '[Your Name]'."
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
-    # --- Button/meta block only contains IDs! ---
+    # --- SLACK BLOCK CONSTRUCTION ---
     button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -231,3 +215,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
+# Stronger clean_ai_reply to forcibly strip sign-offs
+def clean_ai_reply(reply: str):
+    reply = reply.strip()
+    for bad in ["Best,", "Best regards,", "[Your Name]", "Sincerely,", "Thanks!", "Thank you!", "All the best,", "Cheers,", "Kind regards,", "—", "--"]:
+        reply = reply.replace(bad, "")
+    reply = reply.replace("  ", " ").replace("..", ".").strip()
+    # Truncate accidental long endings
+    if "[your name]" in reply.lower():
+        reply = reply[:reply.lower().find("[your name]")]
+    # Remove extra trailing periods or whitespace
+    reply = reply.rstrip(". ").strip()
+    return reply
+
