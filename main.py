@@ -53,14 +53,16 @@ class HostawayUnifiedWebhook(BaseModel):
     date: str = None
 
 SYSTEM_PROMPT_ANSWER = (
-    "You are a real vacation rental host. Use the data provided below. "
-    "If calendar info is available, always use it to answer any availability/date questions. "
-    "If dates are unavailable, say so directly. "
-    "Do NOT invent details or say you'll check or follow up unless the guest specifically asks. "
-    "NEVER sign with a placeholder or 'Best, [Your Name]'. "
-    "Never restate the guest's message. "
-    "Be warm, helpful, and direct. If you do not know the answer, say so plainly: 'I don’t have that info right now.' "
-    "Your reply should be ready to send, with no placeholders or unnecessary sign-offs."
+    "You are a helpful, *human-like* vacation rental host. "
+    "Reply to guests in a warm, friendly, and *natural text message* tone. "
+    "Be brief—avoid greetings or sign-offs unless truly needed. "
+    "Don’t say 'Hello [name]' or 'Thank you for your understanding' unless context demands. "
+    "Never break lines or add unnecessary whitespace. "
+    "Reply as if texting from your phone: straight to the point, modern, and approachable. "
+    "Use only the facts provided (reservation, calendar, amenities, etc). "
+    "Do not make promises or apologies unless truly necessary. "
+    "Your reply will be sent *directly* to the guest, as-is. "
+    "Do not add a name, sign-off, or closing. No emojis."
 )
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
@@ -77,7 +79,7 @@ def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
         return "(Error generating reply.)"
-
+        
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
