@@ -80,10 +80,13 @@ def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
         return "(Error generating reply.)"
         
 @app.post("/unified-webhook")
+guest_msg = payload.data.get("body", "")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
     if payload.event != "message.received" or payload.object != "conversationMessage":
         return {"status": "ignored"}
+        detected_intent = detect_intent(guest_msg)
+    logging.info(f"[INTENT] Detected message intent: {detected_intent}")
 
     guest_msg = payload.data.get("body", "")
     conv_id = payload.data.get("conversationId")
