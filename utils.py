@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta
 from difflib import get_close_matches
 import re
+from openai import OpenAI
 
 # --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
@@ -21,6 +22,9 @@ HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = os.getenv("HOSTAWAY_API_BASE", "https://api.hostaway.com/v1")
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- HOSTAWAY TOKEN CACHE ---
 _HOSTAWAY_TOKEN_CACHE = {"access_token": None, "expires_at": 0}
@@ -58,7 +62,6 @@ def fetch_hostaway_calendar(listing_id, start_date, end_date):
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
         data = r.json()
-        # Defensive: Sometimes Hostaway gives a list, sometimes dict with 'result' key
         if isinstance(data, dict) and "result" in data and isinstance(data["result"], list):
             return data["result"]
         elif isinstance(data, dict) and "result" in data and isinstance(data["result"], dict):
@@ -88,13 +91,7 @@ def next_available_dates(calendar_days, days_wanted=5):
                 break
     return available
 
-# --- NEW: Extract date ranges or calendar intent from guest messages ---
 def extract_date_range_from_message(message, reservation=None):
-    """
-    Attempts to extract a date range from a guest message.
-    Returns (start_date, end_date) as YYYY-MM-DD or (None, None) if not found.
-    """
-    # MM/DD/YYYY - MM/DD/YYYY or Month D - Month D
     date_patterns = [
         r'(\d{1,2}/\d{1,2}/\d{4})\s*(?:to|-|through|until)\s*(\d{1,2}/\d{1,2}/\d{4})',
         r'([A-Za-z]+ \d{1,2})\s*(?:to|-|through|until)\s*([A-Za-z]+ \d{1,2})',
@@ -106,7 +103,6 @@ def extract_date_range_from_message(message, reservation=None):
         if m:
             try:
                 start, end = m.group(1), m.group(2)
-                # Try parsing with/without year
                 try:
                     start_date = datetime.strptime(start, "%m/%d/%Y")
                     end_date = datetime.strptime(end, "%m/%d/%Y")
@@ -118,10 +114,17 @@ def extract_date_range_from_message(message, reservation=None):
                 return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
             except Exception:
                 continue
-    # Holidays (simple)
+    # Holidays (simple, can expand)
     if "christmas" in msg or "xmas" in msg:
         year = datetime.now().year
         return f"{year}-12-20", f"{year}-12-27"
+    if "thanksgiving" in msg:
+        # Thanksgiving: 4th Thursday of November
+        year = datetime.now().year
+        november = datetime(year, 11, 1)
+        thursdays = [november + timedelta(days=i) for i in range(31) if (november + timedelta(days=i)).weekday() == 3 and (november + timedelta(days=i)).month == 11]
+        thanksgiving = thursdays[3]
+        return thanksgiving.strftime("%Y-%m-%d"), (thanksgiving + timedelta(days=3)).strftime("%Y-%m-%d")
     if "new year" in msg:
         year = datetime.now().year
         return f"{year}-12-28", f"{year+1}-01-03"
@@ -130,7 +133,7 @@ def extract_date_range_from_message(message, reservation=None):
         return f"{year}-03-10", f"{year}-03-20"
     if "next weekend" in msg:
         today = datetime.now()
-        days_ahead = 5 - today.weekday()  # Next Saturday
+        days_ahead = 5 - today.weekday()
         if days_ahead <= 0: days_ahead += 7
         start = today + timedelta(days=days_ahead)
         end = start + timedelta(days=2)
@@ -144,35 +147,6 @@ def extract_date_range_from_message(message, reservation=None):
     today = datetime.now().strftime("%Y-%m-%d")
     week = (datetime.now() + timedelta(days=13)).strftime("%Y-%m-%d")
     return today, week
-
-# --- Rest of your utils (fetch_hostaway_listing, fetch_hostaway_reservation, etc.) unchanged ---
-# ... (keep your existing code here)
-
-
-def get_hostaway_access_token() -> str:
-    global _HOSTAWAY_TOKEN_CACHE
-    now = time.time()
-    if _HOSTAWAY_TOKEN_CACHE["access_token"] and now < _HOSTAWAY_TOKEN_CACHE["expires_at"]:
-        return _HOSTAWAY_TOKEN_CACHE["access_token"]
-
-    url = f"{HOSTAWAY_API_BASE}/accessTokens"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": HOSTAWAY_CLIENT_ID,
-        "client_secret": HOSTAWAY_CLIENT_SECRET,
-        "scope": "general"
-    }
-    try:
-        r = requests.post(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-        r.raise_for_status()
-        resp = r.json()
-        _HOSTAWAY_TOKEN_CACHE["access_token"] = resp.get("access_token")
-        # Hostaway tokens typically last an hour, use 58 mins to be safe
-        _HOSTAWAY_TOKEN_CACHE["expires_at"] = now + 3480
-        return _HOSTAWAY_TOKEN_CACHE["access_token"]
-    except Exception as e:
-        logging.error(f"❌ Token error: {e}")
-        return None
 
 def fetch_hostaway_resource(resource: str, resource_id: int):
     token = get_hostaway_access_token()
@@ -269,24 +243,23 @@ def get_cancellation_policy_summary(listing_result, reservation_result):
     }
     return desc.get(policy, f"Policy: {policy}")
 
-# --- CENTRALIZED AI REPLY CLEANING ---
-from datetime import datetime
-
 def clean_ai_reply(reply: str):
-    # ...all your existing logic here...
     reply = reply.rstrip(",. ")
-    reply = ''.join(c for c in reply if c.isprintable() and (ord(c) < 0x1F300 or ord(c) > 0x1FAD6)) # emoji filter
-
-    # Only allow holiday wishes if it's actually holiday season (December)
+    reply = ''.join(c for c in reply if c.isprintable() and (ord(c) < 0x1F300 or ord(c) > 0x1FAD6))
     lower_reply = reply.lower()
     holiday_terms = ["enjoy your holidays", "merry christmas", "happy holidays", "happy new year"]
     if any(term in lower_reply for term in holiday_terms):
         if datetime.now().month != 12:
-            # Remove those lines/phrases
             for term in holiday_terms:
                 reply = re.sub(term, "", reply, flags=re.IGNORECASE)
             reply = ' '.join(reply.split())
             reply = reply.strip()
+    for bad in ["Best,", "Best regards,", "[Your Name]", "Sincerely,", "Thanks!", "Thank you!", "All the best,", "Cheers,", "Kind regards,", "—", "--"]:
+        reply = reply.replace(bad, "")
+    reply = reply.replace("  ", " ").replace("..", ".").strip()
+    if "[your name]" in reply.lower():
+        reply = reply[:reply.lower().find("[your name]")]
+    reply = reply.rstrip(". ").strip()
     return reply
 
 # --- SQLite Learning Functions ---
@@ -320,7 +293,6 @@ def _init_learning_db():
     except Exception as e:
         logging.error(f"❌ DB init error: {e}")
 
-# Initialize DB only once at import
 _init_learning_db()
 
 def store_learning_example(guest_message, ai_suggestion, user_reply, listing_id, guest_id):
@@ -415,8 +387,6 @@ def get_listing_amenities(listing_id):
     Returns a list of amenity names for a given Hostaway listing.
     Returns [] on error or if no amenities.
     """
-    from . import get_hostaway_access_token, fetch_hostaway_listing  # adjust import if not in utils.py
-
     # 1. Fetch the listing to get amenities IDs
     listing = fetch_hostaway_listing(listing_id)
     if not listing or "result" not in listing:
@@ -448,11 +418,7 @@ def get_listing_amenities(listing_id):
 
     return amenity_names
 
-from openai import OpenAI
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
+# --- Intent Detection ---
 INTENT_LABELS = [
     "booking inquiry",
     "cancellation",
@@ -484,11 +450,10 @@ def detect_intent(message: str) -> str:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=6,
+            max_tokens=10,
             temperature=0
         )
         intent = response.choices[0].message.content.strip().lower()
-        # Fuzzy match to known labels in case of small deviation
         for label in INTENT_LABELS:
             if label in intent:
                 return label
@@ -496,4 +461,3 @@ def detect_intent(message: str) -> str:
     except Exception as e:
         logging.error(f"Intent detection failed: {e}")
         return "other"
-
