@@ -447,3 +447,53 @@ def get_listing_amenities(listing_id):
     amenity_names = [id_to_name.get(int(aid), f"ID:{aid}") for aid in amenities_ids if isinstance(aid, int) or str(aid).isdigit()]
 
     return amenity_names
+
+from openai import OpenAI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+INTENT_LABELS = [
+    "booking inquiry",
+    "cancellation",
+    "general question",
+    "complaint",
+    "extend stay",
+    "amenities",
+    "check-in info",
+    "check-out info",
+    "pricing inquiry",
+    "other"
+]
+
+def detect_intent(message: str) -> str:
+    """
+    Uses OpenAI to classify guest messages into predefined intent categories.
+    """
+    system_prompt = (
+        "You are an intent classification assistant for a vacation rental business. "
+        "Given a guest message, return ONLY the intent label from this list: "
+        f"{', '.join(INTENT_LABELS)}. "
+        "Return just the label, nothing else."
+    )
+    user_prompt = f"Message: {message}"
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=6,
+            temperature=0
+        )
+        intent = response.choices[0].message.content.strip().lower()
+        # Fuzzy match to known labels in case of small deviation
+        for label in INTENT_LABELS:
+            if label in intent:
+                return label
+        return "other"
+    except Exception as e:
+        logging.error(f"Intent detection failed: {e}")
+        return "other"
+
