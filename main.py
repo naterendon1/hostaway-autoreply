@@ -16,6 +16,7 @@ from utils import (
     fetch_hostaway_calendar,
     is_date_available,
     next_available_dates,
+    detect_intent,  # <-- Make sure this is in utils.py as provided earlier
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -78,29 +79,30 @@ def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
         return "(Error generating reply.)"
-        
+
 @app.post("/unified-webhook")
-guest_msg = payload.data.get("body", "")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
     if payload.event != "message.received" or payload.object != "conversationMessage":
         return {"status": "ignored"}
-        detected_intent = detect_intent(guest_msg)
-    logging.info(f"[INTENT] Detected message intent: {detected_intent}")
 
     guest_msg = payload.data.get("body", "")
-    conv_id = payload.data.get("conversationId")
-    reservation_id = payload.data.get("reservationId")
-    listing_id = payload.data.get("listingMapId")
-    guest_id = payload.data.get("userId", "")
-    communication_type = payload.data.get("communicationType", "channel")
-
     if not guest_msg:
         if payload.data.get("attachments"):
             logging.info("📷 Skipping image-only message.")
         else:
             logging.info("🧾 Empty message skipped.")
         return {"status": "ignored"}
+
+    # Intent detection (classification)
+    detected_intent = detect_intent(guest_msg)
+    logging.info(f"[INTENT] Detected message intent: {detected_intent}")
+
+    conv_id = payload.data.get("conversationId")
+    reservation_id = payload.data.get("reservationId")
+    listing_id = payload.data.get("listingMapId")
+    guest_id = payload.data.get("userId", "")
+    communication_type = payload.data.get("communicationType", "channel")
 
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res = reservation.get("result", {})
@@ -166,14 +168,16 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # --- AI PROMPT CONSTRUCTION ---
     ai_prompt = (
-    f"Here is the conversation thread so far (newest last):\n"
-    f"{context_str}\n"
-    f"Reservation Info:\n{json.dumps(res)}\n"
-    f"Calendar Info: {calendar_summary}\n"
-    "---\n"
-    "Write a brief, human reply to the most recent guest message above, using the full context. "
-    "Do NOT repeat what the guest just said or already confirmed."
-)
+        f"Here is the conversation thread so far (newest last):\n"
+        f"{context_str}\n"
+        f"Reservation Info:\n{json.dumps(res)}\n"
+        f"Calendar Info: {calendar_summary}\n"
+        f"Intent: {detected_intent}\n"
+        "---\n"
+        "Write a brief, human reply to the most recent guest message above, using the full context. "
+        "Do NOT repeat what the guest just said or already confirmed. "
+        "Never add a greeting or a sign-off. Only answer the specific question, if possible."
+    )
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
     # --- SLACK BLOCK CONSTRUCTION ---
@@ -191,6 +195,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}
+            ]
+        },
         {
             "type": "actions",
             "elements": [
@@ -217,17 +227,3 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
-
-# Stronger clean_ai_reply to forcibly strip sign-offs
-def clean_ai_reply(reply: str):
-    reply = reply.strip()
-    for bad in ["Best,", "Best regards,", "[Your Name]", "Sincerely,", "Thanks!", "Thank you!", "All the best,", "Cheers,", "Kind regards,", "—", "--"]:
-        reply = reply.replace(bad, "")
-    reply = reply.replace("  ", " ").replace("..", ".").strip()
-    # Truncate accidental long endings
-    if "[your name]" in reply.lower():
-        reply = reply[:reply.lower().find("[your name]")]
-    # Remove extra trailing periods or whitespace
-    reply = reply.rstrip(". ").strip()
-    return reply
-
