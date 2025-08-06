@@ -13,7 +13,7 @@ from utils import (
     clean_ai_reply,
 )
 from openai import OpenAI
-from utils.modal_helpers import get_modal_blocks
+from utils import get_modal_blocks
 
 logging.basicConfig(level=logging.INFO)
 router = APIRouter()
