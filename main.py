@@ -6,6 +6,7 @@ from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
+    build_full_prompt,
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
@@ -17,7 +18,9 @@ from utils import (
     is_date_available,
     next_available_dates,
     detect_intent,
-    build_full_prompt,
+    get_property_location,
+    search_google_places,
+    detect_place_type,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -122,8 +125,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         guest_id = res.get("guestId", "")
 
     # --- Fetch message thread for full context (and trim for token safety) ---
-    MAX_THREAD_MESSAGES = 5    # try 8 or less if you have long messages
-    TRIMMED_MSG_LEN = 150
+    MAX_THREAD_MESSAGES = 8
+    TRIMMED_MSG_LEN = 300
 
     def trim_msg(m):
         return m[:TRIMMED_MSG_LEN] + ("…" if len(m) > TRIMMED_MSG_LEN else "")
@@ -174,6 +177,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # --- Fetch listing info for AI context ---
     listing = fetch_hostaway_listing(listing_id) or {}
 
+    # --- GOOGLE PLACES DYNAMIC RECS ---
+    place_type, keyword = detect_place_type(guest_msg)
+    local_recs = ""
+    if place_type:
+        lat, lng = get_property_location(listing, reservation)
+        if lat and lng:
+            places = search_google_places(keyword, lat, lng, type_hint=place_type)
+            if places:
+                local_recs = f"Here are some recommended {keyword}s near your property:\n"
+                for p in places:
+                    local_recs += f"- {p['name']} ({p.get('rating', 'N/A')}) – {p['address']}\n"
+        else:
+            local_recs = "Sorry, couldn't determine the property location for recommendations.\n"
+
     # --- AI PROMPT CONSTRUCTION (contextual) ---
     ai_prompt = build_full_prompt(
         guest_message=guest_msg,
@@ -183,7 +200,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         calendar_summary=calendar_summary,
         intent=detected_intent,
         similar_examples=prev_examples,
-        extra_instructions=None
+        extra_instructions=local_recs if local_recs else None
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
