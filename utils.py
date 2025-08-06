@@ -538,52 +538,27 @@ def build_full_prompt(
     similar_examples,
     extra_instructions=None
 ):
-    # Extract only necessary fields
-    res_str = ""
-    if reservation:
-        res_str = (
-            f"Reservation:\n"
-            f"- Guest: {reservation.get('guestFirstName', 'N/A')}\n"
-            f"- Dates: {reservation.get('arrivalDate', 'N/A')} to {reservation.get('departureDate', 'N/A')}\n"
-            f"- Guests: {reservation.get('numberOfGuests', 'N/A')}\n"
-            f"- Status: {reservation.get('status', 'N/A')}\n"
-        )
-    listing_str = ""
-    if listing and "result" in listing:
-        l = listing["result"]
-        listing_str = (
-            f"Listing Info:\n"
-            f"- Name: {l.get('name', 'N/A')}\n"
-            f"- Address: {l.get('address', 'N/A')}\n"
-            f"- City: {l.get('city', 'N/A')}\n"
-        )
-
-    thread_str = "\n".join(thread_msgs) if thread_msgs else ""
-    examples_str = "\n".join(
-        [f"- Guest: {g}\n  Reply: {r}" for g, _, r in similar_examples]
-    ) if similar_examples else ""
-
-    prompt = f"""
-Prior conversation:
-{thread_str}
-
-{res_str}
-{listing_str}
-
-Calendar: {calendar_summary}
-Intent: {intent}
-{"Extra: " + extra_instructions if extra_instructions else ""}
-
-If similar past questions exist, here are examples:
-{examples_str}
-
-Now, reply to the guest message below, using the context above.
-
-Guest Message:
-{guest_message}
-"""
-    # Strip for extra safety
-    return prompt.strip()
+    prompt = (
+        "You are a real human host responding to a guest. Use the following conversation so far (newest last):\n"
+    )
+    for m in thread_msgs:
+        prompt += m + "\n"
+    prompt += (
+        f"\nReservation info: {reservation}\n"
+        f"Listing info: {listing}\n"
+        f"Calendar info: {calendar_summary}\n"
+        f"Intent: {intent}\n"
+    )
+    if similar_examples:
+        prompt += "\nSimilar previous guest questions and replies:\n"
+        for eg in similar_examples:
+            prompt += f"Q: {eg[0]}\nA: {eg[2]}\n"
+    if extra_instructions:
+        prompt += f"\nExtra Instructions: {extra_instructions}\n"
+    prompt += (
+        "\nReply ONLY as the host to the latest guest message at the end of this conversation, but make sure to factor in key context from the conversation history above. If an item is being sent back by your cleaner, acknowledge the cleaner's favor, not the guest's."
+    )
+    return prompt
 
 import requests
 import os
