@@ -5,7 +5,6 @@ from fastapi import FastAPI
 from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
-from utils import build_full_prompt
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
