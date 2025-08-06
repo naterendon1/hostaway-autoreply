@@ -534,30 +534,52 @@ def build_full_prompt(
     listing,
     calendar_summary,
     intent,
-    similar_examples=None,
+    similar_examples,
     extra_instructions=None
 ):
-    """
-    Builds the full AI prompt for generating a reply, using conversation thread, reservation,
-    listing, calendar, and similar previous examples as context.
-    """
-    prompt = "The following is the conversation so far (newest last):\n"
-    for m in thread_msgs:
-        prompt += m + "\n"
-    prompt += f"\nReservation info: {reservation}\n"
-    prompt += f"Listing info: {listing}\n"
-    prompt += f"Calendar info: {calendar_summary}\n"
-    prompt += f"Intent: {intent}\n"
-    if similar_examples:
-        prompt += "\nSimilar previous guest questions and replies:\n"
-        for eg in similar_examples:
-            prompt += f"Q: {eg[0]}\nA: {eg[2]}\n"
-    if extra_instructions:
-        prompt += f"\nExtra Instructions: {extra_instructions}\n"
-    prompt += (
-        "\n\nReply to the most recent guest message above (at the end of the thread) "
-        "in a natural, modern, human way, only as needed."
-    )
-    return prompt
+    # Extract only necessary fields
+    res_str = ""
+    if reservation:
+        res_str = (
+            f"Reservation:\n"
+            f"- Guest: {reservation.get('guestFirstName', 'N/A')}\n"
+            f"- Dates: {reservation.get('arrivalDate', 'N/A')} to {reservation.get('departureDate', 'N/A')}\n"
+            f"- Guests: {reservation.get('numberOfGuests', 'N/A')}\n"
+            f"- Status: {reservation.get('status', 'N/A')}\n"
+        )
+    listing_str = ""
+    if listing and "result" in listing:
+        l = listing["result"]
+        listing_str = (
+            f"Listing Info:\n"
+            f"- Name: {l.get('name', 'N/A')}\n"
+            f"- Address: {l.get('address', 'N/A')}\n"
+            f"- City: {l.get('city', 'N/A')}\n"
+        )
 
+    thread_str = "\n".join(thread_msgs) if thread_msgs else ""
+    examples_str = "\n".join(
+        [f"- Guest: {g}\n  Reply: {r}" for g, _, r in similar_examples]
+    ) if similar_examples else ""
 
+    prompt = f"""
+Prior conversation:
+{thread_str}
+
+{res_str}
+{listing_str}
+
+Calendar: {calendar_summary}
+Intent: {intent}
+{"Extra: " + extra_instructions if extra_instructions else ""}
+
+If similar past questions exist, here are examples:
+{examples_str}
+
+Now, reply to the guest message below, using the context above.
+
+Guest Message:
+{guest_message}
+"""
+    # Strip for extra safety
+    return prompt.strip()
