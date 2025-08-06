@@ -71,16 +71,17 @@ SYSTEM_PROMPT = (
 
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT):
-    response = openai_client.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        timeout=20,
-        temperature=0.7  # More human, less rigid
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            timeout=20,
+            temperature=0.7  # More human, less rigid
+        )
+        return response.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
         return "(Error generating reply.)"
