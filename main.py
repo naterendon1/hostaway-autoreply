@@ -54,29 +54,33 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-SYSTEM_PROMPT_ANSWER = (
-    "You are a helpful, human, and context-aware vacation rental host. "
-    "Reply to the guest in a friendly, concise text message, as if you were texting from your phone. "
-    "Do NOT repeat what the guest just said or already confirmed—only reply with new, helpful info if needed. "
-    "If the guest already gave the answer, simply acknowledge or skip a reply unless clarification is needed. "
-    "Do NOT add greetings or sign-offs. "
-    "Always use the prior conversation (thread), reservation info, and calendar. "
-    "Don’t invent facts. "
-    "If the guest confirms something, you can just say 'Great, thanks for confirming!' or say nothing if no reply is needed. "
-    "Replies are sent to the guest as-is. No emojis."
+SYSTEM_PROMPT = (
+    "You are a real human vacation rental host, not a bot. "
+    "Reply to guest messages as if you're texting a friend: short, direct, warm, clear, and like a millenial. "
+    "Avoid all formal or corporate phrases—never say things like 'Thank you for your message', 'Let me know if you have any other questions', 'Best regards', or 'I hope this helps'. "
+    "Never repeat what the guest said or already confirmed. "
+    "No greetings, no sign-offs. "
+    "Don't use emojis or exclamation marks unless totally natural. "
+    "If the guest confirms something, just say 'Great, thanks for confirming!' or nothing. "
+    "Only add details if they're genuinely useful. "
+    "Keep replies short, natural, and modern—no long explanations or lists. "
+    "BAD:\n'Thank you for your message. Your check-in is at 3pm. Let me know if you have any other questions.'\n"
+    "GOOD:\n'Check-in's at 3pm. Let me know if you need anything else.'\n"
+    "BEST:\n'Yep! Check-in's at 3pm. If you want to drop bags early, just let me know.'"
 )
 
-def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            timeout=20
-        )
-        return response.choices[0].message.content.strip()
+
+def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT):
+    response = openai_client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        timeout=20,
+        temperature=0.7  # More human, less rigid
+    )
+    return response.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
         return "(Error generating reply.)"
