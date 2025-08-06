@@ -583,3 +583,85 @@ Guest Message:
 """
     # Strip for extra safety
     return prompt.strip()
+
+import requests
+import os
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+
+PROPERTY_LOCATIONS = {
+    "crystal_beach": {"lat": 29.4472, "lng": -94.6296, "city": "Crystal Beach, TX"},
+    "galveston": {"lat": 29.3013, "lng": -94.7977, "city": "Galveston, TX"},
+    "austin": {"lat": 30.2672, "lng": -97.7431, "city": "Austin, TX"},
+    "georgetown": {"lat": 30.6333, "lng": -97.6770, "city": "Georgetown, TX"},
+}
+
+def get_property_location(listing, reservation):
+    # Try to get lat/lng from Hostaway listing first
+    if listing and "result" in listing:
+        lat = listing["result"].get("latitude")
+        lng = listing["result"].get("longitude")
+        if lat and lng:
+            return float(lat), float(lng)
+        address = (listing["result"].get("city") or "").lower()
+        if "crystal" in address:
+            loc = PROPERTY_LOCATIONS["crystal_beach"]
+        elif "galveston" in address:
+            loc = PROPERTY_LOCATIONS["galveston"]
+        elif "austin" in address:
+            loc = PROPERTY_LOCATIONS["austin"]
+        elif "georgetown" in address:
+            loc = PROPERTY_LOCATIONS["georgetown"]
+        else:
+            loc = None
+        if loc:
+            return loc["lat"], loc["lng"]
+    return None, None
+
+def search_google_places(query, lat, lng, radius=4000, type_hint=None):
+    if not GOOGLE_API_KEY or not lat or not lng:
+        return []
+    endpoint = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    params = {
+        "key": GOOGLE_API_KEY,
+        "location": f"{lat},{lng}",
+        "radius": radius,
+        "keyword": query,
+    }
+    if type_hint:
+        params["type"] = type_hint
+    resp = requests.get(endpoint, params=params)
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    return [{
+        "name": r.get("name"),
+        "address": r.get("vicinity"),
+        "rating": r.get("rating")
+    } for r in results[:5]]
+
+def detect_place_type(msg):
+    location_question_types = {
+        "restaurant": "restaurant",
+        "restaurants": "restaurant",
+        "bar": "bar",
+        "bars": "bar",
+        "club": "night_club",
+        "clubs": "night_club",
+        "grocery": "supermarket",
+        "shopping": "shopping_mall",
+        "things to do": "tourist_attraction",
+        "coffee": "cafe",
+        "breakfast": "restaurant",
+        "lunch": "restaurant",
+        "dinner": "restaurant",
+        "fish": "restaurant",   # for fishing, could also match "fishing charter"
+        "fishing": "fishing",
+        "charter": "fishing",
+        "supermarket": "supermarket",
+        "liquor": "liquor_store"
+    }
+    for k, v in location_question_types.items():
+        if k in msg.lower():
+            return v, k
+    return None, None
+
