@@ -18,7 +18,7 @@ from utils import (
     next_available_dates,
     detect_intent,
 )
-from ai.prompt_builder import build_full_prompt
+from utils import build_full_prompt
 
 logging.basicConfig(level=logging.INFO)
 
