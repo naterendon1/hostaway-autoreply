@@ -527,3 +527,37 @@ def get_modal_blocks(guest_name, guest_msg, draft_text, action_id="write_own", c
         checkbox_block
     ]
 
+def build_full_prompt(
+    guest_message,
+    thread_msgs,
+    reservation,
+    listing,
+    calendar_summary,
+    intent,
+    similar_examples=None,
+    extra_instructions=None
+):
+    """
+    Builds the full AI prompt for generating a reply, using conversation thread, reservation,
+    listing, calendar, and similar previous examples as context.
+    """
+    prompt = "The following is the conversation so far (newest last):\n"
+    for m in thread_msgs:
+        prompt += m + "\n"
+    prompt += f"\nReservation info: {reservation}\n"
+    prompt += f"Listing info: {listing}\n"
+    prompt += f"Calendar info: {calendar_summary}\n"
+    prompt += f"Intent: {intent}\n"
+    if similar_examples:
+        prompt += "\nSimilar previous guest questions and replies:\n"
+        for eg in similar_examples:
+            prompt += f"Q: {eg[0]}\nA: {eg[2]}\n"
+    if extra_instructions:
+        prompt += f"\nExtra Instructions: {extra_instructions}\n"
+    prompt += (
+        "\n\nReply to the most recent guest message above (at the end of the thread) "
+        "in a natural, modern, human way, only as needed."
+    )
+    return prompt
+
+
