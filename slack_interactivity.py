@@ -12,6 +12,99 @@ from utils import (
     get_similar_learning_examples,
     clean_ai_reply,
 )
+
+from slack_sdk import WebClient
+import logging
+
+def update_slack_message_with_sent_reply(
+    slack_bot_token,
+    channel,
+    ts,
+    guest_name,
+    guest_msg,
+    sent_reply,
+    communication_type,
+    check_in,
+    check_out,
+    guest_count,
+    status,
+    detected_intent
+):
+    """
+    Updates the original Slack message (with the AI suggestion) to show the actual sent reply,
+    removes action buttons, and displays a 'Reply sent!' confirmation.
+
+    Args:
+        slack_bot_token: Bot token for authentication.
+        channel: Slack channel ID where the original message was posted.
+        ts: Timestamp of the original Slack message.
+        guest_name: Name of the guest.
+        guest_msg: The guest's message.
+        sent_reply: The actual reply that was sent to the guest.
+        communication_type: Type of message (email, channel, etc).
+        check_in: Check-in date.
+        check_out: Check-out date.
+        guest_count: Number of guests.
+        status: Reservation status.
+        detected_intent: The AI-classified intent.
+    """
+
+    slack_client = WebClient(token=slack_bot_token)
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*New {communication_type.capitalize()}* from *{guest_name}*\n"
+                    f"Dates: *{check_in} → {check_out}*\n"
+                    f"Guests: *{guest_count}* | Status: *{status}*"
+                )
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"> {guest_msg}"
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Sent Reply:*\n>{sent_reply}"
+            }
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Intent:* `{detected_intent}`"
+                }
+            ]
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": ":white_check_mark: *Reply sent to guest!*"
+            }
+        }
+    ]
+
+    try:
+        slack_client.chat_update(
+            channel=channel,
+            ts=ts,
+            blocks=blocks,
+            text="Reply sent to guest!"
+        )
+    except Exception as e:
+        logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
+
 from openai import OpenAI
 from utils import get_modal_blocks
 
