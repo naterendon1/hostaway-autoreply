@@ -17,9 +17,8 @@ from utils import (
     is_date_available,
     next_available_dates,
     detect_intent,
-    build_full_prompt,   # assumed to be in utils.py as per your last context
+    build_full_prompt,
 )
-from utils import build_full_prompt
 
 logging.basicConfig(level=logging.INFO)
 
@@ -78,7 +77,7 @@ def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT):
                 {"role": "user", "content": prompt}
             ],
             timeout=20,
-            temperature=0.7  # More human, less rigid
+            temperature=0.7
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -123,8 +122,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         guest_id = res.get("guestId", "")
 
     # --- Fetch message thread for full context (and trim for token safety) ---
-    MAX_THREAD_MESSAGES = 8    # Reduce for longer threads/messages
-    TRIMMED_MSG_LEN = 300      # Trim each msg for safety
+    MAX_THREAD_MESSAGES = 8    # try 8 or less if you have long messages
+    TRIMMED_MSG_LEN = 300
 
     def trim_msg(m):
         return m[:TRIMMED_MSG_LEN] + ("…" if len(m) > TRIMMED_MSG_LEN else "")
@@ -140,7 +139,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if not body:
             continue
         conversation_context.append(f"{sender}: {trim_msg(body)}")
-    # Now conversation_context is trimmed for token safety
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
     cancellation = get_cancellation_policy_summary({}, res)
@@ -176,7 +174,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # --- Fetch listing info for AI context ---
     listing = fetch_hostaway_listing(listing_id) or {}
 
-    # --- AI PROMPT CONSTRUCTION (contextual & safe) ---
+    # --- AI PROMPT CONSTRUCTION (contextual) ---
     ai_prompt = build_full_prompt(
         guest_message=guest_msg,
         thread_msgs=conversation_context,
@@ -185,7 +183,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         calendar_summary=calendar_summary,
         intent=detected_intent,
         similar_examples=prev_examples,
-        extra_instructions=None  # optional
+        extra_instructions=None
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
