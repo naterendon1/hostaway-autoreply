@@ -12,7 +12,8 @@ from openai import OpenAI
 # --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
-    "HOSTAWAY_CLIENT_SECRET"
+    "HOSTAWAY_CLIENT_SECRET",
+    "GOOGLE_PLACES_API_KEY"
 ]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
