@@ -620,6 +620,7 @@ def get_property_location(listing, reservation):
 
 def search_google_places(query, lat, lng, radius=4000, type_hint=None):
     if not GOOGLE_API_KEY or not lat or not lng:
+        logging.warning("[PLACES] Missing API key or coordinates.")
         return []
     endpoint = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     params = {
@@ -630,14 +631,25 @@ def search_google_places(query, lat, lng, radius=4000, type_hint=None):
     }
     if type_hint:
         params["type"] = type_hint
-    resp = requests.get(endpoint, params=params)
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
-    return [{
-        "name": r.get("name"),
-        "address": r.get("vicinity"),
-        "rating": r.get("rating")
-    } for r in results[:5]]
+
+    logging.info(f"[PLACES] Calling Google Places: {endpoint} with params: {params}")
+    try:
+        resp = requests.get(endpoint, params=params)
+        logging.info(f"[PLACES] Response status: {resp.status_code}")
+        logging.debug(f"[PLACES] Response body: {resp.text[:500]}")  # log first 500 chars of response
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        places = [{
+            "name": r.get("name"),
+            "address": r.get("vicinity"),
+            "rating": r.get("rating")
+        } for r in results[:5]]
+        logging.info(f"[PLACES] Top results: {places}")
+        return places
+    except Exception as e:
+        logging.error(f"[PLACES] Error calling Google Places: {e}")
+        return []
+
 
 def detect_place_type(msg):
     location_question_types = {
