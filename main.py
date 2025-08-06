@@ -56,7 +56,7 @@ class HostawayUnifiedWebhook(BaseModel):
 
 SYSTEM_PROMPT = (
     "You are a real human vacation rental host, not a bot. "
-    "Reply to guest messages as if you're texting a friend: short, direct, warm, clear, and like a millenial. "
+    "Reply to guest messages as if you're texting a friend: short, direct, warm, clear, and like a millennial. "
     "Avoid all formal or corporate phrases—never say things like 'Thank you for your message', 'Let me know if you have any other questions', 'Best regards', or 'I hope this helps'. "
     "Never repeat what the guest said or already confirmed. "
     "No greetings, no sign-offs. "
@@ -68,7 +68,6 @@ SYSTEM_PROMPT = (
     "GOOD:\n'Check-in's at 3pm. Let me know if you need anything else.'\n"
     "BEST:\n'Yep! Check-in's at 3pm. If you want to drop bags early, just let me know.'"
 )
-
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT):
     try:
@@ -172,7 +171,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # --- Fetch listing info for AI context ---
     listing = fetch_hostaway_listing(listing_id) or {}
 
-    # --- AI PROMPT CONSTRUCTION (upgraded) ---
+    # --- AI PROMPT CONSTRUCTION (upgraded/contextual) ---
     ai_prompt = build_full_prompt(
         guest_message=guest_msg,
         thread_msgs=conversation_context,
@@ -181,7 +180,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         calendar_summary=calendar_summary,
         intent=detected_intent,
         similar_examples=prev_examples,
-        extra_instructions=None  # add any per-intent instructions here
+        extra_instructions=None
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
