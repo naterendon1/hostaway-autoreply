@@ -122,20 +122,26 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Fetch message thread for full context ---
-    convo_obj = fetch_hostaway_conversation(conv_id) or {}
-    msgs = []
-    if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
-        msgs = convo_obj["result"]["conversationMessages"]
-    conversation_context = []
-    for m in msgs[-MAX_THREAD_MESSAGES:]:
-        sender = "Guest" if m.get("isIncoming") else "Host"
-        body = m.get("body", "")
-        if not body:
-            continue
-        conversation_context.append(f"{sender}: {body}")
-    # Use newest last for best context to LLM
-    conversation_context = conversation_context[-MAX_THREAD_MESSAGES:]
+    # --- Fetch message thread for full context (and trim for token safety) ---
+MAX_THREAD_MESSAGES = 8   # try 8 (or even 5-6 if you have long messages)
+TRIMMED_MSG_LEN = 300     # max chars per message
+
+def trim_msg(m):
+    return m[:TRIMMED_MSG_LEN] + ("…" if len(m) > TRIMMED_MSG_LEN else "")
+
+convo_obj = fetch_hostaway_conversation(conv_id) or {}
+msgs = []
+if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
+    msgs = convo_obj["result"]["conversationMessages"]
+conversation_context = []
+for m in msgs[-MAX_THREAD_MESSAGES:]:
+    sender = "Guest" if m.get("isIncoming") else "Host"
+    body = m.get("body", "")
+    if not body:
+        continue
+    conversation_context.append(f"{sender}: {trim_msg(body)}")
+# Now conversation_context is trimmed, so prompt will fit in token limit
+
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
     cancellation = get_cancellation_policy_summary({}, res)
