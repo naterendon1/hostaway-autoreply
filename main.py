@@ -16,8 +16,9 @@ from utils import (
     fetch_hostaway_calendar,
     is_date_available,
     next_available_dates,
-    detect_intent,  # <-- Make sure this is in utils.py as provided earlier
+    detect_intent,
 )
+from ai.prompt_builder import build_full_prompt
 
 logging.basicConfig(level=logging.INFO)
 
@@ -129,13 +130,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if not body:
             continue
         conversation_context.append(f"{sender}: {body}")
-    context_str = "\n".join(conversation_context)
+    # Use newest last for best context to LLM
+    conversation_context = conversation_context[-MAX_THREAD_MESSAGES:]
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
-    prev_answer = ""
-    if prev_examples and prev_examples[0][2]:
-        prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
-
     cancellation = get_cancellation_policy_summary({}, res)
 
     # --- CALENDAR INTENT & LIVE CHECK ---
@@ -166,18 +164,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         calendar_summary = "No calendar check for this inquiry."
 
-    # --- AI PROMPT CONSTRUCTION ---
-    ai_prompt = (
-        f"Here is the conversation thread so far (newest last):\n"
-        f"{context_str}\n"
-        f"Reservation Info:\n{json.dumps(res)}\n"
-        f"Calendar Info: {calendar_summary}\n"
-        f"Intent: {detected_intent}\n"
-        "---\n"
-        "Write a brief, human reply to the most recent guest message above, using the full context. "
-        "Do NOT repeat what the guest just said or already confirmed. "
-        "Never add a greeting or a sign-off. Only answer the specific question, if possible."
+    # --- Fetch listing info for AI context ---
+    listing = fetch_hostaway_listing(listing_id) or {}
+
+    # --- AI PROMPT CONSTRUCTION (upgraded) ---
+    ai_prompt = build_full_prompt(
+        guest_message=guest_msg,
+        thread_msgs=conversation_context,
+        reservation=res,
+        listing=listing,
+        calendar_summary=calendar_summary,
+        intent=detected_intent,
+        similar_examples=prev_examples,
+        extra_instructions=None  # add any per-intent instructions here
     )
+
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
     # --- SLACK BLOCK CONSTRUCTION ---
