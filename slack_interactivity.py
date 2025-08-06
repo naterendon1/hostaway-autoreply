@@ -1,20 +1,26 @@
 import os
 import logging
 import json
-import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
+from openai import OpenAI
 from utils import (
     send_reply_to_hostaway,
     fetch_hostaway_resource,
     store_learning_example,
     get_similar_learning_examples,
     clean_ai_reply,
+    get_modal_blocks,  # now from utils
 )
 
-from slack_sdk import WebClient
-import logging
+logging.basicConfig(level=logging.INFO)
+router = APIRouter()
+
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 def update_slack_message_with_sent_reply(
     slack_bot_token,
@@ -30,27 +36,7 @@ def update_slack_message_with_sent_reply(
     status,
     detected_intent
 ):
-    """
-    Updates the original Slack message (with the AI suggestion) to show the actual sent reply,
-    removes action buttons, and displays a 'Reply sent!' confirmation.
-
-    Args:
-        slack_bot_token: Bot token for authentication.
-        channel: Slack channel ID where the original message was posted.
-        ts: Timestamp of the original Slack message.
-        guest_name: Name of the guest.
-        guest_msg: The guest's message.
-        sent_reply: The actual reply that was sent to the guest.
-        communication_type: Type of message (email, channel, etc).
-        check_in: Check-in date.
-        check_out: Check-out date.
-        guest_count: Number of guests.
-        status: Reservation status.
-        detected_intent: The AI-classified intent.
-    """
-
     slack_client = WebClient(token=slack_bot_token)
-
     blocks = [
         {
             "type": "section",
@@ -105,17 +91,6 @@ def update_slack_message_with_sent_reply(
     except Exception as e:
         logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
 
-from openai import OpenAI
-from utils import get_modal_blocks
-
-logging.basicConfig(level=logging.INFO)
-router = APIRouter()
-
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-slack_client = WebClient(token=SLACK_BOT_TOKEN)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
 def add_undo_button(blocks, meta):
     """Adds an Undo AI button if previous_draft exists in meta."""
     if "previous_draft" in meta and meta["previous_draft"]:
@@ -162,6 +137,13 @@ async def slack_actions(request: Request):
             communication_type = meta.get("type", "email")
             channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
             ts = meta.get("ts") or payload.get("message", {}).get("ts")
+            guest_name = meta.get("guest_name", "Guest")
+            guest_msg = meta.get("guest_message", "(Message unavailable)")
+            check_in = meta.get("check_in", "N/A")
+            check_out = meta.get("check_out", "N/A")
+            guest_count = meta.get("guest_count", "N/A")
+            status = meta.get("status", "Unknown")
+            detected_intent = meta.get("detected_intent", "Unknown")
 
             if not reply or not conv_id:
                 return JSONResponse({"text": "Missing reply or conversation ID."})
@@ -172,23 +154,38 @@ async def slack_actions(request: Request):
                 logging.error(f"Slack SEND error: {e}")
                 success = False
 
-            # --- Update the Slack message, replacing the buttons with "Reply sent" ---
-            if ts and channel:
-                original_blocks = payload.get("message", {}).get("blocks", [])
-                new_blocks = [block for block in original_blocks if block.get("type") != "actions"]
-                new_blocks.append({
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": ":white_check_mark: *Message sent!*" if success else ":x: *Failed to send reply.*"
-                    }
-                })
+            # --- Update Slack thread with *actual sent reply* and close modal ---
+            if ts and channel and success:
+                update_slack_message_with_sent_reply(
+                    slack_bot_token=SLACK_BOT_TOKEN,
+                    channel=channel,
+                    ts=ts,
+                    guest_name=guest_name,
+                    guest_msg=guest_msg,
+                    sent_reply=reply,
+                    communication_type=communication_type,
+                    check_in=check_in,
+                    check_out=check_out,
+                    guest_count=guest_count,
+                    status=status,
+                    detected_intent=detected_intent
+                )
+            elif ts and channel and not success:
                 try:
+                    # Just show error in the thread
                     slack_client.chat_update(
                         channel=channel,
                         ts=ts,
-                        blocks=new_blocks,
-                        text="Message sent!" if success else "Failed to send reply."
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": ":x: *Failed to send reply.*"
+                                }
+                            }
+                        ],
+                        text="Failed to send reply."
                     )
                 except Exception as e:
                     logging.error(f"Slack chat_update error: {e}")
@@ -275,7 +272,7 @@ async def slack_actions(request: Request):
 
             prompt = (
                 "Take this guest message reply and improve it. "
-                "Make it clear, modern, friendly, concise like a mmillennial, and make it make sense. "
+                "Make it clear, modern, friendly, concise, and natural. "
                 "Do not add extra content or use emojis. Only return the improved version.\n\n"
                 f"{edited_text}"
             )
@@ -295,7 +292,6 @@ async def slack_actions(request: Request):
                 improved = previous_draft
                 error_message = f"Error improving with AI: {str(e)}"
 
-            # Always pre-fill with improved, preserve checkbox, add "undo" to metadata if wanted
             new_meta = {
                 **meta,
                 "previous_draft": previous_draft,
@@ -379,9 +375,27 @@ async def slack_actions(request: Request):
         communication_type = meta.get("type", "email")
         guest_message = meta.get("guest_message", "")
         ai_suggestion = meta.get("ai_suggestion", "")
+        channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
+        ts = meta.get("ts")
 
         try:
             send_reply_to_hostaway(conv_id, reply_text, communication_type)
+            # Update the Slack message thread with the ACTUAL sent reply
+            if channel and ts:
+                update_slack_message_with_sent_reply(
+                    slack_bot_token=SLACK_BOT_TOKEN,
+                    channel=channel,
+                    ts=ts,
+                    guest_name=meta.get("guest_name", "Guest"),
+                    guest_msg=guest_message,
+                    sent_reply=reply_text,
+                    communication_type=communication_type,
+                    check_in=meta.get("check_in", "N/A"),
+                    check_out=meta.get("check_out", "N/A"),
+                    guest_count=meta.get("guest_count", "N/A"),
+                    status=meta.get("status", "Unknown"),
+                    detected_intent=meta.get("detected_intent", "Unknown"),
+                )
             if save_for_next_time:
                 listing_id = meta.get("listing_id")
                 guest_id = meta.get("guest_id")
@@ -389,8 +403,6 @@ async def slack_actions(request: Request):
         except Exception as e:
             logging.error(f"Slack regular send error: {e}")
 
-        # --- Close the modal after send, and send message sent to Slack ---
-        # (Slack already updates the thread as in the SEND block above.)
         return JSONResponse({
             "response_action": "clear"
         })
