@@ -49,22 +49,32 @@ def verify_slack_signature(request_body: str, slack_signature: str, slack_reques
 
 
 # --------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
-def get_modal_blocks(guest_name, guest_msg, action_id, draft_text: str = "", checkbox_checked: bool = False):
+def get_modal_blocks(
+    guest_name,
+    guest_msg,
+    action_id,
+    draft_text: str = "",
+    checkbox_checked: bool = False,
+    input_block_id: str = "reply_input",
+    input_action_id: str = "reply",
+):
     """
-    Returns blocks for "Write/Edit reply" modals. Keeps stable block_id/action_id so we can preserve input text.
+    Returns blocks for "Write/Edit reply" modals.
+
+    IMPORTANT: Slack preserves user-entered text when block_id/action_id stay the same.
+    To overwrite with AI text, pass a NEW input_block_id/action_id so initial_value is used.
     """
     reply_block = {
         "type": "input",
-        "block_id": "reply_input",
+        "block_id": input_block_id,
         "label": {"type": "plain_text", "text": "Your reply:" if action_id == "write_own" else "Edit below:", "emoji": True},
         "element": {
             "type": "plain_text_input",
-            "action_id": "reply",
+            "action_id": input_action_id,
             "multiline": True,
         }
     }
-    # Preserve text by setting initial_value when editing or writing your own
-    if action_id in ("edit", "write_own") and draft_text:
+    if draft_text:
         reply_block["element"]["initial_value"] = draft_text
 
     learning_checkbox_option = {
@@ -82,7 +92,6 @@ def get_modal_blocks(guest_name, guest_msg, action_id, draft_text: str = "", che
         "label": {"type": "plain_text", "text": "Learning", "emoji": True},
         "optional": True
     }
-    # Only pre-check if requested
     if checkbox_checked:
         learning_checkbox["element"]["initial_options"] = [learning_checkbox_option]
 
@@ -139,22 +148,10 @@ def update_slack_message_with_sent_reply(
                 )
             }
         },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}
-        },
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}]
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": ":white_check_mark: *Reply sent to guest!*"}
-        }
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}]},
+        {"type": "section", "text": {"type": "mrkdwn", "text": ":white_check_mark: *Reply sent to guest!*"}}
     ]
     try:
         _client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Reply sent to guest!")
@@ -203,11 +200,16 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         improved = edited_text
         error_message = f"Error improving with AI: {str(e)}"
 
+    # Build final view with NEW input IDs so Slack uses our initial_value
     new_meta = {**meta, "previous_draft": edited_text, "improving": False}
     blocks = get_modal_blocks(
-        guest_name, guest_msg, action_id="edit",
+        guest_name,
+        guest_msg,
+        action_id="edit",
         draft_text=improved,
-        checkbox_checked=new_meta.get("checkbox_checked", False)
+        checkbox_checked=new_meta.get("checkbox_checked", False),
+        input_block_id="reply_input_ai",   # <-- NEW IDs to defeat Slack's preserve behavior
+        input_action_id="reply_ai",
     )
     blocks = add_undo_button(blocks, new_meta)
     if error_message:
@@ -222,7 +224,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         "blocks": blocks
     }
 
-    # First try WITH hash, log result
+    # Update WITH hash first, then fallback once without hash if needed
     try:
         resp = slack_client.views_update(view_id=view_id, hash=hash_value, view=final_view)
         logging.info(f"views_update (final) resp: {resp}")
@@ -236,7 +238,6 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
                     logging.error(f"views_update (final) retry-no-hash ok=false: {resp2.get('error')}")
     except Exception as e:
         logging.error(f"views_update (final) exception: {e}")
-        # Retry once without hash
         try:
             resp2 = slack_client.views_update(view_id=view_id, view=final_view)
             logging.info(f"views_update (final) exception retry-no-hash resp: {resp2}")
@@ -357,7 +358,9 @@ async def slack_actions(
                     guest_msg,
                     action_id="write_own",
                     draft_text="",
-                    checkbox_checked=checkbox_checked
+                    checkbox_checked=checkbox_checked,
+                    input_block_id="reply_input",
+                    input_action_id="reply",
                 )
             }
             slack_client.views_open(trigger_id=trigger_id, view=modal)
@@ -375,7 +378,9 @@ async def slack_actions(
                 guest_msg,
                 action_id="edit",
                 draft_text=ai_suggestion,
-                checkbox_checked=checkbox_checked
+                checkbox_checked=checkbox_checked,
+                input_block_id="reply_input",
+                input_action_id="reply",
             )
             modal_blocks = add_undo_button(modal_blocks, meta)
             modal = {
@@ -425,7 +430,7 @@ async def slack_actions(
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "")
 
-            # Build a "loading" view preserving input + text
+            # Build a "loading" view preserving input + text (same IDs)
             loading_meta = {**meta, "improving": True, "checkbox_checked": checkbox_checked}
             loading_blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply…"}}
@@ -433,8 +438,10 @@ async def slack_actions(
                 guest_name,
                 guest_msg,
                 action_id="edit",
-                draft_text=edited_text,            # preserve current text
-                checkbox_checked=checkbox_checked  # preserve checkbox
+                draft_text=edited_text,
+                checkbox_checked=checkbox_checked,
+                input_block_id="reply_input",     # keep original IDs so text remains visible
+                input_action_id="reply",
             )
             loading_view = {
                 "type": "modal",
@@ -445,7 +452,7 @@ async def slack_actions(
                 "blocks": loading_blocks
             }
 
-            # Update via API immediately using current hash; CAPTURE & LOG response
+            # Update via API immediately using current hash; CAPTURE & LOG response (no response_action)
             current_hash = view.get("hash")
             try:
                 resp = slack_client.views_update(view_id=view_id, hash=current_hash, view=loading_view)
@@ -459,7 +466,6 @@ async def slack_actions(
                     if not resp2.get("ok"):
                         logging.error(f"views_update (loading) fallback ok=false: {resp2.get('error')}")
                         return JSONResponse({})
-                # success path
                 new_hash = resp.get("view", {}).get("hash") or resp.get("hash")
             except Exception as e:
                 logging.error(f"views_update (loading) exception: {e}")
@@ -501,7 +507,9 @@ async def slack_actions(
                 guest_msg,
                 action_id="edit",
                 draft_text=previous_draft,
-                checkbox_checked=checkbox_checked
+                checkbox_checked=checkbox_checked,
+                input_block_id="reply_input",    # back to original IDs
+                input_action_id="reply",
             )
             blocks = add_undo_button(blocks, meta)
             modal = {
@@ -529,11 +537,15 @@ async def slack_actions(
         state = view.get("state", {}).get("values", {})
         meta = json.loads(view.get("private_metadata", "{}") or "{}")
 
-        # Get reply text from input
+        # Get reply text: prefer AI field if present, else original
         reply_text = None
-        for block in state.values():
+        for block_id, block in state.items():
+            if "reply_ai" in block:
+                reply_text = block["reply_ai"]["value"]
+                break
             if "reply" in block:
                 reply_text = block["reply"]["value"]
+                break
 
         # Get checkbox state
         save_for_next_time = False
