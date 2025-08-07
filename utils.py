@@ -23,11 +23,9 @@ HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 HOSTAWAY_API_BASE = os.getenv("HOSTAWAY_API_BASE", "https://api.hostaway.com/v1")
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
 GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 PROPERTY_LOCATIONS = {
     "crystal_beach": {"lat": 29.4472, "lng": -94.6296, "city": "Crystal Beach, TX"},
@@ -62,6 +60,136 @@ def get_hostaway_access_token() -> str:
     except Exception as e:
         logging.error(f"❌ Token error: {e}")
         return None
+
+# ... other Hostaway and DB functions go here (unchanged) ...
+
+def get_property_location(listing, reservation):
+    if listing and "result" in listing:
+        lat = listing["result"].get("latitude")
+        lng = listing["result"].get("longitude")
+        if lat and lng:
+            return float(lat), float(lng)
+        address = (listing["result"].get("city") or "").lower()
+        if "crystal" in address:
+            loc = PROPERTY_LOCATIONS["crystal_beach"]
+        elif "galveston" in address:
+            loc = PROPERTY_LOCATIONS["galveston"]
+        elif "austin" in address:
+            loc = PROPERTY_LOCATIONS["austin"]
+        elif "georgetown" in address:
+            loc = PROPERTY_LOCATIONS["georgetown"]
+        else:
+            loc = None
+        if loc:
+            return loc["lat"], loc["lng"]
+    return None, None
+
+def detect_place_type(msg):
+    location_question_types = {
+        "restaurant": "restaurant",
+        "restaurants": "restaurant",
+        "bar": "bar",
+        "bars": "bar",
+        "club": "night_club",
+        "clubs": "night_club",
+        "grocery": "supermarket",
+        "shopping": "shopping_mall",
+        "things to do": "tourist_attraction",
+        "coffee": "cafe",
+        "breakfast": "restaurant",
+        "lunch": "restaurant",
+        "dinner": "restaurant",
+        "fish": "restaurant",   # for fishing, could also match "fishing charter"
+        "fishing": "fishing",
+        "charter": "fishing",
+        "supermarket": "supermarket",
+        "liquor": "liquor_store"
+    }
+    for k, v in location_question_types.items():
+        if k in msg.lower():
+            return v, k
+    return None, None
+
+def search_google_places(query, lat, lng, radius=4000, type_hint=None):
+    if not GOOGLE_API_KEY or not lat or not lng:
+        logging.warning("[PLACES] Missing API key or coordinates.")
+        return []
+    endpoint = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    params = {
+        "key": GOOGLE_API_KEY,
+        "location": f"{lat},{lng}",
+        "radius": radius,
+        "keyword": query,
+    }
+    if type_hint:
+        params["type"] = type_hint
+    logging.info(f"[PLACES] Calling Google Places: {endpoint} with params: {params}")
+    try:
+        resp = requests.get(endpoint, params=params)
+        logging.info(f"[PLACES] Response status: {resp.status_code}")
+        logging.debug(f"[PLACES] Response body: {resp.text[:500]}")
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        places = [{
+            "name": r.get("name"),
+            "address": r.get("vicinity"),
+            "rating": r.get("rating")
+        } for r in results[:5]]
+        logging.info(f"[PLACES] Top results: {places}")
+        return places
+    except Exception as e:
+        logging.error(f"[PLACES] Error calling Google Places: {e}")
+        return []
+
+def build_places_summary_block(places, query=None):
+    if not places:
+        return ""
+    summary = []
+    if query:
+        summary.append(f"Search results for '{query}':")
+    for p in places:
+        if p["rating"]:
+            summary.append(f"- {p['name']} ({p['address']}, rating {p['rating']})")
+        else:
+            summary.append(f"- {p['name']} ({p['address']})")
+    return "\n".join(summary)
+
+def build_full_prompt(
+    guest_message,
+    thread_msgs,
+    reservation,
+    listing,
+    calendar_summary,
+    intent,
+    similar_examples,
+    extra_instructions=None  # <-- pass in Google Places summary block here!
+):
+    """
+    Compose the full prompt for OpenAI, always referencing last guest/host messages,
+    and (if present) dynamic Google Places results right before reply instructions.
+    """
+    prompt = "You are a real human host. Here is the conversation so far (newest last):\n"
+    for m in thread_msgs:
+        prompt += m + "\n"
+    prompt += (
+        f"\nReservation info: {reservation}\n"
+        f"Listing info: {listing}\n"
+        f"Calendar info: {calendar_summary}\n"
+        f"Intent: {intent}\n"
+    )
+    if similar_examples:
+        prompt += "\nSimilar previous guest questions and replies:\n"
+        for eg in similar_examples:
+            prompt += f"Q: {eg[0]}\nA: {eg[2]}\n"
+    # Always add any extra context (Google results, etc) right here:
+    if extra_instructions:
+        prompt += "\nNearby recommendations (from Google Places):\n" + extra_instructions + "\n"
+    prompt += (
+        "\nReply ONLY as the host to the latest guest message at the end of this conversation. "
+        "Always use the actual conversation history above for your reply. "
+        "If an item is being sent back by your cleaner, acknowledge the cleaner's favor, not the guest's."
+    )
+    return prompt
 
 def fetch_hostaway_calendar(listing_id, start_date, end_date):
     token = get_hostaway_access_token()
