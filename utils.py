@@ -615,3 +615,19 @@ def get_modal_blocks(guest_name, guest_msg, draft_text="", action_id="edit", che
     ]
     return blocks
 
+def detect_intent(message: str) -> str:
+    """
+    Dummy keyword-based intent detector. Expand with your own logic or ML model.
+    """
+    msg = message.lower()
+    if any(word in msg for word in ["cancel", "refund"]):
+        return "cancellation"
+    if any(word in msg for word in ["book", "available", "reserve", "date"]):
+        return "booking"
+    if any(word in msg for word in ["question", "info", "information", "details"]):
+        return "info_request"
+    if any(word in msg for word in ["extend", "extra night", "longer"]):
+        return "extend_stay"
+    # Add more rules as you need
+    return "general"
+
