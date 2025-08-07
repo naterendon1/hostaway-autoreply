@@ -63,6 +63,7 @@ def get_modal_blocks(guest_name, guest_msg, action_id, draft_text: str = "", che
             "multiline": True,
         }
     }
+    # Preserve text by setting initial_value when editing or writing your own
     if action_id in ("edit", "write_own") and draft_text:
         reply_block["element"]["initial_value"] = draft_text
 
@@ -398,95 +399,95 @@ async def slack_actions(
             return JSONResponse({})
 
         # --- IMPROVE WITH AI (Immediate API update -> capture hash -> async finalize) ---
-       if action_id == "improve_with_ai":
-    view = payload.get("view", {})
-    view_id = view.get("id")
-    if not view_id:
-        logging.error("No view_id on improve_with_ai payload")
-        return JSONResponse({})
-
-    # Read current typed text from state
-    state = view.get("state", {}).get("values", {})
-    reply_block = state.get("reply_input", {})
-    edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
-
-    # Checkbox state
-    state_save = state.get("save_answer_block", {})
-    checkbox_checked = False
-    if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
-        checkbox_checked = True
-
-    # Private metadata + debounce
-    meta = json.loads(view.get("private_metadata", "{}") or "{}")
-    if meta.get("improving"):
-        logging.info("Improve clicked while already improving; ignoring.")
-        return JSONResponse({})
-    guest_name = meta.get("guest_name", "Guest")
-    guest_msg = meta.get("guest_message", "")
-
-    # Build a "loading" view preserving input + text
-    loading_meta = {**meta, "improving": True, "checkbox_checked": checkbox_checked}
-    loading_blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply…"}}
-    ] + get_modal_blocks(
-        guest_name,
-        guest_msg,
-        action_id="edit",
-        draft_text=edited_text,            # preserve current text
-        checkbox_checked=checkbox_checked  # preserve checkbox
-    )
-    loading_view = {
-        "type": "modal",
-        "title": {"type": "plain_text", "text": "Improving…", "emoji": True},
-        "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-        "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-        "private_metadata": json.dumps(loading_meta),
-        "blocks": loading_blocks
-    }
-
-    # Update via API immediately using current hash; CAPTURE & LOG response
-    current_hash = view.get("hash")
-    try:
-        resp = slack_client.views_update(view_id=view_id, hash=current_hash, view=loading_view)
-        logging.info(f"views_update (loading) resp: {resp}")
-        if not resp.get("ok"):
-            err = resp.get("error")
-            logging.error(f"views_update (loading) returned ok=false: {err}")
-            # Fallback once without hash so user still sees loading
-            resp2 = slack_client.views_update(view_id=view_id, view=loading_view)
-            logging.info(f"views_update (loading) fallback resp: {resp2}")
-            if not resp2.get("ok"):
-                logging.error(f"views_update (loading) fallback ok=false: {resp2.get('error')}")
-                # Bail out visibly
+        if action_id == "improve_with_ai":
+            view = payload.get("view", {})
+            view_id = view.get("id")
+            if not view_id:
+                logging.error("No view_id on improve_with_ai payload")
                 return JSONResponse({})
-        # success path
-        new_hash = resp.get("view", {}).get("hash") or resp.get("hash")
-    except Exception as e:
-        logging.error(f"views_update (loading) exception: {e}")
-        # Final fallback: try without hash and keep going
-        try:
-            resp2 = slack_client.views_update(view_id=view_id, view=loading_view)
-            logging.info(f"views_update (loading) exception-fallback resp: {resp2}")
-            new_hash = resp2.get("view", {}).get("hash") or resp2.get("hash")
-            if not resp2.get("ok"):
-                logging.error(f"views_update (loading) exception-fallback ok=false: {resp2.get('error')}")
-        except Exception as e2:
-            logging.error(f"views_update (loading) second exception: {e2}")
+
+            # Read current typed text from state
+            state = view.get("state", {}).get("values", {})
+            reply_block = state.get("reply_input", {})
+            edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
+
+            # Checkbox state
+            state_save = state.get("save_answer_block", {})
+            checkbox_checked = False
+            if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
+                checkbox_checked = True
+
+            # Private metadata + debounce
+            meta = json.loads(view.get("private_metadata", "{}") or "{}")
+            if meta.get("improving"):
+                logging.info("Improve clicked while already improving; ignoring.")
+                return JSONResponse({})
+            guest_name = meta.get("guest_name", "Guest")
+            guest_msg = meta.get("guest_message", "")
+
+            # Build a "loading" view preserving input + text
+            loading_meta = {**meta, "improving": True, "checkbox_checked": checkbox_checked}
+            loading_blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply…"}}
+            ] + get_modal_blocks(
+                guest_name,
+                guest_msg,
+                action_id="edit",
+                draft_text=edited_text,            # preserve current text
+                checkbox_checked=checkbox_checked  # preserve checkbox
+            )
+            loading_view = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Improving…", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": json.dumps(loading_meta),
+                "blocks": loading_blocks
+            }
+
+            # Update via API immediately using current hash; CAPTURE & LOG response
+            current_hash = view.get("hash")
+            try:
+                resp = slack_client.views_update(view_id=view_id, hash=current_hash, view=loading_view)
+                logging.info(f"views_update (loading) resp: {resp}")
+                if not resp.get("ok"):
+                    err = resp.get("error")
+                    logging.error(f"views_update (loading) returned ok=false: {err}")
+                    # Fallback once without hash so user still sees loading
+                    resp2 = slack_client.views_update(view_id=view_id, view=loading_view)
+                    logging.info(f"views_update (loading) fallback resp: {resp2}")
+                    if not resp2.get("ok"):
+                        logging.error(f"views_update (loading) fallback ok=false: {resp2.get('error')}")
+                        return JSONResponse({})
+                # success path
+                new_hash = resp.get("view", {}).get("hash") or resp.get("hash")
+            except Exception as e:
+                logging.error(f"views_update (loading) exception: {e}")
+                # Final fallback: try without hash and keep going
+                try:
+                    resp2 = slack_client.views_update(view_id=view_id, view=loading_view)
+                    logging.info(f"views_update (loading) exception-fallback resp: {resp2}")
+                    new_hash = resp2.get("view", {}).get("hash") or resp2.get("hash")
+                    if not resp2.get("ok"):
+                        logging.error(f"views_update (loading) exception-fallback ok=false: {resp2.get('error')}")
+                        return JSONResponse({})
+                except Exception as e2:
+                    logging.error(f"views_update (loading) second exception: {e2}")
+                    return JSONResponse({})
+
+            # Background: call OpenAI + final update using fresh hash
+            background_tasks.add_task(
+                _background_improve_and_update,
+                view_id,
+                new_hash,
+                loading_meta,
+                edited_text,
+                guest_name,
+                guest_msg,
+            )
+
+            # IMPORTANT: return empty JSON — no response_action from block_action
             return JSONResponse({})
-
-    # Background: call OpenAI + final update using fresh hash
-    background_tasks.add_task(
-        _background_improve_and_update,
-        view_id,
-        new_hash,
-        loading_meta,
-        edited_text,
-        guest_name,
-        guest_msg,
-    )
-
-    # IMPORTANT: return empty JSON — no response_action from block_action
-    return JSONResponse({})
 
         # --- UNDO AI IMPROVEMENT ---
         if action_id == "undo_ai":
