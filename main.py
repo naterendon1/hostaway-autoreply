@@ -101,7 +101,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             logging.info("🧾 Empty message skipped.")
         return {"status": "ignored"}
 
-    # Intent detection (classification)
+    # --- Intent detection
     detected_intent = detect_intent(guest_msg)
     logging.info(f"[INTENT] Detected message intent: {detected_intent}")
 
@@ -124,10 +124,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Fetch message thread for full context (and trim for token safety) ---
+    # --- Fetch message thread for context ---
     MAX_THREAD_MESSAGES = 8
     TRIMMED_MSG_LEN = 300
-
     def trim_msg(m):
         return m[:TRIMMED_MSG_LEN] + ("…" if len(m) > TRIMMED_MSG_LEN else "")
 
@@ -185,13 +184,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if lat and lng:
             places = search_google_places(keyword, lat, lng, type_hint=place_type)
             if places:
-                local_recs = f"Here are some recommended {keyword}s near your property:\n"
-                for p in places:
-                    local_recs += f"- {p['name']} ({p.get('rating', 'N/A')}) – {p['address']}\n"
+                local_recs = (
+                    f"Nearby {keyword}s from Google Maps for this property:\n"
+                    + "\n".join([f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}" for p in places])
+                )
+            else:
+                logging.info(f"[PLACES] No results for '{keyword}' at {lat},{lng}")
+                local_recs = f"No {keyword}s found nearby from Google Maps."
         else:
-            local_recs = "Sorry, couldn't determine the property location for recommendations.\n"
+            local_recs = "Sorry, couldn't determine the property location for recommendations."
+            logging.warning("[PLACES] No lat/lng for property.")
 
-    # --- AI PROMPT CONSTRUCTION (contextual) ---
+    # --- AI PROMPT CONSTRUCTION ---
     ai_prompt = build_full_prompt(
         guest_message=guest_msg,
         thread_msgs=conversation_context,
@@ -203,6 +207,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         extra_instructions=local_recs if local_recs else None
     )
 
+    # --- AI Completion ---
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
     # --- SLACK BLOCK CONSTRUCTION ---
