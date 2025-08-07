@@ -9,6 +9,20 @@ from difflib import get_close_matches
 import re
 from openai import OpenAI
 
+# --- Intent Labels (always keep above detect_intent!) ---
+INTENT_LABELS = [
+    "booking inquiry",
+    "cancellation",
+    "general question",
+    "complaint",
+    "extend stay",
+    "amenities",
+    "check-in info",
+    "check-out info",
+    "pricing inquiry",
+    "other"
+]
+
 # --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
@@ -26,6 +40,40 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- detect_intent uses the global INTENT_LABELS above! ---
+def detect_intent(message: str) -> str:
+    """
+    Uses OpenAI to classify guest messages into predefined intent categories.
+    """
+    system_prompt = (
+        "You are an intent classification assistant for a vacation rental business. "
+        "Given a guest message, return ONLY the intent label from this list: "
+        f"{', '.join(INTENT_LABELS)}. "
+        "Return just the label, nothing else."
+    )
+    user_prompt = f"Message: {message}"
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=10,
+            temperature=0
+        )
+        intent = response.choices[0].message.content.strip().lower()
+        for label in INTENT_LABELS:
+            if label in intent:
+                return label
+        return "other"
+    except Exception as e:
+        logging.error(f"Intent detection failed: {e}")
+        return "other"
+
+# ---- Rest of your code unchanged below this line ----
+# ... (keep your functions for hostaway, db, google places, etc. as before)
 
 PROPERTY_LOCATIONS = {
     "crystal_beach": {"lat": 29.4472, "lng": -94.6296, "city": "Crystal Beach, TX"},
@@ -614,48 +662,3 @@ def get_modal_blocks(guest_name, guest_msg, draft_text="", action_id="edit", che
         }
     ]
     return blocks
-
-
-# --- Intent Detection ---
-INTENT_LABELS = [
-    "booking inquiry",
-    "cancellation",
-    "general question",
-    "complaint",
-    "extend stay",
-    "amenities",
-    "check-in info",
-    "check-out info",
-    "pricing inquiry",
-    "other"
-]
-
-def detect_intent(message: str) -> str:
-    """
-    Uses OpenAI to classify guest messages into predefined intent categories.
-    """
-    system_prompt = (
-        "You are an intent classification assistant for a vacation rental business. "
-        "Given a guest message, return ONLY the intent label from this list: "
-        f"{', '.join(INTENT_LABELS)}. "
-        "Return just the label, nothing else."
-    )
-    user_prompt = f"Message: {message}"
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=10,
-            temperature=0
-        )
-        intent = response.choices[0].message.content.strip().lower()
-        for label in INTENT_LABELS:
-            if label in intent:
-                return label
-        return "other"
-    except Exception as e:
-        logging.error(f"Intent detection failed: {e}")
-        return "other"
