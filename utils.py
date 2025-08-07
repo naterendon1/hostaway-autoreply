@@ -210,34 +210,54 @@ def build_full_prompt(
     calendar_summary,
     intent,
     similar_examples,
-    extra_instructions=None  # <-- pass in Google Places summary block here!
+    extra_instructions=None,  # <-- pass in Google Places summary block here!
+    max_messages=12,          # Limit number of messages
+    max_field_chars=600       # Truncate very large fields
 ):
     """
     Compose the full prompt for OpenAI, always referencing last guest/host messages,
     and (if present) dynamic Google Places results right before reply instructions.
     """
+    # --- Limit history ---
+    recent_msgs = thread_msgs[-max_messages:] if len(thread_msgs) > max_messages else thread_msgs
     prompt = "You are a real human host. Here is the conversation so far (newest last):\n"
-    for m in thread_msgs:
-        prompt += m + "\n"
+    for m in recent_msgs:
+        # Optionally truncate single message if very large
+        if len(m) > 600:
+            prompt += m[:600] + " ...[truncated]\n"
+        else:
+            prompt += m + "\n"
+
+    # --- Truncate large fields for listing/reservation/calendar ---
+    def trunc(s):
+        s = str(s)
+        return (s[:max_field_chars] + " ...[truncated]") if len(s) > max_field_chars else s
+
     prompt += (
-        f"\nReservation info: {reservation}\n"
-        f"Listing info: {listing}\n"
-        f"Calendar info: {calendar_summary}\n"
+        f"\nReservation info: {trunc(reservation)}\n"
+        f"Listing info: {trunc(listing)}\n"
+        f"Calendar info: {trunc(calendar_summary)}\n"
         f"Intent: {intent}\n"
     )
+
+    # --- Truncate similar examples if needed ---
     if similar_examples:
         prompt += "\nSimilar previous guest questions and replies:\n"
-        for eg in similar_examples:
-            prompt += f"Q: {eg[0]}\nA: {eg[2]}\n"
+        for eg in similar_examples[:3]:  # Only use 3 for brevity
+            q, a = trunc(eg[0]), trunc(eg[2])
+            prompt += f"Q: {q}\nA: {a}\n"
+
     # Always add any extra context (Google results, etc) right here:
     if extra_instructions:
-        prompt += "\nNearby recommendations (from Google Places):\n" + extra_instructions + "\n"
+        prompt += "\nNearby recommendations (from Google Places):\n" + trunc(extra_instructions) + "\n"
+
     prompt += (
         "\nReply ONLY as the host to the latest guest message at the end of this conversation. "
         "Always use the actual conversation history above for your reply. "
         "If an item is being sent back by your cleaner, acknowledge the cleaner's favor, not the guest's."
     )
     return prompt
+
 
 def fetch_hostaway_calendar(listing_id, start_date, end_date):
     token = get_hostaway_access_token()
