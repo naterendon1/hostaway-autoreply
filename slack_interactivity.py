@@ -67,7 +67,6 @@ def get_modal_blocks(guest_name, guest_msg, action_id, draft_text="", checkbox_c
         "label": {"type": "plain_text", "text": "Learning", "emoji": True},
         "optional": True
     }
-    # Patch: Only set initial_options if checked
     if checkbox_checked:
         learning_checkbox["element"]["initial_options"] = [learning_checkbox_option]
 
@@ -180,13 +179,13 @@ def add_undo_button(blocks, meta):
 
 def improve_with_ai_and_update_modal(
     view_id,
+    hash_value,
     guest_name,
     guest_msg,
     edited_text,
     meta,
     checkbox_checked
 ):
-    # This runs in the background!
     prompt = (
         "Take this guest message reply and improve it. "
         "Make it clear, modern, friendly, concise, and natural. "
@@ -229,8 +228,10 @@ def improve_with_ai_and_update_modal(
         }] + blocks
 
     try:
+        # Include hash for race condition safety!
         slack_client.views_update(
             view_id=view_id,
+            hash=hash_value,
             view={
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "AI Improved Reply", "emoji": True},
@@ -403,7 +404,7 @@ async def slack_actions(
                 logging.error(f"Slack modal error: {e}")
             return JSONResponse({})
 
-        # --- IMPROVE WITH AI (now async, loading modal) ---
+        # --- IMPROVE WITH AI (show loading modal, then async update) ---
         if action_id == "improve_with_ai":
             view = payload.get("view", {})
             state = view.get("state", {}).get("values", {})
@@ -419,7 +420,7 @@ async def slack_actions(
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "")
 
-            # Respond immediately with a loading modal (response_action: "update")
+            # Respond immediately with a loading modal!
             loading_modal = {
                 "response_action": "update",
                 "view": {
@@ -436,10 +437,11 @@ async def slack_actions(
                 }
             }
 
-            # Kick off background OpenAI + Slack update
+            # Kick off OpenAI + update modal in background
             background_tasks.add_task(
                 improve_with_ai_and_update_modal,
                 view_id=view.get("id"),
+                hash_value=view.get("hash"),
                 guest_name=guest_name,
                 guest_msg=guest_msg,
                 edited_text=edited_text,
