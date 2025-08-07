@@ -210,47 +210,89 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # --- AI Completion ---
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
-    # --- SLACK BLOCK CONSTRUCTION ---
-    button_meta_minimal = {
-        "conv_id": conv_id,
-        "listing_id": listing_id,
-        "guest_id": guest_id,
-        "type": communication_type,
-        "guest_name": guest_name,
-        "guest_message": guest_msg,
-        "ai_suggestion": ai_reply,
-    }
-
-    blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
-        {
-            "type": "context",
-            "elements": [
-                {"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}
-            ]
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
-                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
-                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
-            ]
-        }
-    ]
-
     from slack_sdk import WebClient
     slack_client = WebClient(token=SLACK_BOT_TOKEN)
+
+    # --- SLACK BLOCK CONSTRUCTION (PATCH: Build meta AFTER posting to get ts) ---
+    # 1. Send a basic message, get the timestamp
+    slack_message_result = None
     try:
-        slack_client.chat_postMessage(
+        slack_message_result = slack_client.chat_postMessage(
             channel=SLACK_CHANNEL,
-            blocks=blocks,
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+                {
+                    "type": "context",
+                    "elements": [
+                        {"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}
+                    ]
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": "dummy", "action_id": "noop"},
+                        {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": "dummy", "action_id": "noop"},
+                        {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": "dummy", "action_id": "noop"}
+                    ]
+                }
+            ],
             text="New message from guest"
         )
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
+
+    # PATCH: Now grab the ts, build proper meta and update message with real actions
+    if slack_message_result:
+        slack_ts = slack_message_result["ts"]
+
+        button_meta_minimal = {
+            "conv_id": conv_id,
+            "listing_id": listing_id,
+            "guest_id": guest_id,
+            "type": communication_type,
+            "guest_name": guest_name,
+            "guest_message": guest_msg,
+            "ai_suggestion": ai_reply,
+            "channel": SLACK_CHANNEL,
+            "ts": slack_ts,
+            "check_in": check_in,
+            "check_out": check_out,
+            "guest_count": guest_count,
+            "status": status,
+            "detected_intent": detected_intent,
+        }
+
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}
+                ]
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
+                ]
+            }
+        ]
+
+        try:
+            slack_client.chat_update(
+                channel=SLACK_CHANNEL,
+                ts=slack_ts,
+                blocks=blocks,
+                text="New message from guest"
+            )
+        except Exception as e:
+            logging.error(f"❌ Slack update error: {e}")
 
     return {"status": "ok"}
 
