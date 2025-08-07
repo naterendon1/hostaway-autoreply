@@ -11,7 +11,7 @@ from utils import (
     store_learning_example,
     get_similar_learning_examples,
     clean_ai_reply,
-    get_modal_blocks,  # now from utils
+    # DO NOT import get_modal_blocks here (we patch it below)
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +21,62 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
+def get_modal_blocks(guest_name, guest_msg, action_id, draft_text="", checkbox_checked=False):
+    reply_block = {
+        "type": "input",
+        "block_id": "reply_input",
+        "label": {"type": "plain_text", "text": "Your reply:" if action_id == "write_own" else "Edit below:", "emoji": True},
+        "element": {
+            "type": "plain_text_input",
+            "action_id": "reply",
+            "multiline": True,
+        }
+    }
+    if action_id == "edit" and draft_text:
+        reply_block["element"]["initial_value"] = draft_text
+
+    learning_checkbox_option = {
+        "text": {"type": "plain_text", "text": "Save this answer for next time", "emoji": True},
+        "value": "save"
+    }
+    learning_checkbox = {
+        "type": "input",
+        "block_id": "save_answer_block",
+        "element": {
+            "type": "checkboxes",
+            "action_id": "save_answer",
+            "options": [learning_checkbox_option]
+        },
+        "label": {"type": "plain_text", "text": "Learning", "emoji": True},
+        "optional": True
+    }
+    # Patch: Only set initial_options if checked
+    if checkbox_checked:
+        learning_checkbox["element"]["initial_options"] = [learning_checkbox_option]
+
+    return [
+        {
+            "type": "section",
+            "block_id": "guest_message_section",
+            "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}
+        },
+        reply_block,
+        {
+            "type": "actions",
+            "block_id": "improve_ai_block",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "improve_with_ai",
+                    "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}
+                }
+            ]
+        },
+        learning_checkbox
+    ]
+# -------------------------------------------------------------------
 
 def update_slack_message_with_sent_reply(
     slack_bot_token,
@@ -210,8 +266,8 @@ async def slack_actions(request: Request):
                 "blocks": get_modal_blocks(
                     guest_name,
                     guest_msg,
-                    draft_text="",
                     action_id="write_own",
+                    draft_text="",
                     checkbox_checked=checkbox_checked
                 )
             }
@@ -228,8 +284,8 @@ async def slack_actions(request: Request):
             modal_blocks = get_modal_blocks(
                 guest_name,
                 guest_msg,
-                draft_text=ai_suggestion,
                 action_id="edit",
+                draft_text=ai_suggestion,
                 checkbox_checked=checkbox_checked
             )
             modal_blocks = add_undo_button(modal_blocks, meta)
@@ -260,10 +316,10 @@ async def slack_actions(request: Request):
             reply_block = state.get("reply_input", {})
             edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
 
-            prev_checkbox = False
             state_save = state.get("save_answer_block", {})
+            checkbox_checked = False
             if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
-                prev_checkbox = True
+                checkbox_checked = True
 
             meta = json.loads(view.get("private_metadata", "{}"))
             guest_name = meta.get("guest_name", "Guest")
@@ -295,14 +351,14 @@ async def slack_actions(request: Request):
             new_meta = {
                 **meta,
                 "previous_draft": previous_draft,
-                "checkbox_checked": prev_checkbox
+                "checkbox_checked": checkbox_checked
             }
             blocks = get_modal_blocks(
                 guest_name,
                 guest_msg,
-                draft_text=improved,
                 action_id="edit",
-                checkbox_checked=prev_checkbox
+                draft_text=improved,
+                checkbox_checked=checkbox_checked
             )
             blocks = add_undo_button(blocks, new_meta)
             if error_message:
@@ -337,8 +393,8 @@ async def slack_actions(request: Request):
             blocks = get_modal_blocks(
                 guest_name,
                 guest_msg,
-                draft_text=previous_draft,
                 action_id="edit",
+                draft_text=previous_draft,
                 checkbox_checked=checkbox_checked
             )
             blocks = add_undo_button(blocks, meta)
