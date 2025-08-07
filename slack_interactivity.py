@@ -257,6 +257,9 @@ async def slack_actions(request: Request):
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "(Message unavailable)")
             checkbox_checked = meta.get("checkbox_checked", False)
+            # Preserve channel and ts for post-send update
+            meta.setdefault("channel", payload.get("channel", {}).get("id") or os.getenv("SLACK_CHANNEL"))
+            meta.setdefault("ts", payload.get("message", {}).get("ts"))
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Reply", "emoji": True},
@@ -289,6 +292,9 @@ async def slack_actions(request: Request):
                 checkbox_checked=checkbox_checked
             )
             modal_blocks = add_undo_button(modal_blocks, meta)
+            # Preserve channel and ts for post-send update
+            meta.setdefault("channel", payload.get("channel", {}).get("id") or os.getenv("SLACK_CHANNEL"))
+            meta.setdefault("ts", payload.get("message", {}).get("ts"))
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Edit AI Reply", "emoji": True},
@@ -348,6 +354,9 @@ async def slack_actions(request: Request):
                 improved = previous_draft
                 error_message = f"Error improving with AI: {str(e)}"
 
+            # Preserve channel and ts for post-send update
+            meta.setdefault("channel", payload.get("channel", {}).get("id") or os.getenv("SLACK_CHANNEL"))
+            meta.setdefault("ts", payload.get("message", {}).get("ts"))
             new_meta = {
                 **meta,
                 "previous_draft": previous_draft,
@@ -398,6 +407,9 @@ async def slack_actions(request: Request):
                 checkbox_checked=checkbox_checked
             )
             blocks = add_undo_button(blocks, meta)
+            # Preserve channel and ts for post-send update
+            meta.setdefault("channel", payload.get("channel", {}).get("id") or os.getenv("SLACK_CHANNEL"))
+            meta.setdefault("ts", payload.get("message", {}).get("ts"))
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Edit Your Reply", "emoji": True},

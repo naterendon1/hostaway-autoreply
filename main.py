@@ -47,6 +47,11 @@ app.include_router(slack_router)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 MAX_THREAD_MESSAGES = 10
 
+# For Render/CLI runs
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
 class HostawayUnifiedWebhook(BaseModel):
     object: str
     event: str
@@ -249,6 +254,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "guest_name": guest_name,
         "guest_message": guest_msg,
         "ai_suggestion": ai_reply,
+        "check_in": check_in,
+        "check_out": check_out,
+        "guest_count": guest_count,
+        "status": status,
+        "detected_intent": detected_intent,
+        "channel": SLACK_CHANNEL
     }
 
     blocks = [
