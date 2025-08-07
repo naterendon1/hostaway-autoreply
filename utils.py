@@ -617,17 +617,30 @@ def get_modal_blocks(guest_name, guest_msg, draft_text="", action_id="edit", che
 
 def detect_intent(message: str) -> str:
     """
-    Dummy keyword-based intent detector. Expand with your own logic or ML model.
+    Uses OpenAI to classify guest messages into predefined intent categories.
     """
-    msg = message.lower()
-    if any(word in msg for word in ["cancel", "refund"]):
-        return "cancellation"
-    if any(word in msg for word in ["book", "available", "reserve", "date"]):
-        return "booking"
-    if any(word in msg for word in ["question", "info", "information", "details"]):
-        return "info_request"
-    if any(word in msg for word in ["extend", "extra night", "longer"]):
-        return "extend_stay"
-    # Add more rules as you need
-    return "general"
-
+    system_prompt = (
+        "You are an intent classification assistant for a vacation rental business. "
+        "Given a guest message, return ONLY the intent label from this list: "
+        f"{', '.join(INTENT_LABELS)}. "
+        "Return just the label, nothing else."
+    )
+    user_prompt = f"Message: {message}"
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=10,
+            temperature=0
+        )
+        intent = response.choices[0].message.content.strip().lower()
+        for label in INTENT_LABELS:
+            if label in intent:
+                return label
+        return "other"
+    except Exception as e:
+        logging.error(f"Intent detection failed: {e}")
+        return "other"
