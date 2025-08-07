@@ -5,6 +5,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
 from openai import OpenAI
+import hmac
+import hashlib
+import time
+from fastapi import Header, HTTPException
 from utils import (
     send_reply_to_hostaway,
     fetch_hostaway_resource,
@@ -21,6 +25,17 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+
+def verify_slack_signature(request_body, slack_signature, slack_request_timestamp):
+    """Check Slack request is authentic"""
+    if not SLACK_SIGNING_SECRET:
+        raise RuntimeError("Missing SLACK_SIGNING_SECRET")
+    basestring = f"v0:{slack_request_timestamp}:{request_body}".encode("utf-8")
+    my_signature = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode("utf-8"), basestring, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(my_signature, slack_signature)
 
 # --------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
 def get_modal_blocks(guest_name, guest_msg, action_id, draft_text="", checkbox_checked=False):
@@ -164,16 +179,31 @@ def add_undo_button(blocks, meta):
     return blocks
 
 @router.post("/slack/actions")
-async def slack_actions(request: Request):
-    logging.info("🎯 /slack/actions endpoint hit!")
+async def slack_actions(
+    request: Request,
+    x_slack_signature: str = Header(None, alias="X-Slack-Signature"),
+    x_slack_request_timestamp: str = Header(None, alias="X-Slack-Request-Timestamp")
+):
+    body = await request.body()
+
+    # 1. Check request is fresh (avoid replay attacks)
+    if not x_slack_request_timestamp or abs(time.time() - int(x_slack_request_timestamp)) > 60 * 5:
+        raise HTTPException(status_code=400, detail="Invalid Slack request timestamp.")
+
+    # 2. Verify Slack signature
+    if not x_slack_signature or not verify_slack_signature(
+        body.decode("utf-8"),
+        x_slack_signature,
+        x_slack_request_timestamp
+    ):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature.")
+
+    # 3. Parse the Slack form-encoded payload
     form = await request.form()
     payload_raw = form.get("payload")
     if not payload_raw:
-        logging.error("No payload found in Slack actions request!")
-        return JSONResponse({})
-
+        raise HTTPException(status_code=400, detail="Missing payload from Slack.")
     payload = json.loads(payload_raw)
-    logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
     if payload.get("type") == "block_actions":
         action = payload["actions"][0]
