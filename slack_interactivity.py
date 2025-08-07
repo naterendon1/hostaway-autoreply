@@ -1,14 +1,14 @@
 import os
 import logging
 import json
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
-from slack_sdk import WebClient
-from openai import OpenAI
 import hmac
 import hashlib
 import time
-from fastapi import Header, HTTPException
+
+from fastapi import APIRouter, Request, Header, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+from slack_sdk import WebClient
+from openai import OpenAI
 from utils import (
     send_reply_to_hostaway,
     fetch_hostaway_resource,
@@ -36,146 +36,6 @@ def verify_slack_signature(request_body, slack_signature, slack_request_timestam
         SLACK_SIGNING_SECRET.encode("utf-8"), basestring, hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(my_signature, slack_signature)
-
-def improve_with_ai_and_update_modal(
-    view_id,
-    guest_name,
-    guest_msg,
-    edited_text,
-    meta,
-    checkbox_checked
-):
-    from slack_sdk import WebClient
-
-    SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-    slack_client = WebClient(token=SLACK_BOT_TOKEN)
-
-    prompt = (
-        "Take this guest message reply and improve it. "
-        "Make it clear, modern, friendly, concise, and natural. "
-        "Do not add extra content or use emojis. Only return the improved version.\n\n"
-        f"{edited_text}"
-    )
-
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            timeout=15,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant for editing guest replies. Be clear, modern, friendly, and concise. No emojis."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        improved = clean_ai_reply(response.choices[0].message.content.strip())
-        error_message = None
-    except Exception as e:
-        improved = edited_text
-        error_message = f"Error improving with AI: {str(e)}"
-
-    # Prepare updated modal blocks
-    new_meta = {
-        **meta,
-        "previous_draft": edited_text,
-        "checkbox_checked": checkbox_checked
-    }
-    blocks = get_modal_blocks(
-        guest_name,
-        guest_msg,
-        action_id="edit",
-        draft_text=improved,
-        checkbox_checked=checkbox_checked
-    )
-    blocks = add_undo_button(blocks, new_meta)
-    if error_message:
-        blocks = [{
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}
-        }] + blocks
-
-    try:
-        slack_client.views_update(
-            view_id=view_id,
-            view={
-                "type": "modal",
-                "title": {"type": "plain_text", "text": "AI Improved Reply", "emoji": True},
-                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                "private_metadata": json.dumps(new_meta),
-                "blocks": blocks
-            }
-        )
-    except Exception as e:
-        logging.error(f"Slack views_update error: {e}")
-def improve_with_ai_and_update_modal(
-    view_id,
-    guest_name,
-    guest_msg,
-    edited_text,
-    meta,
-    checkbox_checked
-):
-    from slack_sdk import WebClient
-
-    SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-    slack_client = WebClient(token=SLACK_BOT_TOKEN)
-
-    prompt = (
-        "Take this guest message reply and improve it. "
-        "Make it clear, modern, friendly, concise, and natural. "
-        "Do not add extra content or use emojis. Only return the improved version.\n\n"
-        f"{edited_text}"
-    )
-
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            timeout=15,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant for editing guest replies. Be clear, modern, friendly, and concise. No emojis."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        improved = clean_ai_reply(response.choices[0].message.content.strip())
-        error_message = None
-    except Exception as e:
-        improved = edited_text
-        error_message = f"Error improving with AI: {str(e)}"
-
-    # Prepare updated modal blocks
-    new_meta = {
-        **meta,
-        "previous_draft": edited_text,
-        "checkbox_checked": checkbox_checked
-    }
-    blocks = get_modal_blocks(
-        guest_name,
-        guest_msg,
-        action_id="edit",
-        draft_text=improved,
-        checkbox_checked=checkbox_checked
-    )
-    blocks = add_undo_button(blocks, new_meta)
-    if error_message:
-        blocks = [{
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}
-        }] + blocks
-
-    try:
-        slack_client.views_update(
-            view_id=view_id,
-            view={
-                "type": "modal",
-                "title": {"type": "plain_text", "text": "AI Improved Reply", "emoji": True},
-                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                "private_metadata": json.dumps(new_meta),
-                "blocks": blocks
-            }
-        )
-    except Exception as e:
-        logging.error(f"Slack views_update error: {e}")
-
 
 # --------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
 def get_modal_blocks(guest_name, guest_msg, action_id, draft_text="", checkbox_checked=False):
@@ -318,6 +178,71 @@ def add_undo_button(blocks, meta):
         })
     return blocks
 
+def improve_with_ai_and_update_modal(
+    view_id,
+    guest_name,
+    guest_msg,
+    edited_text,
+    meta,
+    checkbox_checked
+):
+    # This runs in the background!
+    prompt = (
+        "Take this guest message reply and improve it. "
+        "Make it clear, modern, friendly, concise, and natural. "
+        "Do not add extra content or use emojis. Only return the improved version.\n\n"
+        f"{edited_text}"
+    )
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4",
+            timeout=15,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for editing guest replies. Be clear, modern, friendly, and concise. No emojis."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        improved = clean_ai_reply(response.choices[0].message.content.strip())
+        error_message = None
+    except Exception as e:
+        improved = edited_text
+        error_message = f"Error improving with AI: {str(e)}"
+
+    # Prepare updated modal blocks
+    new_meta = {
+        **meta,
+        "previous_draft": edited_text,
+        "checkbox_checked": checkbox_checked
+    }
+    blocks = get_modal_blocks(
+        guest_name,
+        guest_msg,
+        action_id="edit",
+        draft_text=improved,
+        checkbox_checked=checkbox_checked
+    )
+    blocks = add_undo_button(blocks, new_meta)
+    if error_message:
+        blocks = [{
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}
+        }] + blocks
+
+    try:
+        slack_client.views_update(
+            view_id=view_id,
+            view={
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "AI Improved Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": json.dumps(new_meta),
+                "blocks": blocks
+            }
+        )
+    except Exception as e:
+        logging.error(f"Slack views_update error: {e}")
+
 @router.post("/slack/actions")
 async def slack_actions(
     request: Request,
@@ -399,7 +324,6 @@ async def slack_actions(
                 )
             elif ts and channel and not success:
                 try:
-                    # Just show error in the thread
                     slack_client.chat_update(
                         channel=channel,
                         ts=ts,
@@ -417,7 +341,6 @@ async def slack_actions(
                 except Exception as e:
                     logging.error(f"Slack chat_update error: {e}")
 
-            # --- Close the modal after send ---
             return JSONResponse({
                 "response_action": "clear"
             })
@@ -480,55 +403,51 @@ async def slack_actions(
                 logging.error(f"Slack modal error: {e}")
             return JSONResponse({})
 
-        # --- IMPROVE WITH AI ---
-       from fastapi import BackgroundTasks
+        # --- IMPROVE WITH AI (now async, loading modal) ---
+        if action_id == "improve_with_ai":
+            view = payload.get("view", {})
+            state = view.get("state", {}).get("values", {})
+            reply_block = state.get("reply_input", {})
+            edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
 
-# ... (inside your @router.post("/slack/actions") ...)
+            state_save = state.get("save_answer_block", {})
+            checkbox_checked = False
+            if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
+                checkbox_checked = True
 
-if action_id == "improve_with_ai":
-    view = payload.get("view", {})
-    state = view.get("state", {}).get("values", {})
-    reply_block = state.get("reply_input", {})
-    edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
+            meta = json.loads(view.get("private_metadata", "{}"))
+            guest_name = meta.get("guest_name", "Guest")
+            guest_msg = meta.get("guest_message", "")
 
-    state_save = state.get("save_answer_block", {})
-    checkbox_checked = False
-    if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
-        checkbox_checked = True
-
-    meta = json.loads(view.get("private_metadata", "{}"))
-    guest_name = meta.get("guest_name", "Guest")
-    guest_msg = meta.get("guest_message", "")
-
-    # 1. Respond immediately with a loading modal (response_action: "update")
-    loading_modal = {
-        "response_action": "update",
-        "view": {
-            "type": "modal",
-            "title": {"type": "plain_text", "text": "Improving…", "emoji": True},
-            "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply with AI…"}
+            # Respond immediately with a loading modal (response_action: "update")
+            loading_modal = {
+                "response_action": "update",
+                "view": {
+                    "type": "modal",
+                    "title": {"type": "plain_text", "text": "Improving…", "emoji": True},
+                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply with AI…"}
+                        }
+                    ],
+                    "private_metadata": view.get("private_metadata"),
                 }
-            ],
-            "private_metadata": view.get("private_metadata"),
-        }
-    }
+            }
 
-    # 2. Kick off background OpenAI + Slack update
-    background_tasks.add_task(
-        improve_with_ai_and_update_modal,
-        view_id=view.get("id"),
-        guest_name=guest_name,
-        guest_msg=guest_msg,
-        edited_text=edited_text,
-        meta=meta,
-        checkbox_checked=checkbox_checked
-    )
+            # Kick off background OpenAI + Slack update
+            background_tasks.add_task(
+                improve_with_ai_and_update_modal,
+                view_id=view.get("id"),
+                guest_name=guest_name,
+                guest_msg=guest_msg,
+                edited_text=edited_text,
+                meta=meta,
+                checkbox_checked=checkbox_checked
+            )
 
-    return JSONResponse(content=loading_modal)
+            return JSONResponse(content=loading_modal)
 
         # --- UNDO AI IMPROVEMENT ---
         if action_id == "undo_ai":
