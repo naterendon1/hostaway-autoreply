@@ -180,17 +180,12 @@ def add_undo_button(blocks, meta):
 
 # ---------------- Background: improve + final views.update (with hash) ----------------
 def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest_name, guest_msg):
-    """
-    Runs in the background: calls OpenAI to improve the text and then updates the modal.
-    Uses the fresh view hash captured from the loading update and retries once without hash if needed.
-    """
     prompt = (
         "Take this guest message reply and improve it. "
         "Make it clear, modern, friendly, concise, and natural. "
         "Do not add extra content or use emojis. Only return the improved version.\n\n"
         f"{edited_text}"
     )
-
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4",
@@ -207,25 +202,15 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         improved = edited_text
         error_message = f"Error improving with AI: {str(e)}"
 
-    # Build final view (preserve input ids; insert improved text)
-    new_meta = {
-        **meta,
-        "previous_draft": edited_text,
-        "improving": False,  # clear debounce flag
-    }
+    new_meta = {**meta, "previous_draft": edited_text, "improving": False}
     blocks = get_modal_blocks(
-        guest_name,
-        guest_msg,
-        action_id="edit",
+        guest_name, guest_msg, action_id="edit",
         draft_text=improved,
         checkbox_checked=new_meta.get("checkbox_checked", False)
     )
     blocks = add_undo_button(blocks, new_meta)
     if error_message:
-        blocks = [{
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}
-        }] + blocks
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}}] + blocks
 
     final_view = {
         "type": "modal",
@@ -236,22 +221,28 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         "blocks": blocks
     }
 
+    # First try WITH hash, log result
     try:
-        # First attempt: use the fresh hash for safety
-        slack_client.views_update(view_id=view_id, hash=hash_value, view=final_view)
-    except SlackApiError as e:
-        err = (getattr(e, "response", {}) or {}).get("error")
-        logging.error(f"views_update (final) with hash failed: {err}")
-        if err in {"hash_conflict", "not_found", "view_not_found"}:
-            # Retry once without hash
-            try:
-                slack_client.views_update(view_id=view_id, view=final_view)
-            except Exception as e2:
-                logging.error(f"views_update (final) retry without hash failed: {e2}")
-        else:
-            raise
+        resp = slack_client.views_update(view_id=view_id, hash=hash_value, view=final_view)
+        logging.info(f"views_update (final) resp: {resp}")
+        if not resp.get("ok"):
+            err = resp.get("error")
+            logging.error(f"views_update (final) ok=false: {err}")
+            if err in {"hash_conflict", "not_found", "view_not_found"}:
+                resp2 = slack_client.views_update(view_id=view_id, view=final_view)
+                logging.info(f"views_update (final) retry-no-hash resp: {resp2}")
+                if not resp2.get("ok"):
+                    logging.error(f"views_update (final) retry-no-hash ok=false: {resp2.get('error')}")
     except Exception as e:
-        logging.error(f"Slack views_update (final) error: {e}")
+        logging.error(f"views_update (final) exception: {e}")
+        # Retry once without hash
+        try:
+            resp2 = slack_client.views_update(view_id=view_id, view=final_view)
+            logging.info(f"views_update (final) exception retry-no-hash resp: {resp2}")
+            if not resp2.get("ok"):
+                logging.error(f"views_update (final) exception retry-no-hash ok=false: {resp2.get('error')}")
+        except Exception as e2:
+            logging.error(f"views_update (final) second exception: {e2}")
 
 
 # ---------------------------- Slack Interactivity Endpoint ----------------------------
