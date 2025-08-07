@@ -6,7 +6,6 @@ from slack_interactivity import router as slack_router
 from pydantic import BaseModel
 from openai import OpenAI
 from utils import (
-    build_full_prompt,
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
@@ -18,10 +17,10 @@ from utils import (
     is_date_available,
     next_available_dates,
     detect_intent,
-    get_property_location,
-    search_google_places,
-    detect_place_type,
+    get_property_info,
 )
+from utils import get_listing_amenities  # If using amenities as context
+from utils import get_property_location, search_google_places, detect_place_type
 
 logging.basicConfig(level=logging.INFO)
 
@@ -46,6 +45,7 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 app = FastAPI()
 app.include_router(slack_router)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+MAX_THREAD_MESSAGES = 10
 
 class HostawayUnifiedWebhook(BaseModel):
     object: str
@@ -56,22 +56,19 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str = None
     date: str = None
 
-SYSTEM_PROMPT = (
-    "You are a real human vacation rental host, not a bot. "
-    "Reply to guest messages as if you're texting a friend: short, direct, warm, clear, and like a millennial. "
-    "Avoid all formal or corporate phrases—never say things like 'Thank you for your message', 'Let me know if you have any other questions', 'Best regards', or 'I hope this helps'. "
-    "Never repeat what the guest said or already confirmed. "
-    "No greetings, no sign-offs. "
-    "Don't use emojis or exclamation marks unless totally natural. "
-    "If the guest confirms something, just say 'Great, thanks for confirming!' or nothing. "
-    "Only add details if they're genuinely useful. "
-    "Keep replies short, natural, and modern—no long explanations or lists. "
-    "BAD:\n'Thank you for your message. Your check-in is at 3pm. Let me know if you have any other questions.'\n"
-    "GOOD:\n'Check-in's at 3pm. Let me know if you need anything else.'\n"
-    "BEST:\n'Yep! Check-in's at 3pm. If you want to drop bags early, just let me know.'"
+SYSTEM_PROMPT_ANSWER = (
+    "You are a helpful, human, and context-aware vacation rental host. "
+    "Reply to the guest in a friendly, concise text message, as if you were texting from your phone. "
+    "Do NOT repeat what the guest just said or already confirmed—only reply with new, helpful info if needed. "
+    "If the guest already gave the answer, simply acknowledge or skip a reply unless clarification is needed. "
+    "Do NOT add greetings or sign-offs. "
+    "Always use the prior conversation (thread), reservation info, calendar, listing data, and relevant local recommendations. "
+    "Do not invent facts. "
+    "If the guest confirms something, you can just say 'Great, thanks for confirming!' or say nothing if no reply is needed. "
+    "Replies are sent to the guest as-is. No emojis."
 )
 
-def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT):
+def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4",
@@ -79,8 +76,7 @@ def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            timeout=20,
-            temperature=0.7
+            timeout=20
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -101,7 +97,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             logging.info("🧾 Empty message skipped.")
         return {"status": "ignored"}
 
-    # --- Intent detection
+    # Intent detection
     detected_intent = detect_intent(guest_msg)
     logging.info(f"[INTENT] Detected message intent: {detected_intent}")
 
@@ -110,6 +106,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_id = payload.data.get("listingMapId")
     guest_id = payload.data.get("userId", "")
     communication_type = payload.data.get("communicationType", "channel")
+    ts = payload.data.get("ts") or payload.data.get("slack_ts")  # Might be empty on first webhook
 
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res = reservation.get("result", {})
@@ -125,11 +122,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         guest_id = res.get("guestId", "")
 
     # --- Fetch message thread for context ---
-    MAX_THREAD_MESSAGES = 3
-    TRIMMED_MSG_LEN = 300
-    def trim_msg(m):
-        return m[:TRIMMED_MSG_LEN] + ("…" if len(m) > TRIMMED_MSG_LEN else "")
-
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
@@ -140,9 +132,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         body = m.get("body", "")
         if not body:
             continue
-        conversation_context.append(f"{sender}: {trim_msg(body)}")
+        conversation_context.append(f"{sender}: {body}")
+    context_str = "\n".join(conversation_context)
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
+    prev_answer = ""
+    if prev_examples and prev_examples[0][2]:
+        prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
+
     cancellation = get_cancellation_policy_summary({}, res)
 
     # --- CALENDAR INTENT & LIVE CHECK ---
@@ -176,7 +173,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # --- Fetch listing info for AI context ---
     listing = fetch_hostaway_listing(listing_id) or {}
 
-    # --- GOOGLE PLACES DYNAMIC RECS ---
+    # --- GOOGLE PLACES DYNAMIC RECOMMENDATIONS ---
     place_type, keyword = detect_place_type(guest_msg)
     local_recs = ""
     if place_type:
@@ -196,103 +193,66 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             logging.warning("[PLACES] No lat/lng for property.")
 
     # --- AI PROMPT CONSTRUCTION ---
-    ai_prompt = build_full_prompt(
-        guest_message=guest_msg,
-        thread_msgs=conversation_context,
-        reservation=res,
-        listing=listing,
-        calendar_summary=calendar_summary,
-        intent=detected_intent,
-        similar_examples=prev_examples,
-        extra_instructions=local_recs if local_recs else None
+    # You can also add amenities, cancellation, etc. as needed.
+    ai_prompt = (
+        f"Here is the conversation thread so far (newest last):\n"
+        f"{context_str}\n"
+        f"Reservation Info:\n{json.dumps(res)}\n"
+        f"Listing Info:\n{json.dumps(listing)}\n"
+        f"Calendar Info: {calendar_summary}\n"
+        f"{local_recs}\n"
+        f"Intent: {detected_intent}\n"
+        f"{prev_answer}\n"
+        "---\n"
+        "Write a brief, human reply to the most recent guest message above, using the full context. "
+        "Do NOT repeat what the guest just said or already confirmed. "
+        "Never add a greeting or a sign-off. Only answer the specific question, if possible."
     )
-
-    # --- AI Completion ---
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
+
+    # --- SLACK BLOCK CONSTRUCTION ---
+    button_meta_minimal = {
+        "conv_id": conv_id,
+        "listing_id": listing_id,
+        "guest_id": guest_id,
+        "type": communication_type,
+        "guest_name": guest_name,
+        "guest_message": guest_msg,
+        "ai_suggestion": ai_reply,
+        "channel": SLACK_CHANNEL,
+        "ts": ts
+    }
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}"}
+            ]
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
+                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
+                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
+            ]
+        }
+    ]
 
     from slack_sdk import WebClient
     slack_client = WebClient(token=SLACK_BOT_TOKEN)
-
-    # --- SLACK BLOCK CONSTRUCTION (PATCH: Build meta AFTER posting to get ts) ---
-    # 1. Send a basic message, get the timestamp
-    slack_message_result = None
     try:
-        slack_message_result = slack_client.chat_postMessage(
+        slack_client.chat_postMessage(
             channel=SLACK_CHANNEL,
-            blocks=[
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
-                {
-                    "type": "context",
-                    "elements": [
-                        {"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}
-                    ]
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": "dummy", "action_id": "noop"},
-                        {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": "dummy", "action_id": "noop"},
-                        {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": "dummy", "action_id": "noop"}
-                    ]
-                }
-            ],
+            blocks=blocks,
             text="New message from guest"
         )
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
-
-    # PATCH: Now grab the ts, build proper meta and update message with real actions
-    if slack_message_result:
-        slack_ts = slack_message_result["ts"]
-
-        button_meta_minimal = {
-            "conv_id": conv_id,
-            "listing_id": listing_id,
-            "guest_id": guest_id,
-            "type": communication_type,
-            "guest_name": guest_name,
-            "guest_message": guest_msg,
-            "ai_suggestion": ai_reply,
-            "channel": SLACK_CHANNEL,
-            "ts": slack_ts,
-            "check_in": check_in,
-            "check_out": check_out,
-            "guest_count": guest_count,
-            "status": status,
-            "detected_intent": detected_intent,
-        }
-
-        blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
-            {
-                "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}
-                ]
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
-                    {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
-                    {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
-                ]
-            }
-        ]
-
-        try:
-            slack_client.chat_update(
-                channel=SLACK_CHANNEL,
-                ts=slack_ts,
-                blocks=blocks,
-                text="New message from guest"
-            )
-        except Exception as e:
-            logging.error(f"❌ Slack update error: {e}")
 
     return {"status": "ok"}
 
