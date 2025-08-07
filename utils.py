@@ -528,7 +528,7 @@ def get_listing_amenities(listing_id):
     # 1. Fetch the listing to get amenities IDs
     listing = fetch_hostaway_listing(listing_id)
     if not listing or "result" not in listing:
-        logging.error(f"[AMENITY] Failed to fetch listing {listing_id}")
+       logging.error(f"[AMENITY] Failed to fetch amenities: {e}")
         return []
     amenities_ids = listing["result"].get("amenities", [])
     if not isinstance(amenities_ids, list):
