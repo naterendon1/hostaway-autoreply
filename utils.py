@@ -615,6 +615,21 @@ def get_modal_blocks(guest_name, guest_msg, draft_text="", action_id="edit", che
     ]
     return blocks
 
+
+# --- Intent Detection ---
+INTENT_LABELS = [
+    "booking inquiry",
+    "cancellation",
+    "general question",
+    "complaint",
+    "extend stay",
+    "amenities",
+    "check-in info",
+    "check-out info",
+    "pricing inquiry",
+    "other"
+]
+
 def detect_intent(message: str) -> str:
     """
     Uses OpenAI to classify guest messages into predefined intent categories.
