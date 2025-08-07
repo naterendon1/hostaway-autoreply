@@ -1,9 +1,14 @@
 import os
 import logging
 import json
-from fastapi import APIRouter, Request, BackgroundTasks
+import hmac
+import hashlib
+import time
+
+from fastapi import APIRouter, Request, Header, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from openai import OpenAI
 from utils import (
     send_reply_to_hostaway,
@@ -21,9 +26,33 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+
+
+# -------------------- Security: Slack Signature Verify --------------------
+def verify_slack_signature(request_body: str, slack_signature: str, slack_request_timestamp: str) -> bool:
+    """Verify Slack-signed request authenticity."""
+    if not SLACK_SIGNING_SECRET:
+        raise RuntimeError("Missing SLACK_SIGNING_SECRET")
+
+    # Reject replays (>5 minutes)
+    if not slack_request_timestamp or abs(time.time() - int(slack_request_timestamp)) > 60 * 5:
+        return False
+
+    basestring = f"v0:{slack_request_timestamp}:{request_body}".encode("utf-8")
+    my_signature = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode("utf-8"),
+        basestring,
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(my_signature, slack_signature or "")
+
 
 # --------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
-def get_modal_blocks(guest_name, guest_msg, action_id, draft_text="", checkbox_checked=False):
+def get_modal_blocks(guest_name, guest_msg, action_id, draft_text: str = "", checkbox_checked: bool = False):
+    """
+    Returns blocks for "Write/Edit reply" modals. Keeps stable block_id/action_id so we can preserve input text.
+    """
     reply_block = {
         "type": "input",
         "block_id": "reply_input",
@@ -34,7 +63,7 @@ def get_modal_blocks(guest_name, guest_msg, action_id, draft_text="", checkbox_c
             "multiline": True,
         }
     }
-    if action_id == "edit" and draft_text:
+    if action_id in ("edit", "write_own") and draft_text:
         reply_block["element"]["initial_value"] = draft_text
 
     learning_checkbox_option = {
@@ -52,7 +81,7 @@ def get_modal_blocks(guest_name, guest_msg, action_id, draft_text="", checkbox_c
         "label": {"type": "plain_text", "text": "Learning", "emoji": True},
         "optional": True
     }
-    # Patch: Only set initial_options if checked
+    # Only pre-check if requested
     if checkbox_checked:
         learning_checkbox["element"]["initial_options"] = [learning_checkbox_option]
 
@@ -78,6 +107,7 @@ def get_modal_blocks(guest_name, guest_msg, action_id, draft_text="", checkbox_c
     ]
 # -------------------------------------------------------------------
 
+
 def update_slack_message_with_sent_reply(
     slack_bot_token,
     channel,
@@ -92,7 +122,10 @@ def update_slack_message_with_sent_reply(
     status,
     detected_intent
 ):
-    slack_client = WebClient(token=slack_bot_token)
+    """
+    Update the original Slack thread with the actual sent reply + metadata.
+    """
+    _client = WebClient(token=slack_bot_token)
     blocks = [
         {
             "type": "section",
@@ -107,45 +140,26 @@ def update_slack_message_with_sent_reply(
         },
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"> {guest_msg}"
-            }
+            "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}
         },
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Sent Reply:*\n>{sent_reply}"
-            }
+            "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}
         },
         {
             "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Intent:* `{detected_intent}`"
-                }
-            ]
+            "elements": [{"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}]
         },
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": ":white_check_mark: *Reply sent to guest!*"
-            }
+            "text": {"type": "mrkdwn", "text": ":white_check_mark: *Reply sent to guest!*"}
         }
     ]
-
     try:
-        slack_client.chat_update(
-            channel=channel,
-            ts=ts,
-            blocks=blocks,
-            text="Reply sent to guest!"
-        )
+        _client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Reply sent to guest!")
     except Exception as e:
         logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
+
 
 def add_undo_button(blocks, meta):
     """Adds an Undo AI button if previous_draft exists in meta."""
@@ -163,14 +177,20 @@ def add_undo_button(blocks, meta):
         })
     return blocks
 
-# Background task to improve text and update the modal asynchronously
-def _background_improve_and_update(view_id, meta, edited_text, guest_name, guest_msg):
+
+# ---------------- Background: improve + final views.update (with hash) ----------------
+def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest_name, guest_msg):
+    """
+    Runs in the background: calls OpenAI to improve the text and then updates the modal.
+    Uses the fresh view hash captured from the loading update and retries once without hash if needed.
+    """
     prompt = (
         "Take this guest message reply and improve it. "
         "Make it clear, modern, friendly, concise, and natural. "
         "Do not add extra content or use emojis. Only return the improved version.\n\n"
         f"{edited_text}"
     )
+
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4",
@@ -187,16 +207,18 @@ def _background_improve_and_update(view_id, meta, edited_text, guest_name, guest
         improved = edited_text
         error_message = f"Error improving with AI: {str(e)}"
 
+    # Build final view (preserve input ids; insert improved text)
     new_meta = {
         **meta,
         "previous_draft": edited_text,
+        "improving": False,  # clear debounce flag
     }
     blocks = get_modal_blocks(
         guest_name,
         guest_msg,
         action_id="edit",
         draft_text=improved,
-        checkbox_checked=meta.get("checkbox_checked", False)
+        checkbox_checked=new_meta.get("checkbox_checked", False)
     )
     blocks = add_undo_button(blocks, new_meta)
     if error_message:
@@ -205,7 +227,7 @@ def _background_improve_and_update(view_id, meta, edited_text, guest_name, guest
             "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}
         }] + blocks
 
-    new_modal = {
+    final_view = {
         "type": "modal",
         "title": {"type": "plain_text", "text": "AI Improved Reply", "emoji": True},
         "submit": {"type": "plain_text", "text": "Send", "emoji": True},
@@ -215,22 +237,51 @@ def _background_improve_and_update(view_id, meta, edited_text, guest_name, guest
     }
 
     try:
-        slack_client.views_update(view_id=view_id, view=new_modal)
+        # First attempt: use the fresh hash for safety
+        slack_client.views_update(view_id=view_id, hash=hash_value, view=final_view)
+    except SlackApiError as e:
+        err = (getattr(e, "response", {}) or {}).get("error")
+        logging.error(f"views_update (final) with hash failed: {err}")
+        if err in {"hash_conflict", "not_found", "view_not_found"}:
+            # Retry once without hash
+            try:
+                slack_client.views_update(view_id=view_id, view=final_view)
+            except Exception as e2:
+                logging.error(f"views_update (final) retry without hash failed: {e2}")
+        else:
+            raise
     except Exception as e:
-        logging.error(f"Slack views_update error: {e}")
+        logging.error(f"Slack views_update (final) error: {e}")
 
+
+# ---------------------------- Slack Interactivity Endpoint ----------------------------
 @router.post("/slack/actions")
-async def slack_actions(request: Request, background_tasks: BackgroundTasks):
-    logging.info("🎯 /slack/actions endpoint hit!")
+async def slack_actions(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_slack_signature: str = Header(None, alias="X-Slack-Signature"),
+    x_slack_request_timestamp: str = Header(None, alias="X-Slack-Request-Timestamp")
+):
+    # Raw body for signature verification
+    raw_body_bytes = await request.body()
+    raw_body = raw_body_bytes.decode("utf-8") if raw_body_bytes else ""
+
+    # Verify Slack signature + freshness
+    if not verify_slack_signature(raw_body, x_slack_signature, x_slack_request_timestamp):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature or timestamp.")
+
+    # Parse form-encoded payload from Slack
     form = await request.form()
     payload_raw = form.get("payload")
     if not payload_raw:
-        logging.error("No payload found in Slack actions request!")
-        return JSONResponse({})
-
+        logging.error("Missing payload from Slack.")
+        raise HTTPException(status_code=400, detail="Missing payload from Slack.")
     payload = json.loads(payload_raw)
+
+    logging.info("🎯 /slack/actions hit")
     logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
+    # -------------------- block_actions handler --------------------
     if payload.get("type") == "block_actions":
         action = payload["actions"][0]
         action_id = action.get("action_id")
@@ -238,8 +289,8 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
         user = payload.get("user", {})
         user_id = user.get("id", "")
 
-        def get_meta_from_action(action):
-            return json.loads(action["value"]) if "value" in action else {}
+        def get_meta_from_action(_action):
+            return json.loads(_action["value"]) if "value" in _action else {}
 
         # --- SEND ---
         if action_id == "send":
@@ -266,7 +317,6 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
                 logging.error(f"Slack SEND error: {e}")
                 success = False
 
-            # --- Update Slack thread with *actual sent reply* and close modal ---
             if ts and channel and success:
                 update_slack_message_with_sent_reply(
                     slack_bot_token=SLACK_BOT_TOKEN,
@@ -284,28 +334,19 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
                 )
             elif ts and channel and not success:
                 try:
-                    # Just show error in the thread
                     slack_client.chat_update(
                         channel=channel,
                         ts=ts,
-                        blocks=[
-                            {
-                                "type": "section",
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": ":x: *Failed to send reply.*"
-                                }
-                            }
-                        ],
+                        blocks=[{
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
+                        }],
                         text="Failed to send reply."
                     )
                 except Exception as e:
                     logging.error(f"Slack chat_update error: {e}")
 
-            # --- Close the modal after send ---
-            return JSONResponse({
-                "response_action": "clear"
-            })
+            return JSONResponse({"response_action": "clear"})
 
         # --- WRITE OWN ---
         if action_id == "write_own":
@@ -365,56 +406,82 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
                 logging.error(f"Slack modal error: {e}")
             return JSONResponse({})
 
-        # --- IMPROVE WITH AI ---
+        # --- IMPROVE WITH AI (Immediate API update -> capture hash -> async finalize) ---
         if action_id == "improve_with_ai":
             view = payload.get("view", {})
             view_id = view.get("id")
+            if not view_id:
+                logging.error("No view_id on improve_with_ai payload")
+                return JSONResponse({})
+
+            # Read the current typed text from state
             state = view.get("state", {}).get("values", {})
             reply_block = state.get("reply_input", {})
             edited_text = next((v.get("value") for v in reply_block.values() if v.get("value")), "")
 
+            # Checkbox state
             state_save = state.get("save_answer_block", {})
             checkbox_checked = False
             if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
                 checkbox_checked = True
 
-            meta = json.loads(view.get("private_metadata", "{}"))
+            # Private metadata + debounce
+            meta = json.loads(view.get("private_metadata", "{}") or "{}")
+            if meta.get("improving"):
+                logging.info("Improve clicked while already improving; ignoring.")
+                return JSONResponse({})
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "")
 
-            # Immediately update modal to show working state
-            working_blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply..."}}
+            # Build a "loading" view preserving input + text
+            loading_meta = {**meta, "improving": True, "checkbox_checked": checkbox_checked}
+            loading_blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply…"}}
             ] + get_modal_blocks(
                 guest_name,
                 guest_msg,
                 action_id="edit",
-                draft_text=edited_text,
-                checkbox_checked=checkbox_checked
+                draft_text=edited_text,            # preserve current text
+                checkbox_checked=checkbox_checked  # preserve checkbox
             )
-            working_modal = {
+            loading_view = {
                 "type": "modal",
-                "title": {"type": "plain_text", "text": "Improving Reply", "emoji": True},
+                "title": {"type": "plain_text", "text": "Improving…", "emoji": True},
                 "submit": {"type": "plain_text", "text": "Send", "emoji": True},
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                "private_metadata": json.dumps({**meta, "checkbox_checked": checkbox_checked}),
-                "blocks": working_blocks
+                "private_metadata": json.dumps(loading_meta),
+                "blocks": loading_blocks
             }
 
-            # Kick off background improvement and update
+            # Update via API immediately using current hash; capture fresh hash from response
+            current_hash = view.get("hash")
+            try:
+                resp = slack_client.views_update(view_id=view_id, hash=current_hash, view=loading_view)
+                new_hash = (resp or {}).get("view", {}).get("hash")
+            except SlackApiError as e:
+                err = (getattr(e, "response", {}) or {}).get("error")
+                logging.error(f"views_update (loading) with hash failed: {err}")
+                # Fallback: try once without hash so users still see loading
+                try:
+                    resp = slack_client.views_update(view_id=view_id, view=loading_view)
+                    new_hash = (resp or {}).get("view", {}).get("hash")
+                except Exception as e2:
+                    logging.error(f"views_update (loading) retry without hash failed: {e2}")
+                    new_hash = None  # proceed anyway; final update may still work
+
+            # Background: call OpenAI + final update using fresh hash
             background_tasks.add_task(
                 _background_improve_and_update,
                 view_id,
-                {**meta, "checkbox_checked": checkbox_checked},
+                new_hash,
+                loading_meta,
                 edited_text,
                 guest_name,
                 guest_msg,
             )
 
-            return JSONResponse({
-                "response_action": "update",
-                "view": working_modal
-            })
+            # IMPORTANT: return empty JSON — no response_action from block_action
+            return JSONResponse({})
 
         # --- UNDO AI IMPROVEMENT ---
         if action_id == "undo_ai":
@@ -439,16 +506,24 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
                 "private_metadata": json.dumps(meta),
                 "blocks": blocks
             }
-            slack_client.views_push(trigger_id=trigger_id, view=modal)
+            # Use push/open depending on container type
+            container = payload.get("container", {})
+            try:
+                if container.get("type") == "message":
+                    slack_client.views_open(trigger_id=trigger_id, view=modal)
+                else:
+                    slack_client.views_push(trigger_id=trigger_id, view=modal)
+            except Exception as e:
+                logging.error(f"Slack views push/open error: {e}")
             return JSONResponse({})
 
-    # --- Modal submission handler (edit/send/write own) ---
+    # -------------------- view_submission handler --------------------
     if payload.get("type") == "view_submission":
         view = payload.get("view", {})
         state = view.get("state", {}).get("values", {})
-        meta = json.loads(view.get("private_metadata", "{}"))
+        meta = json.loads(view.get("private_metadata", "{}") or "{}")
 
-        # Get reply text
+        # Get reply text from input
         reply_text = None
         for block in state.values():
             if "reply" in block:
@@ -469,7 +544,7 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
 
         try:
             send_reply_to_hostaway(conv_id, reply_text, communication_type)
-            # Update the Slack message thread with the ACTUAL sent reply
+            # Update Slack thread with actual sent reply
             if channel and ts:
                 update_slack_message_with_sent_reply(
                     slack_bot_token=SLACK_BOT_TOKEN,
@@ -492,8 +567,7 @@ async def slack_actions(request: Request, background_tasks: BackgroundTasks):
         except Exception as e:
             logging.error(f"Slack regular send error: {e}")
 
-        return JSONResponse({
-            "response_action": "clear"
-        })
+        return JSONResponse({"response_action": "clear"})
 
+    # Fallback
     return JSONResponse({"status": "ok"})
