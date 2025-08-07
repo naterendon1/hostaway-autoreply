@@ -552,3 +552,66 @@ def get_listing_amenities(listing_id):
     except Exception as e:
         logging.error(f"[AMENITY] Fetch error: {e}")
         return []
+
+def get_modal_blocks(guest_name, guest_msg, draft_text="", action_id="edit", checkbox_checked=False):
+    """
+    Returns Slack modal blocks for editing/writing a reply.
+    """
+    blocks = [
+        {
+            "type": "input",
+            "block_id": "reply_input",
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "reply",
+                "multiline": True,
+                "initial_value": draft_text or "",
+                "placeholder": {"type": "plain_text", "text": "Write your reply here..."}
+            },
+            "label": {"type": "plain_text", "text": f"Reply to {guest_name}", "emoji": True}
+        },
+        {
+            "type": "section",
+            "block_id": "guest_message",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Guest message:*\n>{guest_msg}"
+            }
+        },
+        {
+            "type": "input",
+            "block_id": "save_answer_block",
+            "element": {
+                "type": "checkboxes",
+                "action_id": "save_answer",
+                "options": [
+                    {
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Save this reply to suggest for similar future questions",
+                            "emoji": True
+                        },
+                        "value": "save_answer"
+                    }
+                ],
+                "initial_options": [
+                    {
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Save this reply to suggest for similar future questions",
+                            "emoji": True
+                        },
+                        "value": "save_answer"
+                    }
+                ] if checkbox_checked else []
+            },
+            "label": {
+                "type": "plain_text",
+                "text": "Save reply",
+                "emoji": True
+            },
+            "optional": True
+        }
+    ]
+    return blocks
+
