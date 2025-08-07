@@ -26,12 +26,12 @@ INTENT_LABELS = [
 # --- ENVIRONMENT VARIABLE CHECKS ---
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
-    "HOSTAWAY_CLIENT_SECRET",
-    "GOOGLE_PLACES_API_KEY"
+    "HOSTAWAY_CLIENT_SECRET"
 ]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
     raise RuntimeError(f"Missing required environment variables: {missing}")
+# Note: GOOGLE_PLACES_API_KEY is optional. Google-based features will be disabled if not provided.
 
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
 HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
