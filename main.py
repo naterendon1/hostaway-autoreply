@@ -125,7 +125,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         guest_id = res.get("guestId", "")
 
     # --- Fetch message thread for context ---
-    MAX_THREAD_MESSAGES = 8
+    MAX_THREAD_MESSAGES = 3
     TRIMMED_MSG_LEN = 300
     def trim_msg(m):
         return m[:TRIMMED_MSG_LEN] + ("…" if len(m) > TRIMMED_MSG_LEN else "")
