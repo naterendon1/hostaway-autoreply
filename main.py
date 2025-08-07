@@ -17,10 +17,10 @@ from utils import (
     is_date_available,
     next_available_dates,
     detect_intent,
-    get_property_info,
+    get_property_location,
+    search_google_places,
+    detect_place_type,
 )
-from utils import get_listing_amenities  # If using amenities as context
-from utils import get_property_location, search_google_places, detect_place_type
 
 logging.basicConfig(level=logging.INFO)
 
@@ -62,14 +62,15 @@ SYSTEM_PROMPT_ANSWER = (
     "Do NOT repeat what the guest just said or already confirmed—only reply with new, helpful info if needed. "
     "If the guest already gave the answer, simply acknowledge or skip a reply unless clarification is needed. "
     "Do NOT add greetings or sign-offs. "
-    "Always use the prior conversation (thread), reservation info, calendar, listing data, and relevant local recommendations. "
-    "Do not invent facts. "
+    "Always use the prior conversation (thread), reservation info, and calendar. "
+    "Don’t invent facts. "
     "If the guest confirms something, you can just say 'Great, thanks for confirming!' or say nothing if no reply is needed. "
     "Replies are sent to the guest as-is. No emojis."
 )
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
     try:
+        logging.info(f"Prompt length: {len(prompt)} characters")
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
@@ -97,7 +98,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             logging.info("🧾 Empty message skipped.")
         return {"status": "ignored"}
 
-    # Intent detection
+    # Intent detection (classification)
     detected_intent = detect_intent(guest_msg)
     logging.info(f"[INTENT] Detected message intent: {detected_intent}")
 
@@ -106,7 +107,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_id = payload.data.get("listingMapId")
     guest_id = payload.data.get("userId", "")
     communication_type = payload.data.get("communicationType", "channel")
-    ts = payload.data.get("ts") or payload.data.get("slack_ts")  # Might be empty on first webhook
 
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res = reservation.get("result", {})
@@ -121,11 +121,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Fetch message thread for context ---
+    # --- Fetch message thread for full context ---
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"]
+
+    # Only last N messages, and total char cap (for token safety)
     conversation_context = []
     for m in msgs[-MAX_THREAD_MESSAGES:]:
         sender = "Guest" if m.get("isIncoming") else "Host"
@@ -134,6 +136,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             continue
         conversation_context.append(f"{sender}: {body}")
     context_str = "\n".join(conversation_context)
+
+    # Limit conversation context chars
+    max_context_chars = 1200
+    if len(context_str) > max_context_chars:
+        context_str = context_str[-max_context_chars:]
 
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
     prev_answer = ""
@@ -170,20 +177,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         calendar_summary = "No calendar check for this inquiry."
 
-    # --- Fetch listing info for AI context ---
-    listing = fetch_hostaway_listing(listing_id) or {}
-
-    # --- GOOGLE PLACES DYNAMIC RECOMMENDATIONS ---
+    # --- GOOGLE PLACES DYNAMIC RECS ---
     place_type, keyword = detect_place_type(guest_msg)
     local_recs = ""
     if place_type:
-        lat, lng = get_property_location(listing, reservation)
+        lat, lng = get_property_location(fetch_hostaway_listing(listing_id), reservation)
         if lat and lng:
             places = search_google_places(keyword, lat, lng, type_hint=place_type)
             if places:
                 local_recs = (
                     f"Nearby {keyword}s from Google Maps for this property:\n"
-                    + "\n".join([f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}" for p in places])
+                    + "\n".join([f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}" for p in places[:3]])
                 )
             else:
                 logging.info(f"[PLACES] No results for '{keyword}' at {lat},{lng}")
@@ -192,13 +196,38 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             local_recs = "Sorry, couldn't determine the property location for recommendations."
             logging.warning("[PLACES] No lat/lng for property.")
 
-    # --- AI PROMPT CONSTRUCTION ---
-    # You can also add amenities, cancellation, etc. as needed.
+    # --- Reservation/listing context trimming ---
+    important_res_fields = [
+        'arrivalDate', 'departureDate', 'numberOfGuests', 'guestFirstName',
+        'guestLastName', 'status', 'totalPrice', 'cancellationPolicy', 'listingId'
+    ]
+    res_trimmed = {k: res[k] for k in important_res_fields if k in res}
+
+    # Listing fields, but don't blow up tokens
+    listing_trimmed = {}
+    listing_obj = fetch_hostaway_listing(listing_id)
+    if listing_obj and 'result' in listing_obj and isinstance(listing_obj['result'], dict):
+        lres = listing_obj['result']
+        listing_trimmed = {
+            "name": lres.get("name"),
+            "address": lres.get("address"),
+            "propertyType": lres.get("propertyType"),
+            "bedrooms": lres.get("bedrooms"),
+            "bathrooms": lres.get("bathrooms"),
+            "maxGuests": lres.get("maxGuests"),
+            "amenities": lres.get("amenities")[:5] if lres.get("amenities") else [],
+        }
+
+    # Limit recs and context total length
+    if local_recs and len(local_recs) > 800:
+        local_recs = local_recs[:800] + "..."
+
+    # --- AI PROMPT CONSTRUCTION (PATCHED/TRIMMED) ---
     ai_prompt = (
         f"Here is the conversation thread so far (newest last):\n"
         f"{context_str}\n"
-        f"Reservation Info:\n{json.dumps(res)}\n"
-        f"Listing Info:\n{json.dumps(listing)}\n"
+        f"Reservation Info (important fields only):\n{json.dumps(res_trimmed)}\n"
+        f"Listing Info (important fields only):\n{json.dumps(listing_trimmed)}\n"
         f"Calendar Info: {calendar_summary}\n"
         f"{local_recs}\n"
         f"Intent: {detected_intent}\n"
@@ -208,6 +237,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "Do NOT repeat what the guest just said or already confirmed. "
         "Never add a greeting or a sign-off. Only answer the specific question, if possible."
     )
+
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
 
     # --- SLACK BLOCK CONSTRUCTION ---
@@ -219,8 +249,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "guest_name": guest_name,
         "guest_message": guest_msg,
         "ai_suggestion": ai_reply,
-        "channel": SLACK_CHANNEL,
-        "ts": ts
     }
 
     blocks = [
