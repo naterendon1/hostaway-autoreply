@@ -287,7 +287,7 @@ async def slack_actions(
             return json.loads(_action["value"]) if "value" in _action else {}
 
         # --- SEND ---
-       if action_id == "send":
+     if action_id == "send":
     meta = get_meta_from_action(action)
     reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
     conv_id = meta.get("conv_id")
@@ -304,6 +304,7 @@ async def slack_actions(
 
     if not reply or not conv_id:
         return JSONResponse({"text": "Missing reply or conversation ID."})
+
 
 
             # Immediately update modal to say "Sending..."
