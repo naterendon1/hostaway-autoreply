@@ -315,7 +315,7 @@ async def slack_actions(
 
     return JSONResponse({"status": "ok"})
 
-        # --- WRITE OWN ---
+                # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
             guest_name = meta.get("guest_name", "Guest")
