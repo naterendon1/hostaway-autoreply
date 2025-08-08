@@ -836,7 +836,7 @@ async def slack_actions(
         state = view.get("state", {}).get("values", {})
         meta = json.loads(view.get("private_metadata", "{}") or "{}")
 
-        # Get reply text: prefer AI field if present, else original
+        # Get reply text
         reply_text = None
         for block_id, block in state.items():
             if "reply_ai" in block:
@@ -846,12 +846,16 @@ async def slack_actions(
                 reply_text = block["reply"]["value"]
                 break
 
-        # Get checkbox state
-        save_for_next_time = False
-        for block in state.values():
-            if "save_answer" in block and block["save_answer"].get("selected_options"):
-                save_for_next_time = True
+        if not reply_text:
+            # Slack expects this format to display an error
+            return JSONResponse({
+                "response_action": "errors",
+                "errors": {
+                    "reply_input": "Please enter a reply before submitting."
+                }
+            })
 
+        # Continue with the send
         conv_id = meta.get("conv_id") or meta.get("conversation_id")
         communication_type = meta.get("type", "email")
         guest_message = meta.get("guest_message", "")
@@ -877,6 +881,11 @@ async def slack_actions(
                 detected_intent=meta.get("detected_intent", "Unknown"),
             )
 
+        save_for_next_time = False
+        for block in state.values():
+            if "save_answer" in block and block["save_answer"].get("selected_options"):
+                save_for_next_time = True
+
         if save_for_next_time:
             store_learning_example(
                 guest_message,
@@ -887,8 +896,8 @@ async def slack_actions(
             )
 
         return JSONResponse({"response_action": "clear"})
-    
+
     except Exception as e:
         logging.error(f"view_submission error: {e}")
-        # Always clear the modal even if something went wrong
+        # Always clear the modal on error, but also log it
         return JSONResponse({"response_action": "clear"})
