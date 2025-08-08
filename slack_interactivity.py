@@ -288,22 +288,22 @@ async def slack_actions(
 
         # --- SEND ---
     if action_id == "send":
-    meta = get_meta_from_action(action)
-    reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
-    conv_id = meta.get("conv_id")
-    communication_type = meta.get("type", "email")
-    channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
-    ts = meta.get("ts") or payload.get("message", {}).get("ts")
-    guest_name = meta.get("guest_name", "Guest")
-    guest_msg = meta.get("guest_message", "(Message unavailable)")
-    check_in = meta.get("check_in", "N/A")
-    check_out = meta.get("check_out", "N/A")
-    guest_count = meta.get("guest_count", "N/A")
-    status = meta.get("status", "Unknown")
-    detected_intent = meta.get("detected_intent", "Unknown")
+        meta = get_meta_from_action(action)
+        reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
+        conv_id = meta.get("conv_id")
+        communication_type = meta.get("type", "email")
+        channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
+        ts = meta.get("ts") or payload.get("message", {}).get("ts")
+        guest_name = meta.get("guest_name", "Guest")
+        guest_msg = meta.get("guest_message", "(Message unavailable)")
+        check_in = meta.get("check_in", "N/A")
+        check_out = meta.get("check_out", "N/A")
+        guest_count = meta.get("guest_count", "N/A")
+        status = meta.get("status", "Unknown")
+        detected_intent = meta.get("detected_intent", "Unknown")
 
-    if not reply or not conv_id:
-        return JSONResponse({"text": "Missing reply or conversation ID."})
+        if not reply or not conv_id:
+             return JSONResponse({"text": "Missing reply or conversation ID."})
 
 
 
