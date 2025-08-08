@@ -19,6 +19,8 @@ from utils import (
     # DO NOT import get_modal_blocks here (we patch it below)
 )
 
+
+
 logging.basicConfig(level=logging.INFO)
 router = APIRouter()
 
@@ -27,6 +29,59 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+
+def update_slack_message_with_sent_reply(
+    slack_bot_token,
+    channel,
+    ts,
+    guest_name,
+    guest_msg,
+    sent_reply,
+    communication_type,
+    check_in,
+    check_out,
+    guest_count,
+    status,
+    detected_intent
+):
+    slack_client = WebClient(token=slack_bot_token)
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Message sent to {guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"> {guest_msg}"
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Sent Reply:*\n>{sent_reply}"
+            }
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"✅ *Message Sent*  |  Intent: `{detected_intent}`"}
+            ]
+        }
+    ]
+
+    slack_client.chat_update(
+        channel=channel,
+        ts=ts,
+        blocks=blocks,
+        text="Message sent"
+    )
+
 
 
 # -------------------- Security: Slack Signature Verify --------------------
@@ -358,6 +413,8 @@ async def slack_actions(
                     logging.error(f"Slack chat_update error: {e}")
 
             return JSONResponse({"response_action": "clear"})
+            
+
 
         # --- WRITE OWN ---
         if action_id == "write_own":
