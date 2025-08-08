@@ -831,6 +831,7 @@ async def slack_actions(
 
     # -------------------- view_submission handler --------------------
     if payload.get("type") == "view_submission":
+    try:
         view = payload.get("view", {})
         state = view.get("state", {}).get("values", {})
         meta = json.loads(view.get("private_metadata", "{}") or "{}")
@@ -858,91 +859,36 @@ async def slack_actions(
         channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
         ts = meta.get("ts")
 
-        try:
-            send_reply_to_hostaway(conv_id, reply_text, communication_type)
-            # Update Slack thread with actual sent reply
-            if channel and ts:
-                update_slack_message_with_sent_reply(
-                    slack_bot_token=SLACK_BOT_TOKEN,
-                    channel=channel,
-                    ts=ts,
-                    guest_name=meta.get("guest_name", "Guest"),
-                    guest_msg=guest_message,
-                    sent_reply=reply_text,
-                    communication_type=communication_type,
-                    check_in=meta.get("check_in", "N/A"),
-                    check_out=meta.get("check_out", "N/A"),
-                    guest_count=meta.get("guest_count", "N/A"),
-                    status=meta.get("status", "Unknown"),
-                    detected_intent=meta.get("detected_intent", "Unknown"),
-                )
-            if save_for_next_time:
-                listing_id = meta.get("listing_id")
-                guest_id = meta.get("guest_id")
-                store_learning_example(guest_message, ai_suggestion, reply_text, listing_id, guest_id)
-        except Exception as e:
-            logging.error(f"Slack regular send error: {e}")
+        send_reply_to_hostaway(conv_id, reply_text, communication_type)
+
+        if channel and ts:
+            update_slack_message_with_sent_reply(
+                slack_bot_token=SLACK_BOT_TOKEN,
+                channel=channel,
+                ts=ts,
+                guest_name=meta.get("guest_name", "Guest"),
+                guest_msg=guest_message,
+                sent_reply=reply_text,
+                communication_type=communication_type,
+                check_in=meta.get("check_in", "N/A"),
+                check_out=meta.get("check_out", "N/A"),
+                guest_count=meta.get("guest_count", "N/A"),
+                status=meta.get("status", "Unknown"),
+                detected_intent=meta.get("detected_intent", "Unknown"),
+            )
+
+        if save_for_next_time:
+            store_learning_example(
+                guest_message,
+                ai_suggestion,
+                reply_text,
+                meta.get("listing_id"),
+                meta.get("guest_id")
+            )
 
         return JSONResponse({"response_action": "clear"})
-
-    # Fallback
-    return JSONResponse({"status": "ok"})
-
-    # -------------------- view_submission handler --------------------
-    if payload.get("type") == "view_submission":
-        view = payload.get("view", {})
-        state = view.get("state", {}).get("values", {})
-        meta = json.loads(view.get("private_metadata", "{}") or "{}")
-
-        # Get reply text: prefer AI field if present, else original
-        reply_text = None
-        for block_id, block in state.items():
-            if "reply_ai" in block:
-                reply_text = block["reply_ai"]["value"]
-                break
-            if "reply" in block:
-                reply_text = block["reply"]["value"]
-                break
-
-        # Get checkbox state
-        save_for_next_time = False
-        for block in state.values():
-            if "save_answer" in block and block["save_answer"].get("selected_options"):
-                save_for_next_time = True
-
-        conv_id = meta.get("conv_id") or meta.get("conversation_id")
-        communication_type = meta.get("type", "email")
-        guest_message = meta.get("guest_message", "")
-        ai_suggestion = meta.get("ai_suggestion", "")
-        channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
-        ts = meta.get("ts")
-
-        try:
-            send_reply_to_hostaway(conv_id, reply_text, communication_type)
-            # Update Slack thread with actual sent reply
-            if channel and ts:
-                update_slack_message_with_sent_reply(
-                    slack_bot_token=SLACK_BOT_TOKEN,
-                    channel=channel,
-                    ts=ts,
-                    guest_name=meta.get("guest_name", "Guest"),
-                    guest_msg=guest_message,
-                    sent_reply=reply_text,
-                    communication_type=communication_type,
-                    check_in=meta.get("check_in", "N/A"),
-                    check_out=meta.get("check_out", "N/A"),
-                    guest_count=meta.get("guest_count", "N/A"),
-                    status=meta.get("status", "Unknown"),
-                    detected_intent=meta.get("detected_intent", "Unknown"),
-                )
-            if save_for_next_time:
-                listing_id = meta.get("listing_id")
-                guest_id = meta.get("guest_id")
-                store_learning_example(guest_message, ai_suggestion, reply_text, listing_id, guest_id)
-        except Exception as e:
-            logging.error(f"Slack regular send error: {e}")
-
+    
+    except Exception as e:
+        logging.error(f"view_submission error: {e}")
+        # Always clear the modal even if something went wrong
         return JSONResponse({"response_action": "clear"})
-
-    # Fallback
-    return JSONResponse({"status": "ok"})
