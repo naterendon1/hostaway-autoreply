@@ -67,6 +67,11 @@ SYSTEM_PROMPT_ANSWER = (
     "Don’t invent facts. "
     "If the guest confirms something, you can just say 'Great, thanks for confirming!' or say nothing if no reply is needed. "
     "Replies are sent to the guest as-is. No emojis."
+    f"The property address is: {meta.get('property_address', 'unknown')}\n"
+    f"The guest asked this:\n{guest_msg}\n\n"
+    f"The current draft reply is:\n{edited_text}\n\n"
+    "Improve this message, keeping the geographic accuracy in mind. "
+    "Be clear, modern, friendly, and concise. Do not use emojis. Only return the improved reply."
 )
 
 def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
