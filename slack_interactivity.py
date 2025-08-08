@@ -16,6 +16,7 @@ from utils import (
     store_learning_example,
     get_similar_learning_examples,
     clean_ai_reply,
+    # DO NOT import get_modal_blocks here (we patch it below)
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -28,10 +29,13 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
 
+# -------------------- Security: Slack Signature Verify --------------------
 def verify_slack_signature(request_body: str, slack_signature: str, slack_request_timestamp: str) -> bool:
+    """Verify Slack-signed request authenticity."""
     if not SLACK_SIGNING_SECRET:
         raise RuntimeError("Missing SLACK_SIGNING_SECRET")
 
+    # Reject replays (>5 minutes)
     if not slack_request_timestamp or abs(time.time() - int(slack_request_timestamp)) > 60 * 5:
         return False
 
@@ -44,6 +48,7 @@ def verify_slack_signature(request_body: str, slack_signature: str, slack_reques
     return hmac.compare_digest(my_signature, slack_signature or "")
 
 
+# --------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
 def get_modal_blocks(
     guest_name,
     guest_msg,
@@ -53,6 +58,12 @@ def get_modal_blocks(
     input_block_id: str = "reply_input",
     input_action_id: str = "reply",
 ):
+    """
+    Returns blocks for "Write/Edit reply" modals.
+
+    IMPORTANT: Slack preserves user-entered text when block_id/action_id stay the same.
+    To overwrite with AI text, pass a NEW input_block_id/action_id so initial_value is used.
+    """
     reply_block = {
         "type": "input",
         "block_id": input_block_id,
@@ -104,6 +115,7 @@ def get_modal_blocks(
         },
         learning_checkbox
     ]
+# -------------------------------------------------------------------
 
 
 def update_slack_message_with_sent_reply(
@@ -120,6 +132,9 @@ def update_slack_message_with_sent_reply(
     status,
     detected_intent
 ):
+    """
+    Update the original Slack thread with the actual sent reply + metadata.
+    """
     _client = WebClient(token=slack_bot_token)
     blocks = [
         {
@@ -142,7 +157,10 @@ def update_slack_message_with_sent_reply(
         _client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Reply sent to guest!")
     except Exception as e:
         logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
+
+
 def add_undo_button(blocks, meta):
+    """Adds an Undo AI button if previous_draft exists in meta."""
     if "previous_draft" in meta and meta["previous_draft"]:
         blocks.append({
             "type": "actions",
@@ -158,6 +176,7 @@ def add_undo_button(blocks, meta):
     return blocks
 
 
+# ---------------- Background: improve + final views.update (with hash) ----------------
 def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest_name, guest_msg):
     prompt = (
         "Take this guest message reply and improve it. "
@@ -182,6 +201,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         improved = edited_text
         error_message = f"Error improving with AI: {str(e)}"
 
+    # Build final view with NEW input IDs so Slack uses our initial_value
     new_meta = {**meta, "previous_draft": edited_text, "improving": False}
     blocks = get_modal_blocks(
         guest_name,
@@ -189,7 +209,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         action_id="edit",
         draft_text=improved,
         checkbox_checked=new_meta.get("checkbox_checked", False),
-        input_block_id="reply_input_ai",
+        input_block_id="reply_input_ai",   # <-- NEW IDs to defeat Slack's preserve behavior
         input_action_id="reply_ai",
     )
     blocks = add_undo_button(blocks, new_meta)
@@ -205,6 +225,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         "blocks": blocks
     }
 
+    # Update WITH hash first, then fallback once without hash if needed
     try:
         resp = slack_client.views_update(view_id=view_id, hash=hash_value, view=final_view)
         logging.info(f"views_update (final) resp: {resp}")
@@ -227,6 +248,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
             logging.error(f"views_update (final) second exception: {e2}")
 
 
+# ---------------------------- Slack Interactivity Endpoint ----------------------------
 @router.post("/slack/actions")
 async def slack_actions(
     request: Request,
@@ -234,12 +256,15 @@ async def slack_actions(
     x_slack_signature: str = Header(None, alias="X-Slack-Signature"),
     x_slack_request_timestamp: str = Header(None, alias="X-Slack-Request-Timestamp")
 ):
+    # Raw body for signature verification
     raw_body_bytes = await request.body()
     raw_body = raw_body_bytes.decode("utf-8") if raw_body_bytes else ""
 
+    # Verify Slack signature + freshness
     if not verify_slack_signature(raw_body, x_slack_signature, x_slack_request_timestamp):
         raise HTTPException(status_code=401, detail="Invalid Slack signature or timestamp.")
 
+    # Parse form-encoded payload from Slack
     form = await request.form()
     payload_raw = form.get("payload")
     if not payload_raw:
@@ -249,6 +274,8 @@ async def slack_actions(
 
     logging.info("🎯 /slack/actions hit")
     logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
+
+    # -------------------- block_actions handler --------------------
     if payload.get("type") == "block_actions":
         action = payload["actions"][0]
         action_id = action.get("action_id")
@@ -259,63 +286,80 @@ async def slack_actions(
         def get_meta_from_action(_action):
             return json.loads(_action["value"]) if "value" in _action else {}
 
-        # All logic for each action_id is already covered earlier
+        # --- SEND ---
+       if action_id == "send":
+    meta = get_meta_from_action(action)
+    reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
+    conv_id = meta.get("conv_id")
+    communication_type = meta.get("type", "email")
+    channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
+    ts = meta.get("ts") or payload.get("message", {}).get("ts")
+    guest_name = meta.get("guest_name", "Guest")
+    guest_msg = meta.get("guest_message", "(Message unavailable)")
+    check_in = meta.get("check_in", "N/A")
+    check_out = meta.get("check_out", "N/A")
+    guest_count = meta.get("guest_count", "N/A")
+    status = meta.get("status", "Unknown")
+    detected_intent = meta.get("detected_intent", "Unknown")
 
-    if payload.get("type") == "view_submission":
-        view = payload.get("view", {})
-        state = view.get("state", {}).get("values", {})
-        meta = json.loads(view.get("private_metadata", "{}") or "{}")
+    if not reply or not conv_id:
+        return JSONResponse({"text": "Missing reply or conversation ID."})
 
-        reply_text = None
-        for block_id, block in state.items():
-            if "reply_ai" in block:
-                reply_text = block["reply_ai"]["value"]
-                break
-            if "reply" in block:
-                reply_text = block["reply"]["value"]
-                break
 
-        save_for_next_time = False
-        for block in state.values():
-            if "save_answer" in block and block["save_answer"].get("selected_options"):
-                save_for_next_time = True
+            # Immediately update modal to say "Sending..."
+            try:
+                slack_client.views_update(
+                    view_id=payload["container"]["view_id"],
+                    view={
+                        "type": "modal",
+                        "title": {"type": "plain_text", "text": "Sending...", "emoji": True},
+                        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."}}],
+                        "close": {"type": "plain_text", "text": "Close", "emoji": True}
+                    }
+                )
+            except Exception as e:
+                logging.error(f"Slack sending-modal update error: {e}")
 
-        conv_id = meta.get("conv_id") or meta.get("conversation_id")
-        communication_type = meta.get("type", "email")
-        guest_message = meta.get("guest_message", "")
-        ai_suggestion = meta.get("ai_suggestion", "")
-        channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
-        ts = meta.get("ts")
+            # Then proceed with actual send
+            try:
+                success = send_reply_to_hostaway(conv_id, reply, communication_type)
+            except Exception as e:
+                logging.error(f"Slack SEND error: {e}")
+                success = False
 
-        try:
-            send_reply_to_hostaway(conv_id, reply_text, communication_type)
-            if channel and ts:
+
+            if ts and channel and success:
                 update_slack_message_with_sent_reply(
                     slack_bot_token=SLACK_BOT_TOKEN,
                     channel=channel,
                     ts=ts,
-                    guest_name=meta.get("guest_name", "Guest"),
-                    guest_msg=guest_message,
-                    sent_reply=reply_text,
+                    guest_name=guest_name,
+                    guest_msg=guest_msg,
+                    sent_reply=reply,
                     communication_type=communication_type,
-                    check_in=meta.get("check_in", "N/A"),
-                    check_out=meta.get("check_out", "N/A"),
-                    guest_count=meta.get("guest_count", "N/A"),
-                    status=meta.get("status", "Unknown"),
-                    detected_intent=meta.get("detected_intent", "Unknown"),
+                    check_in=check_in,
+                    check_out=check_out,
+                    guest_count=guest_count,
+                    status=status,
+                    detected_intent=detected_intent
                 )
-            if save_for_next_time:
-                listing_id = meta.get("listing_id")
-                guest_id = meta.get("guest_id")
-                store_learning_example(guest_message, ai_suggestion, reply_text, listing_id, guest_id)
-        except Exception as e:
-            logging.error(f"Slack regular send error: {e}")
+            elif ts and channel and not success:
+                try:
+                    slack_client.chat_update(
+                        channel=channel,
+                        ts=ts,
+                        blocks=[{
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
+                        }],
+                        text="Failed to send reply."
+                    )
+                except Exception as e:
+                    logging.error(f"Slack chat_update error: {e}")
 
-        return JSONResponse({"response_action": "clear"})
+            return JSONResponse({"response_action": "clear"})
 
-    return JSONResponse({"status": "ok"})
-
-                # --- WRITE OWN ---
+        # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
             guest_name = meta.get("guest_name", "Guest")
@@ -563,7 +607,3 @@ async def slack_actions(
 
     # Fallback
     return JSONResponse({"status": "ok"})
-
-
-
-
