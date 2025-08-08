@@ -55,6 +55,8 @@ class HostawayUnifiedWebhook(BaseModel):
     body: str = None
     listingName: str = None
     date: str = None
+    
+meta = json.loads(payload.get("metadata", "{}"))
 
 SYSTEM_PROMPT_ANSWER = (
     "You are a helpful, human, and context-aware vacation rental host. "
