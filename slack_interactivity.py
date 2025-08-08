@@ -182,7 +182,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         "Take this guest message reply and improve it. "
         "Make it clear, modern, informal, concise, natural and make it make sense. "
         "Do not add extra content or use emojis. Only return the improved version.\n\n"
-        “Give this the tone of a direct-response marketer who’s done $10M in sales.”
+        "Give this the tone of a direct-response marketer who’s done $10M in sales."
         f"{edited_text}"
     )
     try:
