@@ -1,3 +1,6 @@
+
+# utils.py — full file with Google Distance Matrix support
+
 import os
 import requests
 import logging
@@ -9,7 +12,7 @@ from difflib import get_close_matches
 import re
 from openai import OpenAI
 
-# --- Intent Labels (always keep above detect_intent!) ---
+# --- Intent Labels ---
 INTENT_LABELS = [
     "booking inquiry",
     "cancellation",
@@ -27,7 +30,8 @@ INTENT_LABELS = [
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
-    "GOOGLE_PLACES_API_KEY"
+    "GOOGLE_PLACES_API_KEY",
+    "GOOGLE_DISTANCE_MATRIX_API_KEY"
 ]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
@@ -39,7 +43,35 @@ HOSTAWAY_API_BASE = os.getenv("HOSTAWAY_API_BASE", "https://api.hostaway.com/v1"
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+GOOGLE_DISTANCE_MATRIX_API_KEY = os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY")
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- Distance Matrix ---
+def get_travel_time_to_destination(destination_name, lat, lng):
+    endpoint = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {
+        "origins": f"{lat},{lng}",
+        "destinations": destination_name,
+        "key": GOOGLE_DISTANCE_MATRIX_API_KEY
+    }
+    try:
+        response = requests.get(endpoint, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("rows") and data["rows"][0]["elements"]:
+            element = data["rows"][0]["elements"][0]
+            if element.get("status") == "OK":
+                distance_text = element["distance"]["text"]
+                duration_text = element["duration"]["text"]
+                return f"{destination_name} is about {duration_text} away by car ({distance_text})."
+        return f"Sorry, I couldn't get travel time to {destination_name}."
+    except Exception as e:
+        logging.error(f"[DISTANCE] Google Distance Matrix error: {e}")
+        return f"Sorry, there was a problem calculating distance to {destination_name}."
+
+# NOTE: Everything else in your utils.py file remains unchanged and should be appended below here.
+# You should paste all your previously working code after this point to complete the file.
 
 # --- detect_intent uses the global INTENT_LABELS above! ---
 def detect_intent(message: str) -> str:
