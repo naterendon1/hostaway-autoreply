@@ -55,25 +55,8 @@ class HostawayUnifiedWebhook(BaseModel):
     body: str = None
     listingName: str = None
     date: str = None
-    
-meta = json.loads(payload.get("metadata", "{}"))
 
-SYSTEM_PROMPT_ANSWER = (
-    "You are a helpful, human, and context-aware vacation rental host. "
-    "Reply to the guest like you're texting from your phone — friendly, direct, and concise. "
-    "Write like a $10M direct-response marketer: persuasive, clear, and efficient. "
-    "Don't repeat what the guest already said or confirmed — only add new, useful info. "
-    "If the guest already has the answer, acknowledge it briefly or skip replying. "
-    "No greetings, no sign-offs, no emojis. "
-    "Use reservation info, calendar availability, and any prior messages. "
-    "Don't make things up — geographic and factual accuracy is essential.\n\n"
-    f"Property address: {meta.get('property_address', 'unknown')}\n"
-    f"Guest message:\n{guest_msg}\n\n"
-    f"Draft reply:\n{edited_text}\n\n"
-    "Improve this message. Only return the improved version."
-)
-
-def make_ai_reply(prompt, system_prompt=SYSTEM_PROMPT_ANSWER):
+def make_ai_reply(prompt, system_prompt):
     try:
         logging.info(f"Prompt length: {len(prompt)} characters")
         response = openai_client.chat.completions.create(
@@ -103,10 +86,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             logging.info("🧾 Empty message skipped.")
         return {"status": "ignored"}
 
-    # Intent detection (classification)
-    detected_intent = detect_intent(guest_msg)
-    logging.info(f"[INTENT] Detected message intent: {detected_intent}")
-
     conv_id = payload.data.get("conversationId")
     reservation_id = payload.data.get("reservationId")
     listing_id = payload.data.get("listingMapId")
@@ -126,13 +105,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # --- Fetch message thread for full context ---
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"]
 
-    # Only last N messages, and total char cap (for token safety)
     conversation_context = []
     for m in msgs[-MAX_THREAD_MESSAGES:]:
         sender = "Guest" if m.get("isIncoming") else "Host"
@@ -141,50 +118,39 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             continue
         conversation_context.append(f"{sender}: {body}")
     context_str = "\n".join(conversation_context)
+    context_str = context_str[-1200:] if len(context_str) > 1200 else context_str
 
-    # Limit conversation context chars
-    max_context_chars = 1200
-    if len(context_str) > max_context_chars:
-        context_str = context_str[-max_context_chars:]
-
+    detected_intent = detect_intent(guest_msg)
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
-    prev_answer = ""
-    if prev_examples and prev_examples[0][2]:
-        prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n"
+    prev_answer = f"Previously, you replied:\n\"{prev_examples[0][2]}\"\nUse this only as context.\n" if prev_examples and prev_examples[0][2] else ""
 
     cancellation = get_cancellation_policy_summary({}, res)
 
-    # --- CALENDAR INTENT & LIVE CHECK ---
-    calendar_keywords = [
-        "available", "availability", "book", "open", "stay", "dates", "night", "reserve", "weekend",
-        "extend", "extra night", "holiday", "christmas", "spring break", "july", "august", "september", "october",
-        "november", "december", "january", "february", "march", "april", "may", "june", "thanksgiving"
-    ]
-    should_check_calendar = any(word in guest_msg.lower() for word in calendar_keywords)
-    calendar_summary = ""
-
-    if should_check_calendar:
+    # Calendar check
+    calendar_summary = "No calendar check for this inquiry."
+    if any(word in guest_msg.lower() for word in [
+        "available", "availability", "book", "open", "stay", "dates", "night",
+        "reserve", "weekend", "extend", "extra night", "holiday", "christmas",
+        "spring break", "july", "august", "september", "october", "november",
+        "december", "january", "february", "march", "april", "may", "june", "thanksgiving"
+    ]):
         start_date, end_date = extract_date_range_from_message(guest_msg, res)
         calendar_days = fetch_hostaway_calendar(listing_id, start_date, end_date)
         if calendar_days:
-            available_days = [d["date"] for d in calendar_days if ("isAvailable" in d and d["isAvailable"]) or (d.get("status") == "available")]
-            unavailable_days = [d["date"] for d in calendar_days if not (("isAvailable" in d and d["isAvailable"]) or (d.get("status") == "available"))]
+            available_days = [d["date"] for d in calendar_days if d.get("isAvailable") or d.get("status") == "available"]
+            unavailable_days = [d["date"] for d in calendar_days if not (d.get("isAvailable") or d.get("status") == "available")]
             if available_days:
-                calendar_summary = (
-                    f"For {start_date} to {end_date}: Available nights: {', '.join(available_days)}."
-                )
+                calendar_summary = f"For {start_date} to {end_date}: Available nights: {', '.join(available_days)}."
                 if unavailable_days:
                     calendar_summary += f" Unavailable: {', '.join(unavailable_days)}."
             else:
                 calendar_summary = f"No available nights between {start_date} and {end_date}."
         else:
             calendar_summary = "Calendar data not available for these dates."
-    else:
-        calendar_summary = "No calendar check for this inquiry."
 
-    # --- GOOGLE PLACES DYNAMIC RECS ---
-    place_type, keyword = detect_place_type(guest_msg)
+    # Places
     local_recs = ""
+    place_type, keyword = detect_place_type(guest_msg)
     if place_type:
         lat, lng = get_property_location(fetch_hostaway_listing(listing_id), reservation)
         if lat and lng:
@@ -195,20 +161,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                     + "\n".join([f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}" for p in places[:3]])
                 )
             else:
-                logging.info(f"[PLACES] No results for '{keyword}' at {lat},{lng}")
                 local_recs = f"No {keyword}s found nearby from Google Maps."
-        else:
-            local_recs = "Sorry, couldn't determine the property location for recommendations."
-            logging.warning("[PLACES] No lat/lng for property.")
 
-    # --- Reservation/listing context trimming ---
-    important_res_fields = [
+    res_trimmed = {k: res[k] for k in [
         'arrivalDate', 'departureDate', 'numberOfGuests', 'guestFirstName',
         'guestLastName', 'status', 'totalPrice', 'cancellationPolicy', 'listingId'
-    ]
-    res_trimmed = {k: res[k] for k in important_res_fields if k in res}
+    ] if k in res}
 
-    # Listing fields, but don't blow up tokens
     listing_trimmed = {}
     listing_obj = fetch_hostaway_listing(listing_id)
     if listing_obj and 'result' in listing_obj and isinstance(listing_obj['result'], dict):
@@ -223,16 +182,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "amenities": lres.get("amenities")[:5] if lres.get("amenities") else [],
         }
 
-    # Limit recs and context total length
-    if local_recs and len(local_recs) > 800:
-        local_recs = local_recs[:800] + "..."
-
-    # --- AI PROMPT CONSTRUCTION (PATCHED/TRIMMED) ---
     ai_prompt = (
         f"Here is the conversation thread so far (newest last):\n"
         f"{context_str}\n"
-        f"Reservation Info (important fields only):\n{json.dumps(res_trimmed)}\n"
-        f"Listing Info (important fields only):\n{json.dumps(listing_trimmed)}\n"
+        f"Reservation Info:\n{json.dumps(res_trimmed)}\n"
+        f"Listing Info:\n{json.dumps(listing_trimmed)}\n"
         f"Calendar Info: {calendar_summary}\n"
         f"{local_recs}\n"
         f"Intent: {detected_intent}\n"
@@ -243,9 +197,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "Never add a greeting or a sign-off. Only answer the specific question, if possible."
     )
 
-    ai_reply = clean_ai_reply(make_ai_reply(ai_prompt))
+    system_prompt = (
+        "You are a helpful, human, and context-aware vacation rental host. "
+        "Reply to the guest like you're texting from your phone — friendly, direct, and concise. "
+        "Write like a $10M direct-response marketer: persuasive, clear, and efficient. "
+        "Don't repeat what the guest already said or confirmed — only add new, useful info. "
+        "If the guest already has the answer, acknowledge it briefly or skip replying. "
+        "No greetings, no sign-offs, no emojis. "
+        "Use reservation info, calendar availability, and any prior messages. "
+        "Don't make things up — geographic and factual accuracy is essential."
+    )
 
-    # --- SLACK BLOCK CONSTRUCTION ---
+    ai_reply = clean_ai_reply(make_ai_reply(ai_prompt, system_prompt))
+
+    # Slack output
     button_meta_minimal = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -260,20 +225,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
-        {
-            "type": "context",
-            "elements": [
-                {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}"}
-            ]
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
-                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
-                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
-            ]
-        }
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}"}]},
+        {"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
+            {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
+            {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
+        ]}
     ]
 
     from slack_sdk import WebClient
