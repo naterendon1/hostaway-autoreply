@@ -301,14 +301,30 @@ async def slack_actions(
             status = meta.get("status", "Unknown")
             detected_intent = meta.get("detected_intent", "Unknown")
 
-            if not reply or not conv_id:
+                        if not reply or not conv_id:
                 return JSONResponse({"text": "Missing reply or conversation ID."})
 
+            # Immediately update modal to say "Sending..."
+            try:
+                slack_client.views_update(
+                    view_id=payload["container"]["view_id"],
+                    view={
+                        "type": "modal",
+                        "title": {"type": "plain_text", "text": "Sending...", "emoji": True},
+                        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."}}],
+                        "close": {"type": "plain_text", "text": "Close", "emoji": True}
+                    }
+                )
+            except Exception as e:
+                logging.error(f"Slack sending-modal update error: {e}")
+
+            # Then proceed with actual send
             try:
                 success = send_reply_to_hostaway(conv_id, reply, communication_type)
             except Exception as e:
                 logging.error(f"Slack SEND error: {e}")
                 success = False
+
 
             if ts and channel and success:
                 update_slack_message_with_sent_reply(
