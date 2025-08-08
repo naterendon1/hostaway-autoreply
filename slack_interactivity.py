@@ -554,89 +554,86 @@ async def slack_actions(
     logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
     # -------------------- block_actions handler --------------------
-    if payload.get("type") == "block_actions":
-        action = payload["actions"][0]
-        action_id = action.get("action_id")
-        trigger_id = payload.get("trigger_id")
-        user = payload.get("user", {})
-        user_id = user.get("id", "")
+   if payload.get("type") == "block_actions":
+    action = payload["actions"][0]
+    action_id = action.get("action_id")
+    trigger_id = payload.get("trigger_id")
+    user = payload.get("user", {})
+    user_id = user.get("id", "")
 
-        def get_meta_from_action(_action):
-            return json.loads(_action["value"]) if "value" in _action else {}
+    def get_meta_from_action(_action):
+        return json.loads(_action["value"]) if "value" in _action else {}
 
-        # --- SEND ---
-  if action_id == "send":
-    meta = get_meta_from_action(action)
-    reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
-    conv_id = meta.get("conv_id")
-    communication_type = meta.get("type", "email")
-    channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
-    ts = meta.get("ts") or payload.get("message", {}).get("ts")
-    guest_name = meta.get("guest_name", "Guest")
-    guest_msg = meta.get("guest_message", "(Message unavailable)")
-    check_in = meta.get("check_in", "N/A")
-    check_out = meta.get("check_out", "N/A")
-    guest_count = meta.get("guest_count", "N/A")
-    status = meta.get("status", "Unknown")
-    detected_intent = meta.get("detected_intent", "Unknown")
+    # --- SEND ---
+    if action_id == "send":
+        meta = get_meta_from_action(action)
+        reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
+        conv_id = meta.get("conv_id")
+        communication_type = meta.get("type", "email")
+        channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
+        ts = meta.get("ts") or payload.get("message", {}).get("ts")
+        guest_name = meta.get("guest_name", "Guest")
+        guest_msg = meta.get("guest_message", "(Message unavailable)")
+        check_in = meta.get("check_in", "N/A")
+        check_out = meta.get("check_out", "N/A")
+        guest_count = meta.get("guest_count", "N/A")
+        status = meta.get("status", "Unknown")
+        detected_intent = meta.get("detected_intent", "Unknown")
 
-    if not reply or not conv_id:
-        return JSONResponse({"text": "Missing reply or conversation ID."})
+        if not reply or not conv_id:
+            return JSONResponse({"text": "Missing reply or conversation ID."})
 
+        # Immediately update modal to say "Sending..."
+        try:
+            slack_client.views_update(
+                view_id=payload["container"]["view_id"],
+                view={
+                    "type": "modal",
+                    "title": {"type": "plain_text", "text": "Sending...", "emoji": True},
+                    "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."}}],
+                    "close": {"type": "plain_text", "text": "Close", "emoji": True}
+                }
+            )
+        except Exception as e:
+            logging.error(f"Slack sending-modal update error: {e}")
 
+        # Then proceed with actual send
+        try:
+            success = send_reply_to_hostaway(conv_id, reply, communication_type)
+        except Exception as e:
+            logging.error(f"Slack SEND error: {e}")
+            success = False
 
-            # Immediately update modal to say "Sending..."
+        if ts and channel and success:
+            update_slack_message_with_sent_reply(
+                slack_bot_token=SLACK_BOT_TOKEN,
+                channel=channel,
+                ts=ts,
+                guest_name=guest_name,
+                guest_msg=guest_msg,
+                sent_reply=reply,
+                communication_type=communication_type,
+                check_in=check_in,
+                check_out=check_out,
+                guest_count=guest_count,
+                status=status,
+                detected_intent=detected_intent
+            )
+        elif ts and channel and not success:
             try:
-                slack_client.views_update(
-                    view_id=payload["container"]["view_id"],
-                    view={
-                        "type": "modal",
-                        "title": {"type": "plain_text", "text": "Sending...", "emoji": True},
-                        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."}}],
-                        "close": {"type": "plain_text", "text": "Close", "emoji": True}
-                    }
-                )
-            except Exception as e:
-                logging.error(f"Slack sending-modal update error: {e}")
-
-            # Then proceed with actual send
-            try:
-                success = send_reply_to_hostaway(conv_id, reply, communication_type)
-            except Exception as e:
-                logging.error(f"Slack SEND error: {e}")
-                success = False
-
-
-            if ts and channel and success:
-                update_slack_message_with_sent_reply(
-                    slack_bot_token=SLACK_BOT_TOKEN,
+                slack_client.chat_update(
                     channel=channel,
                     ts=ts,
-                    guest_name=guest_name,
-                    guest_msg=guest_msg,
-                    sent_reply=reply,
-                    communication_type=communication_type,
-                    check_in=check_in,
-                    check_out=check_out,
-                    guest_count=guest_count,
-                    status=status,
-                    detected_intent=detected_intent
+                    blocks=[{
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
+                    }],
+                    text="Failed to send reply."
                 )
-            elif ts and channel and not success:
-                try:
-                    slack_client.chat_update(
-                        channel=channel,
-                        ts=ts,
-                        blocks=[{
-                            "type": "section",
-                            "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
-                        }],
-                        text="Failed to send reply."
-                    )
-                except Exception as e:
-                    logging.error(f"Slack chat_update error: {e}")
+            except Exception as e:
+                logging.error(f"Slack chat_update error: {e}")
 
-            return JSONResponse({"response_action": "clear"})
+        return JSONResponse({"response_action": "clear"})
 
         # --- WRITE OWN ---
         if action_id == "write_own":
