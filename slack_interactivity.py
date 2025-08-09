@@ -132,7 +132,8 @@ def update_slack_message_with_sent_reply(
     check_out,
     guest_count,
     status,
-    detected_intent
+    detected_intent,
+    sent_label="message sent"
 ):
     """
     Update the original Slack thread with the actual sent reply + metadata.
@@ -153,12 +154,13 @@ def update_slack_message_with_sent_reply(
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}]},
-        {"type": "section", "text": {"type": "mrkdwn", "text": ":white_check_mark: *Reply sent to guest!*"}}
+        {"type": "section", "text": {"type": "mrkdwn", "text": f":white_check_mark: *{sent_label}*"}}
     ]
     try:
         _client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Reply sent to guest!")
     except Exception as e:
         logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
+
 
 
 def add_undo_button(blocks, meta):
@@ -290,11 +292,15 @@ async def slack_actions(
         # --- SEND ---
         if action_id == "send":
             meta = get_meta_from_action(action)
+
+            # NEW: capture channel + ts from the message container
+            container = payload.get("container", {}) or {}
+            channel = meta.get("channel") or container.get("channel_id") or payload.get("channel", {}).get("id") or os.getenv("SLACK_CHANNEL")
+            ts = meta.get("ts") or container.get("message_ts") or payload.get("message", {}).get("ts")
+
             reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
-            channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
-            ts = meta.get("ts") or payload.get("message", {}).get("ts")
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "(Message unavailable)")
             check_in = meta.get("check_in", "N/A")
@@ -302,6 +308,7 @@ async def slack_actions(
             guest_count = meta.get("guest_count", "N/A")
             status = meta.get("status", "Unknown")
             detected_intent = meta.get("detected_intent", "Unknown")
+            sent_label = meta.get("sent_label", "suggested message sent")
 
             if not reply or not conv_id:
                 return JSONResponse({"text": "Missing reply or conversation ID."})
@@ -330,6 +337,7 @@ async def slack_actions(
                 success = False
 
             if ts and channel and success:
+                sent_label = meta.get("sent_label", "message sent")
                 update_slack_message_with_sent_reply(
                     slack_bot_token=SLACK_BOT_TOKEN,
                     channel=channel,
@@ -342,7 +350,8 @@ async def slack_actions(
                     check_out=check_out,
                     guest_count=guest_count,
                     status=status,
-                    detected_intent=detected_intent
+                    detected_intent=detected_intent,
+                    sent_label=sent_label,
                 )
             elif ts and channel and not success:
                 try:
@@ -365,6 +374,16 @@ async def slack_actions(
         # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
+            container = payload.get("container", {}) or {}
+            channel_id = container.get("channel_id") or payload.get("channel", {}).get("id")
+            message_ts = container.get("message_ts") or payload.get("message", {}).get("ts")
+
+            # Keep these for the view_submission updater
+            if channel_id:
+                meta["channel"] = channel_id
+            if message_ts:
+                meta["ts"] = message_ts
+            meta["sent_label"] = "original message sent"
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "(Message unavailable)")
             checkbox_checked = meta.get("checkbox_checked", False)
@@ -386,10 +405,22 @@ async def slack_actions(
             }
             slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
+            
+
 
         # --- EDIT ---
         if action_id == "edit":
             meta = get_meta_from_action(action)
+            container = payload.get("container", {}) or {}
+            channel_id = container.get("channel_id") or payload.get("channel", {}).get("id")
+            message_ts = container.get("message_ts") or payload.get("message", {}).get("ts")
+
+            # Keep these for the view_submission updater
+            if channel_id:
+                meta["channel"] = channel_id
+            if message_ts:
+                meta["ts"] = message_ts
+            meta["sent_label"] = "edited message sent"
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "(Message unavailable)")
             ai_suggestion = meta.get("draft", meta.get("ai_suggestion", ""))
@@ -423,6 +454,8 @@ async def slack_actions(
             except Exception as e:
                 logging.error(f"Slack modal error: {e}")
             return JSONResponse({})
+            
+            
 
         # --- IMPROVE WITH AI (Immediate API update -> capture hash -> async finalize) ---
         if action_id == "improve_with_ai":
@@ -589,6 +622,7 @@ async def slack_actions(
             send_reply_to_hostaway(conv_id, reply_text, communication_type)
 
             if channel and ts:
+                sent_label = meta.get("sent_label", "message sent")
                 update_slack_message_with_sent_reply(
                     slack_bot_token=SLACK_BOT_TOKEN,
                     channel=channel,
@@ -602,6 +636,7 @@ async def slack_actions(
                     guest_count=meta.get("guest_count", "N/A"),
                     status=meta.get("status", "Unknown"),
                     detected_intent=meta.get("detected_intent", "Unknown"),
+                    sent_label=sent_label, 
                 )
 
             # Save checkbox state
