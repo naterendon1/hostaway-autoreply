@@ -1,3 +1,6 @@
+fix any errors that are in this code:
+
+
 import os
 import logging
 import json
@@ -96,7 +99,7 @@ except Exception as e:
 logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
 
 
---------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
+# --------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
 
 def get_modal_blocks(
 guest_name,
@@ -166,7 +169,7 @@ return [
     learning_checkbox
 ]
 
--------------------------------------------------------------------
+# -------------------------------------------------------------------
 
 def update_slack_message_with_sent_reply(
 slack_bot_token,
@@ -227,7 +230,7 @@ blocks.append({
 return blocks
 
 
----------------- Background: improve + final views.update (with hash) ----------------
+# ---------------- Background: improve + final views.update (with hash) ----------------
 
 def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest_name, guest_msg):
 prompt = (
@@ -299,7 +302,7 @@ except Exception as e:
     except Exception as e2:
         logging.error(f"views_update (final) second exception: {e2}")
 
----------------------------- Slack Interactivity Endpoint ----------------------------
+# ---------------------------- Slack Interactivity Endpoint ----------------------------
 
 @router.post("/slack/actions")
 async def slack_actions(
