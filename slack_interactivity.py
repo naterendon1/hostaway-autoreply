@@ -49,6 +49,49 @@ def verify_slack_signature(request_body: str, slack_signature: str, slack_reques
     ).hexdigest()
     return hmac.compare_digest(my_signature, slack_signature or "")
 
+def update_slack_message_with_sent_reply(
+    slack_bot_token,
+    channel,
+    ts,
+    guest_name,
+    guest_msg,
+    sent_reply,
+    communication_type,
+    check_in,
+    check_out,
+    guest_count,
+    status,
+    detected_intent,
+    sent_label="message sent",
+    channel_pretty=None,         # NEW
+    property_address=None        # NEW
+):
+    _client = WebClient(token=slack_bot_token)
+    channel_label = channel_pretty or (communication_type.capitalize() if communication_type else "Channel")
+    addr = property_address or "Address unavailable"
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{channel_label} message* from *{guest_name}*\n"
+                    f"Property: *{addr}*\n"
+                    f"Dates: *{check_in} → {check_out}*\n"
+                    f"Guests: *{guest_count}* | Status: *{status}*"
+                )
+            }
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}]},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f":white_check_mark: *{sent_label}*"}}
+    ]
+    try:
+        _client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Reply sent to guest!")
+    except Exception as e:
+        logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
+
 
 # --------- PATCHED MODAL BLOCKS (Inline helper, do not import from utils) ----------
 def get_modal_blocks(
@@ -291,84 +334,100 @@ async def slack_actions(
 
         # --- SEND ---
         if action_id == "send":
-            meta = get_meta_from_action(action)
+    meta = get_meta_from_action(action)
 
-            # NEW: capture channel + ts from the message container
-            container = payload.get("container", {}) or {}
-            channel = meta.get("channel") or container.get("channel_id") or payload.get("channel", {}).get("id") or os.getenv("SLACK_CHANNEL")
-            ts = meta.get("ts") or container.get("message_ts") or payload.get("message", {}).get("ts")
+    # Resolve channel + ts from container/payload or meta
+    container = payload.get("container", {}) or {}
+    channel = (
+        meta.get("channel")
+        or container.get("channel_id")
+        or payload.get("channel", {}).get("id")
+        or os.getenv("SLACK_CHANNEL")
+    )
+    ts = (
+        meta.get("ts")
+        or container.get("message_ts")
+        or payload.get("message", {}).get("ts")
+    )
 
-            reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
-            conv_id = meta.get("conv_id")
-            communication_type = meta.get("type", "email")
-            guest_name = meta.get("guest_name", "Guest")
-            guest_msg = meta.get("guest_message", "(Message unavailable)")
-            check_in = meta.get("check_in", "N/A")
-            check_out = meta.get("check_out", "N/A")
-            guest_count = meta.get("guest_count", "N/A")
-            status = meta.get("status", "Unknown")
-            detected_intent = meta.get("detected_intent", "Unknown")
-            sent_label = meta.get("sent_label", "suggested message sent")
+    # Pull details (plus pretty channel + address if present)
+    reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
+    conv_id = meta.get("conv_id")
+    communication_type = meta.get("type", "email")
+    guest_name = meta.get("guest_name", "Guest")
+    guest_msg = meta.get("guest_message", "(Message unavailable)")
+    check_in = meta.get("check_in", "N/A")
+    check_out = meta.get("check_out", "N/A")
+    guest_count = meta.get("guest_count", "N/A")
+    status = meta.get("status", "Unknown")
+    detected_intent = meta.get("detected_intent", "Unknown")
+    sent_label = meta.get("sent_label", "message sent")
 
-            if not reply or not conv_id:
-                return JSONResponse({"text": "Missing reply or conversation ID."})
+    # NEW: extras for header
+    channel_pretty = meta.get("channel_pretty")
+    property_address = meta.get("property_address")
 
-            # Immediately update modal to say "Sending..."
-            try:
-                slack_client.views_update(
-                    view_id=payload["container"]["view_id"],
-                    view={
-                        "type": "modal",
-                        "title": {"type": "plain_text", "text": "Sending...", "emoji": True},
-                        "blocks": [
-                            {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."}}
-                        ],
-                        "close": {"type": "plain_text", "text": "Close", "emoji": True}
-                    }
-                )
-            except Exception as e:
-                logging.error(f"Slack sending-modal update error: {e}")
+    if not reply or not conv_id:
+        return JSONResponse({"text": "Missing reply or conversation ID."})
 
-            # Then proceed with actual send
-            try:
-                success = send_reply_to_hostaway(conv_id, reply, communication_type)
-            except Exception as e:
-                logging.error(f"Slack SEND error: {e}")
-                success = False
+    # Immediately update modal to say "Sending..." (if a modal is open)
+    try:
+        view_id = container.get("view_id")
+        if view_id:
+            slack_client.views_update(
+                view_id=view_id,
+                view={
+                    "type": "modal",
+                    "title": {"type": "plain_text", "text": "Sending...", "emoji": True},
+                    "blocks": [
+                        {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."}}
+                    ],
+                    "close": {"type": "plain_text", "text": "Close", "emoji": True}
+                }
+            )
+    except Exception as e:
+        logging.error(f"Slack sending-modal update error: {e}")
 
-            if ts and channel and success:
-                sent_label = meta.get("sent_label", "message sent")
-                update_slack_message_with_sent_reply(
-                    slack_bot_token=SLACK_BOT_TOKEN,
-                    channel=channel,
-                    ts=ts,
-                    guest_name=guest_name,
-                    guest_msg=guest_msg,
-                    sent_reply=reply,
-                    communication_type=communication_type,
-                    check_in=check_in,
-                    check_out=check_out,
-                    guest_count=guest_count,
-                    status=status,
-                    detected_intent=detected_intent,
-                    sent_label=sent_label,
-                )
-            elif ts and channel and not success:
-                try:
-                    slack_client.chat_update(
-                        channel=channel,
-                        ts=ts,
-                        blocks=[{
-                            "type": "section",
-                            "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
-                        }],
-                        text="Failed to send reply."
-                    )
-                except Exception as e:
-                    logging.error(f"Slack chat_update error: {e}")
+    # Then proceed with actual send
+    try:
+        success = send_reply_to_hostaway(conv_id, reply, communication_type)
+    except Exception as e:
+        logging.error(f"Slack SEND error: {e}")
+        success = False
 
-            return JSONResponse({"response_action": "clear"})
-            
+    if ts and channel and success:
+        update_slack_message_with_sent_reply(
+            slack_bot_token=SLACK_BOT_TOKEN,
+            channel=channel,
+            ts=ts,
+            guest_name=guest_name,
+            guest_msg=guest_msg,
+            sent_reply=reply,
+            communication_type=communication_type,
+            check_in=check_in,
+            check_out=check_out,
+            guest_count=guest_count,
+            status=status,
+            detected_intent=detected_intent,
+            sent_label=sent_label,
+            channel_pretty=channel_pretty,      # NEW
+            property_address=property_address,  # NEW
+        )
+    elif ts and channel and not success:
+        try:
+            slack_client.chat_update(
+                channel=channel,
+                ts=ts,
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
+                }],
+                text="Failed to send reply."
+            )
+        except Exception as e:
+            logging.error(f"Slack chat_update error: {e}")
+
+    return JSONResponse({"response_action": "clear"})
 
 
         # --- WRITE OWN ---
@@ -622,9 +681,12 @@ async def slack_actions(
             send_reply_to_hostaway(conv_id, reply_text, communication_type)
 
             if channel and ts:
-                sent_label = meta.get("sent_label", "message sent")
+                 sent_label = meta.get("sent_label", "message sent")
+                 channel_pretty = meta.get("channel_pretty")          # <-- comes from your button/meta
+                 property_address = meta.get("property_address") 
+                
                 update_slack_message_with_sent_reply(
-                    slack_bot_token=SLACK_BOT_TOKEN,
+                    slack_bot_token=SLACK_BOT_TOKEN
                     channel=channel,
                     ts=ts,
                     guest_name=meta.get("guest_name", "Guest"),
@@ -636,7 +698,9 @@ async def slack_actions(
                     guest_count=meta.get("guest_count", "N/A"),
                     status=meta.get("status", "Unknown"),
                     detected_intent=meta.get("detected_intent", "Unknown"),
-                    sent_label=sent_label, 
+                    sent_label=sent_label,
+                    channel_pretty=channel_pretty,
+                    property_address=property_address,
                 )
 
             # Save checkbox state
