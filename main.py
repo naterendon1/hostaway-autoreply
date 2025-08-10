@@ -163,24 +163,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             else:
                 local_recs = f"No {keyword}s found nearby from Google Maps."
 
-    res_trimmed = {k: res[k] for k in [
-        'arrivalDate', 'departureDate', 'numberOfGuests', 'guestFirstName',
-        'guestLastName', 'status', 'totalPrice', 'cancellationPolicy', 'listingId'
-    ] if k in res}
-
-    listing_trimmed = {}
-    listing_obj = fetch_hostaway_listing(listing_id)
-    if listing_obj and 'result' in listing_obj and isinstance(listing_obj['result'], dict):
-        lres = listing_obj['result']
-        listing_trimmed = {
-            "name": lres.get("name"),
-            "address": lres.get("address"),
-            "propertyType": lres.get("propertyType"),
-            "bedrooms": lres.get("bedrooms"),
-            "bathrooms": lres.get("bathrooms"),
-            "maxGuests": lres.get("maxGuests"),
-            "amenities": lres.get("amenities")[:5] if lres.get("amenities") else [],
-        }
     # --- Reservation/listing context trimming ---
     important_res_fields = [
         'arrivalDate', 'departureDate', 'numberOfGuests', 'guestFirstName',
