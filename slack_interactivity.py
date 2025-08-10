@@ -32,7 +32,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
 
--------------------- Security: Slack Signature Verify --------------------
+# -------------------- Security: Slack Signature Verify --------------------
 
 def verify_slack_signature(request_body: str, slack_signature: str, slack_request_timestamp: str) -> bool:
 """Verify Slack-signed request authenticity."""
