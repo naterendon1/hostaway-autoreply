@@ -181,7 +181,53 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "maxGuests": lres.get("maxGuests"),
             "amenities": lres.get("amenities")[:5] if lres.get("amenities") else [],
         }
+    # --- Reservation/listing context trimming ---
+    important_res_fields = [
+        'arrivalDate', 'departureDate', 'numberOfGuests', 'guestFirstName',
+        'guestLastName', 'status', 'totalPrice', 'cancellationPolicy', 'listingId'
+    ]
+    res_trimmed = {k: res[k] for k in important_res_fields if k in res}
 
+    # Listing fields (trimmed)
+    listing_trimmed = {}
+    listing_obj = fetch_hostaway_listing(listing_id)
+    if listing_obj and 'result' in listing_obj and isinstance(listing_obj['result'], dict):
+        lres = listing_obj['result']
+        listing_trimmed = {
+            "name": lres.get("name"),
+            "address": lres.get("address"),
+            "propertyType": lres.get("propertyType"),
+            "bedrooms": lres.get("bedrooms"),
+            "bathrooms": lres.get("bathrooms"),
+            "maxGuests": lres.get("maxGuests"),
+            "amenities": lres.get("amenities")[:5] if lres.get("amenities") else [],
+        }
+
+    # Channel pretty name
+    CHANNEL_MAP = {
+        "airbnb": "Airbnb",
+        "vrbo": "Vrbo",
+        "bookingcom": "Booking.com",
+        "direct": "Direct",
+        "expedia": "Expedia",
+        "channel": "Channel"  # fallback
+    }
+    raw_channel = (
+        payload.data.get("communicationType")
+        or res.get("source")
+        or res.get("channelId")
+        or "channel"
+    )
+    channel_pretty = CHANNEL_MAP.get(str(raw_channel).lower(), str(raw_channel).capitalize())
+
+    # Property address (from listing or reservation fallback)
+    property_address = (
+        listing_trimmed.get("address")
+        or (listing_obj.get("result", {}).get("address") if listing_obj else None)
+        or "Address unavailable"
+    )
+
+    # --- AI prompt ---
     ai_prompt = (
         f"Here is the conversation thread so far (newest last):\n"
         f"{context_str}\n"
@@ -221,15 +267,32 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     }
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*New {communication_type.capitalize()}* from *{guest_name}*\nDates: *{check_in} → {check_out}*\nGuests: *{guest_count}* | Status: *{status}*"}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{channel_pretty} message* from *{guest_name}*\n"
+                    f"Property: *{property_address}*\n"
+                    f"Dates: *{check_in} → {check_out}*\n"
+                    f"Guests: *{guest_count}* | Status: *{status}*"
+                )
+            }
+        },
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}"}]},
-        {"type": "actions", "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
-            {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
-            {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
-        ]}
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}"}]
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta_minimal, "action": "send"}), "action_id": "send"},
+                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta_minimal, "action": "edit"}), "action_id": "edit"},
+                {"type": "button", "text": {"type": "plain_text", "text": "📝 Write Your Own"}, "value": json.dumps({**button_meta_minimal, "action": "write_own"}), "action_id": "write_own"}
+            ]
+        }
     ]
 
     from slack_sdk import WebClient
