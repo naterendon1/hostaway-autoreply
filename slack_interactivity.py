@@ -160,68 +160,6 @@ def get_modal_blocks(
         },
         learning_checkbox
     ]
-# -------------------------------------------------------------------
-
-
-def update_slack_message_with_sent_reply(
-    slack_bot_token,
-    channel,
-    ts,
-    guest_name,
-    guest_msg,
-    sent_reply,
-    communication_type,
-    check_in,
-    check_out,
-    guest_count,
-    status,
-    detected_intent,
-    sent_label="message sent"
-):
-    """
-    Update the original Slack thread with the actual sent reply + metadata.
-    """
-    _client = WebClient(token=slack_bot_token)
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"*New {communication_type.capitalize()}* from *{guest_name}*\n"
-                    f"Dates: *{check_in} → {check_out}*\n"
-                    f"Guests: *{guest_count}* | Status: *{status}*"
-                )
-            }
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}]},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f":white_check_mark: *{sent_label}*"}}
-    ]
-    try:
-        _client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Reply sent to guest!")
-    except Exception as e:
-        logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
-
-
-
-def add_undo_button(blocks, meta):
-    """Adds an Undo AI button if previous_draft exists in meta."""
-    if "previous_draft" in meta and meta["previous_draft"]:
-        blocks.append({
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Undo AI", "emoji": True},
-                    "value": json.dumps(meta),
-                    "action_id": "undo_ai"
-                }
-            ]
-        })
-    return blocks
-
 
 # ---------------- Background: improve + final views.update (with hash) ----------------
 def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest_name, guest_msg):
@@ -333,7 +271,7 @@ async def slack_actions(
             return json.loads(_action["value"]) if "value" in _action else {}
 
         # --- SEND ---
-        if action_id == "send":
+if action_id == "send":
     meta = get_meta_from_action(action)
 
     # Resolve channel + ts from container/payload or meta
@@ -372,7 +310,7 @@ async def slack_actions(
 
     # Immediately update modal to say "Sending..." (if a modal is open)
     try:
-        view_id = container.get("view_id")
+        view_id = container.get("view_id") or payload.get("container", {}).get("view_id")
         if view_id:
             slack_client.views_update(
                 view_id=view_id,
@@ -388,7 +326,7 @@ async def slack_actions(
     except Exception as e:
         logging.error(f"Slack sending-modal update error: {e}")
 
-    # Then proceed with actual send
+    # Send to Hostaway
     try:
         success = send_reply_to_hostaway(conv_id, reply, communication_type)
     except Exception as e:
