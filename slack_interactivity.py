@@ -13,7 +13,6 @@ from utils import (
     send_reply_to_hostaway,
     store_learning_example,
     clean_ai_reply,
-    # DO NOT import get_modal_blocks here (we patch it below)
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -45,7 +44,6 @@ def verify_slack_signature(request_body: str, slack_signature: str, slack_reques
     return hmac.compare_digest(my_signature, slack_signature or "")
 
 
-# -------------------- Slack message updater (includes channel/address) --------------------
 def update_slack_message_with_sent_reply(
     slack_bot_token,
     channel,
@@ -60,8 +58,8 @@ def update_slack_message_with_sent_reply(
     status,
     detected_intent,
     sent_label="message sent",
-    channel_pretty=None,       # pretty channel name, if provided
-    property_address=None      # property address, if provided
+    channel_pretty=None,
+    property_address=None
 ):
     _client = WebClient(token=slack_bot_token)
     channel_label = channel_pretty or (communication_type.capitalize() if communication_type else "Channel")
@@ -174,6 +172,7 @@ def add_undo_button(blocks, meta):
             ]
         })
     return blocks
+# -------------------------------------------------------------------
 
 
 # ---------------- Background: improve + final views.update (with hash) ----------------
@@ -325,7 +324,7 @@ async def slack_actions(
 
             # Immediately update modal to say "Sending..." (if a modal is open)
             try:
-                view_id = container.get("view_id")
+                view_id = container.get("view_id") or payload.get("container", {}).get("view_id")
                 if view_id:
                     slack_client.views_update(
                         view_id=view_id,
@@ -363,8 +362,8 @@ async def slack_actions(
                     status=status,
                     detected_intent=detected_intent,
                     sent_label=sent_label,
-                    channel_pretty=channel_pretty,      # NEW
-                    property_address=property_address,  # NEW
+                    channel_pretty=channel_prety if (channel_prety := channel_pretty) else None,  # keep exact value
+                    property_address=property_address,
                 )
             elif ts and channel and not success:
                 try:
@@ -601,7 +600,7 @@ async def slack_actions(
 
             # Get reply text: prefer AI field if present, else original
             reply_text = None
-            for block in state.values():
+            for block_id, block in state.items():
                 if "reply_ai" in block:
                     reply_text = block["reply_ai"]["value"]
                     break
@@ -652,10 +651,11 @@ async def slack_actions(
                 )
 
             # Save checkbox state
-            save_for_next_time = any(
-                "save_answer" in b and b["save_answer"].get("selected_options")
-                for b in state.values()
-            )
+            save_for_next_time = False
+            for block in state.values():
+                if "save_answer" in block and block["save_answer"].get("selected_options"):
+                    save_for_next_time = True
+
             if save_for_next_time:
                 store_learning_example(
                     guest_message,
