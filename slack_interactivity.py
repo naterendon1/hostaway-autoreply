@@ -178,9 +178,11 @@ def add_undo_button(blocks, meta):
 # ---------------- Background: improve + final views.update (with hash) ----------------
 def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest_name, guest_msg):
     prompt = (
-        "Take this guest message reply and improve it. "
-        "Make it clear, modern, informal, concise, natural and make it make sense. "
-        "Do not add extra content or use emojis. Only return the improved version.\n\n"
+        "Rewrite the reply **without changing meaning**. "
+        "Goals: sound like a real human host, modern, concise, casual-professional, with contractions. "
+        "No greeting, no sign-off, no emojis, no corporate filler. "
+        "Keep or tighten length. Avoid repeating what the guest said. "
+        "Return ONLY the rewritten reply.\n\n"
         f"{edited_text}"
     )
     try:
@@ -188,7 +190,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
             model="gpt-4",
             timeout=15,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant for editing guest replies. Be clear, modern, friendly, and concise. No emojis."},
+                {"role": "system", "content": "You edit messages for a vacation-rental host. Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis."},
                 {"role": "user", "content": prompt}
             ]
         )
