@@ -26,6 +26,8 @@ from utils import (
     resolve_place_textsearch,
     get_distance_drive_time,
 )
+from db import init_db
+init_db()
 
 # Your Slack interactivity router (events/actions)
 from slack_interactivity import router as slack_router
