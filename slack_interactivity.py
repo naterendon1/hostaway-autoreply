@@ -247,15 +247,38 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         except Exception as e2:
             logging.error(f"views_update (final) second exception: {e2}")
 
+@router.post("/events")
+async def slack_events(
+    request: Request,
+    x_slack_signature: str = Header(None, alias="X-Slack-Signature"),
+    x_slack_request_timestamp: str = Header(None, alias="X-Slack-Request-Timestamp"),
+):
+    raw_body_bytes = await request.body()
+    raw_body = raw_body_bytes.decode("utf-8") if raw_body_bytes else ""
+
+    if not verify_slack_signature(raw_body, x_slack_signature, x_slack_request_timestamp):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature or timestamp.")
+
+    payload = await request.json()
+
+    # URL Verification handshake
+    if payload.get("type") == "url_verification":
+        return JSONResponse({"challenge": payload.get("challenge")})
+
+    # Ignore everything else for now
+    return JSONResponse({"ok": True})
+
 
 # ---------------------------- Slack Interactivity Endpoint ----------------------------
-@router.post("/slack/actions")
+@router.post("/actions")
 async def slack_actions(
     request: Request,
     background_tasks: BackgroundTasks,
     x_slack_signature: str = Header(None, alias="X-Slack-Signature"),
     x_slack_request_timestamp: str = Header(None, alias="X-Slack-Request-Timestamp")
 ):
+    if x_slack_retry_num is not None:
+        return JSONResponse({"ok": True})
     # Raw body for signature verification
     raw_body_bytes = await request.body()
     raw_body = raw_body_bytes.decode("utf-8") if raw_body_bytes else ""
@@ -275,6 +298,7 @@ async def slack_actions(
     logging.info("🎯 /slack/actions hit")
     logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
+   
     # -------------------- block_actions handler --------------------
     if payload.get("type") == "block_actions":
         action = payload["actions"][0]
@@ -364,7 +388,7 @@ async def slack_actions(
                     status=status,
                     detected_intent=detected_intent,
                     sent_label=sent_label,
-                    channel_pretty=channel_pretty if (channel_prety := channel_pretty) else None,  # keep exact value
+                    channel_pretty=channel_pretty ,  # keep exact value
                     property_address=property_address,
                 )
             elif ts and channel and not success:
