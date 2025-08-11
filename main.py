@@ -76,7 +76,7 @@ def make_ai_reply(prompt: str, system_prompt: str) -> str:
     try:
         logging.info(f"Prompt length: {len(prompt)} characters")
         resp = openai_client.chat.completions.create(
-            model="gpt-5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
