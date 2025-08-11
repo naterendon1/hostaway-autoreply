@@ -8,6 +8,7 @@ from openai import OpenAI
 
 # Your Slack interactivity router (block_actions/view_submission)
 from slack_interactivity import router as slack_router
+app.include_router(slack_router, prefix="/slack")
 
 # Utils you already have
 from utils import (
