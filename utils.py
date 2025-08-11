@@ -633,8 +633,8 @@ def clean_ai_reply(reply: str) -> str:
 
     # Remove classic sign-offs and placeholders
     for bad in [
-        r"\bBest regards,?", r"\bBest,?", r"\bSincerely,?", r"\bThanks!?",
-        r"\bThank you!?", r"\bAll the best,?", r"\bCheers,?", r"\bKind regards,?"
+        r"\bBest regards,?", r"\bBest,?", r"\bSincerely,?",
+        r"\bAll the best,?", r"\bCheers,?", r"\bKind regards,?"
     ]:
         reply = re.sub(bad, "", reply, flags=re.IGNORECASE)
     reply = reply.replace("—", "").replace("--", "")
