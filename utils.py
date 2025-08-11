@@ -31,7 +31,8 @@ REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
     "GOOGLE_PLACES_API_KEY",
-    "GOOGLE_DISTANCE_MATRIX_API_KEY"
+    "GOOGLE_DISTANCE_MATRIX_API_KEY",
+    "OPENAI_API_KEY"
 ]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
@@ -47,31 +48,112 @@ GOOGLE_DISTANCE_MATRIX_API_KEY = os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Distance Matrix ---
-def get_travel_time_to_destination(destination_name, lat, lng):
+
+DISTANCE_TRIGGERS = [
+    "how far", "distance to", "distance from", "how long to", "drive to",
+    "drive time", "driving time", "travel time", "how long is the drive",
+]
+
+def extract_destination_from_message(msg: str) -> str | None:
+    """
+    Heuristic: if the message looks like a distance question, try to grab the destination text.
+    Examples it can catch:
+      - "How far is NASA Space Center?"
+      - "What's the drive time to Austin airport?"
+      - "Distance to the beach?"
+    """
+    mlow = msg.lower()
+    if not any(t in mlow for t in DISTANCE_TRIGGERS):
+        return None
+
+    # Strip common lead-ins and filler words
+    cleaned = re.sub(r"(how\s+far\s+is|how\s+far\s+to|distance\s+to|distance\s+from|how\s+long\s+to|drive(\s+time)?\s+to|driving\s+time\s+to|travel\s+time\s+to)\s+", "", mlow, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*(the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip(" ?!.,")
+
+    # Too short? bail
+    if len(cleaned) < 3:
+        return None
+    return cleaned
+
+def resolve_place_textsearch(query: str, lat: float | None = None, lng: float | None = None) -> dict | None:
+    """
+    Uses Google Places Text Search to resolve arbitrary destination names.
+    Optional origin bias with lat/lng.
+    Returns a dict: { 'name': str, 'place_id': str, 'lat': float, 'lng': float }
+    """
+    if not GOOGLE_API_KEY:
+        logging.warning("[PLACES] Missing GOOGLE_PLACES_API_KEY")
+        return None
+
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {"key": GOOGLE_API_KEY, "query": query}
+    if lat and lng:
+        params["location"] = f"{lat},{lng}"
+        params["radius"] = 30000  # bias up to ~30km; adjust as you like
+
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        j = resp.json()
+        results = j.get("results") or []
+        if not results:
+            return None
+        top = results[0]
+        geom = top.get("geometry", {}).get("location", {})
+        return {
+            "name": top.get("name") or query,
+            "place_id": top.get("place_id"),
+            "lat": geom.get("lat"),
+            "lng": geom.get("lng"),
+        }
+    except Exception as e:
+        logging.error(f"[PLACES] TextSearch error: {e}")
+        return None
+
+def get_distance_drive_time(origin_lat: float, origin_lng: float, destination: str, units: str = "imperial") -> str:
+    """
+    Calls Distance Matrix with traffic-aware driving estimates.
+    Returns a short English sentence (or error string).
+    """
+    if not GOOGLE_DISTANCE_MATRIX_API_KEY:
+        return "Distance service is not configured."
+
     endpoint = "https://maps.googleapis.com/maps/api/distancematrix/json"
     params = {
-        "origins": f"{lat},{lng}",
-        "destinations": destination_name,
-        "key": GOOGLE_DISTANCE_MATRIX_API_KEY
+        "origins": f"{origin_lat},{origin_lng}",
+        "destinations": destination,  # can be name or 'lat,lng'
+        "mode": "driving",
+        "departure_time": "now",      # use live traffic
+        "units": units,               # 'imperial' or 'metric'
+        "key": GOOGLE_DISTANCE_MATRIX_API_KEY,
     }
     try:
-        response = requests.get(endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("rows") and data["rows"][0]["elements"]:
-            element = data["rows"][0]["elements"][0]
-            if element.get("status") == "OK":
-                distance_text = element["distance"]["text"]
-                duration_text = element["duration"]["text"]
-                return f"{destination_name} is about {duration_text} away by car ({distance_text})."
-        return f"Sorry, I couldn't get travel time to {destination_name}."
+        r = requests.get(endpoint, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        rows = data.get("rows") or []
+        if not rows or not rows[0].get("elements"):
+            return f"Sorry, I couldn’t get distance to {destination}."
+        el = rows[0]["elements"][0]
+        if el.get("status") != "OK":
+            return f"Sorry, I couldn’t get distance to {destination}."
+        dist = el.get("distance", {}).get("text")
+        dur = el.get("duration_in_traffic", {}).get("text") or el.get("duration", {}).get("text")
+        return f"{destination} is about {dur} by car ({dist})."
     except Exception as e:
-        logging.error(f"[DISTANCE] Google Distance Matrix error: {e}")
-        return f"Sorry, there was a problem calculating distance to {destination_name}."
+        logging.error(f"[DISTANCE] Matrix error: {e}")
+        return f"Sorry, there was a problem calculating distance to {destination}."
 
-# NOTE: Everything else in your utils.py file remains unchanged and should be appended below here.
-# You should paste all your previously working code after this point to complete the file.
+def haversine_fallback_km(lat1, lon1, lat2, lon2) -> float:
+    """
+    Straight-line distance as a last resort (km).
+    """
+    from math import radians, sin, cos, asin, sqrt
+    R = 6371.0
+    dlat = radians(lat2-lat1); dlon = radians(lon2-lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    return 2*R*asin(sqrt(a))
 
 # --- detect_intent uses the global INTENT_LABELS above! ---
 def detect_intent(message: str) -> str:
@@ -194,6 +276,7 @@ def search_google_places(query, lat, lng, radius=4000, type_hint=None):
     if not GOOGLE_API_KEY or not lat or not lng:
         logging.warning("[PLACES] Missing API key or coordinates.")
         return []
+    
     endpoint = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     params = {
         "key": GOOGLE_API_KEY,
@@ -201,11 +284,19 @@ def search_google_places(query, lat, lng, radius=4000, type_hint=None):
         "radius": radius,
         "keyword": query,
     }
-    if type_hint:
+    
+    # ✅ Only set type if Google actually supports it
+    VALID_PLACE_TYPES = {
+        "restaurant", "bar", "night_club", "supermarket",
+        "shopping_mall", "tourist_attraction", "cafe", "liquor_store"
+    }
+    if type_hint in VALID_PLACE_TYPES:
         params["type"] = type_hint
+
     logging.info(f"[PLACES] Calling Google Places: {endpoint} with params: {params}")
+    
     try:
-        resp = requests.get(endpoint, params=params)
+        resp = requests.get(endpoint, params=params, timeout=10)
         logging.info(f"[PLACES] Response status: {resp.status_code}")
         logging.debug(f"[PLACES] Response body: {resp.text[:500]}")
         resp.raise_for_status()
@@ -547,7 +638,6 @@ def clean_ai_reply(reply: str) -> str:
     ]:
         reply = re.sub(bad, "", reply, flags=re.IGNORECASE)
     reply = reply.replace("—", "").replace("--", "")
-    reply = reply.replace(bad, "")
     reply = reply.replace("  ", " ").replace("..", ".").strip()
     if "[your name]" in reply.lower():
         reply = reply[:reply.lower().find("[your name]")]
