@@ -547,7 +547,7 @@ def clean_ai_reply(reply: str) -> str:
     ]:
         reply = re.sub(bad, "", reply, flags=re.IGNORECASE)
     reply = reply.replace("—", "").replace("--", "")
-        reply = reply.replace(bad, "")
+    reply = reply.replace(bad, "")
     reply = reply.replace("  ", " ").replace("..", ".").strip()
     if "[your name]" in reply.lower():
         reply = reply[:reply.lower().find("[your name]")]
