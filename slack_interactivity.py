@@ -362,7 +362,7 @@ async def slack_actions(
                     status=status,
                     detected_intent=detected_intent,
                     sent_label=sent_label,
-                    channel_pretty=channel_prety if (channel_prety := channel_pretty) else None,  # keep exact value
+                    channel_pretty=channel_pretty if (channel_prety := channel_pretty) else None,  # keep exact value
                     property_address=property_address,
                 )
             elif ts and channel and not success:
