@@ -25,6 +25,9 @@ from utils import (
     get_property_location,
     search_google_places,
     detect_place_type,
+    extract_destination_from_message,
+    resolve_place_textsearch,
+    get_distance_drive_time,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +39,9 @@ REQUIRED_ENV_VARS = [
     "OPENAI_API_KEY",
     "SLACK_CHANNEL",
     "SLACK_BOT_TOKEN",
+    # Optional but nice to fail-fast here too:
+    "GOOGLE_PLACES_API_KEY",
+    "GOOGLE_DISTANCE_MATRIX_API_KEY",
 ]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
@@ -184,24 +190,43 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         else:
             calendar_summary = "Calendar data not available for these dates."
 
-    # Optional local recommendations if user asked for places
+    # -------------------- Local recommendations + distance answers --------------------
     local_recs = ""
+    distance_block = ""
+
+    listing_obj_for_geo = fetch_hostaway_listing(listing_id)
+    lat, lng = get_property_location(listing_obj_for_geo, reservation)
+
+    # Nearby places (only if user asked for a place type)
     place_type, keyword = detect_place_type(guest_msg)
-    if place_type:
-        listing_obj_for_geo = fetch_hostaway_listing(listing_id)
-        lat, lng = get_property_location(listing_obj_for_geo, reservation)
-        if lat and lng:
-            places = search_google_places(keyword, lat, lng, type_hint=place_type) or []
-            if places:
-                local_recs = (
-                    f"Nearby {keyword}s from Google Maps for this property:\n" +
-                    "\n".join([
-                        f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}"
-                        for p in places[:3]
-                    ])
-                )
-            else:
-                local_recs = f"No {keyword}s found nearby from Google Maps."
+    if place_type and lat and lng:
+        places = search_google_places(keyword, lat, lng, type_hint=place_type) or []
+        if places:
+            local_recs = (
+                f"Nearby {keyword}s from Google Maps for this property:\n" +
+                "\n".join([
+                    f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}"
+                    for p in places[:3]
+                ])
+            )
+        else:
+            local_recs = f"No {keyword}s found nearby from Google Maps."
+
+    # Distance question handling (runs independently of place type)
+    try:
+        dest_text = extract_destination_from_message(guest_msg)
+        if dest_text and lat and lng:
+            resolved = resolve_place_textsearch(dest_text, lat=lat, lng=lng)
+            destination_for_matrix = (
+                f"{resolved['lat']},{resolved['lng']}"
+                if resolved and resolved.get("lat") and resolved.get("lng")
+                else dest_text
+            )
+            distance_sentence = get_distance_drive_time(lat, lng, destination_for_matrix, units="imperial")
+            pretty_name = resolved["name"] if resolved and resolved.get("name") else dest_text
+            distance_block = f"From the property to {pretty_name}: {distance_sentence}"
+    except Exception as e:
+        logging.exception(f"[DISTANCE] Pipeline error: {e}")
 
     # Trim reservation info for prompt
     important_res_fields = [
@@ -213,7 +238,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # Listing info (trim)
     listing_trimmed = {}
-    listing_obj = fetch_hostaway_listing(listing_id)
+    listing_obj = listing_obj_for_geo
     if listing_obj and "result" in listing_obj and isinstance(listing_obj["result"], dict):
         lres = listing_obj["result"] or {}
         listing_trimmed = {
@@ -266,6 +291,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         f"Listing Info:\n{json.dumps(listing_trimmed)}\n"
         f"Calendar Info: {calendar_summary}\n"
         f"{local_recs}\n"
+        f"{distance_block}\n"
         f"Intent: {detected_intent}\n"
         f"{prev_answer}\n"
         "---\n"
