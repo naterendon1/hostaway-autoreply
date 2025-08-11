@@ -8,15 +8,15 @@ from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
 from openai import OpenAI
 
-# --- App & logging early (so decorators can attach) ---
+# --- App & logging early ---
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
-# Your Slack interactivity router (events/actions)
+# Slack interactivity (events/actions) router
 from slack_interactivity import router as slack_router
 app.include_router(slack_router, prefix="/slack")
 
-# Utils you already have
+# Utils
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
@@ -37,12 +37,13 @@ from utils import (
     get_distance_drive_time,
 )
 
-# DB init
+# DB init for custom_responses.db (kept for compatibility/future use)
 from db import init_db
 init_db()
 
-DB_PATH = "custom_responses.db"
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")  # set on Render
+# --- Admin + DB paths ---
+LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")  # set this on Render
 
 def require_admin(
     x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
@@ -52,30 +53,33 @@ def require_admin(
     if supplied != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ---------- Admin endpoints ----------
+# ---------- Admin endpoints (Option A: point to learning.db) ----------
 @app.get("/learning", dependencies=[Depends(require_admin)])
 def list_learning(limit: int = 100) -> List[Dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(LEARNING_DB_PATH)
     conn.row_factory = sqlite3.Row
+    # ensure table exists
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS custom_responses (
+        CREATE TABLE IF NOT EXISTS learning_examples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            listing_id INTEGER,
-            question_text TEXT,
-            response_text TEXT,
+            guest_message TEXT,
+            ai_suggestion TEXT,
+            user_reply TEXT,
+            listing_id TEXT,
+            guest_id TEXT,
             created_at TEXT
         )
     """)
     rows = conn.execute(
-        "SELECT id, listing_id, question_text, response_text, created_at "
-        "FROM custom_responses ORDER BY id DESC LIMIT ?", (limit,)
+        "SELECT id, guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at "
+        "FROM learning_examples ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/feedback", dependencies=[Depends(require_admin)])
 def list_feedback(limit: int = 100) -> List[Dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(LEARNING_DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ai_feedback (
@@ -119,6 +123,7 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 MAX_THREAD_MESSAGES = 10
 
+# -------------------- Models --------------------
 class HostawayUnifiedWebhook(BaseModel):
     object: str
     event: str
@@ -128,6 +133,7 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str | None = None
     date: str | None = None
 
+# -------------------- AI helper --------------------
 def make_ai_reply(prompt: str, system_prompt: str) -> str:
     try:
         logging.info(f"Prompt length: {len(prompt)} characters")
@@ -144,10 +150,12 @@ def make_ai_reply(prompt: str, system_prompt: str) -> str:
         logging.error(f"❌ OpenAI error: {e}")
         return "(Error generating reply.)"
 
+# -------------------- Webhook --------------------
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
 
+    # Only handle inbound guest messages
     if payload.event != "message.received" or payload.object != "conversationMessage":
         return {"status": "ignored"}
 
@@ -159,12 +167,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             logging.info("🧾 Empty message skipped.")
         return {"status": "ignored"}
 
+    # Basic IDs/context
     conv_id = payload.data.get("conversationId")
     reservation_id = payload.data.get("reservationId")
     listing_id = payload.data.get("listingMapId")
     guest_id = payload.data.get("userId", "")
-    communication_type = payload.data.get("communicationType", "channel")
+    communication_type = payload.data.get("communicationType", "channel")  # airbnb, vrbo, direct
 
+    # Reservation
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res = reservation.get("result", {}) or {}
 
@@ -180,6 +190,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
+    # Conversation context (last few)
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
@@ -196,6 +207,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if len(context_str) > 1200:
         context_str = context_str[-1200:]
 
+    # Intent + few-shot learning
     detected_intent = detect_intent(guest_msg)
     prev_examples = get_similar_learning_examples(guest_msg, listing_id)
     prev_answer = (
@@ -204,22 +216,33 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         else ""
     )
 
+    # Cancellation context (placeholder)
     _ = get_cancellation_policy_summary({}, res)
 
+    # Calendar check if query looks date-ish
     calendar_summary = "No calendar check for this inquiry."
     if any(word in guest_msg.lower() for word in [
-        "available","availability","book","open","stay","dates","night",
-        "reserve","weekend","extend","extra night","holiday","christmas",
-        "spring break","july","august","september","october","november",
-        "december","january","february","march","april","may","june","thanksgiving"
+        "available", "availability", "book", "open", "stay", "dates", "night",
+        "reserve", "weekend", "extend", "extra night", "holiday", "christmas",
+        "spring break", "july", "august", "september", "october", "november",
+        "december", "january", "february", "march", "april", "may", "june", "thanksgiving"
     ]):
         start_date, end_date = extract_date_range_from_message(guest_msg, res)
         calendar_days = fetch_hostaway_calendar(listing_id, start_date, end_date)
         if calendar_days:
-            available_days = [d["date"] for d in calendar_days if d.get("isAvailable") or d.get("status") == "available"]
-            unavailable_days = [d["date"] for d in calendar_days if not (d.get("isAvailable") or d.get("status") == "available")]
+            available_days = [
+                d["date"] for d in calendar_days
+                if d.get("isAvailable") or d.get("status") == "available"
+            ]
+            unavailable_days = [
+                d["date"] for d in calendar_days
+                if not (d.get("isAvailable") or d.get("status") == "available")
+            ]
             if available_days:
-                calendar_summary = f"For {start_date} to {end_date}: Available nights: {', '.join(available_days)}."
+                calendar_summary = (
+                    f"For {start_date} to {end_date}: "
+                    f"Available nights: {', '.join(available_days)}."
+                )
                 if unavailable_days:
                     calendar_summary += f" Unavailable: {', '.join(unavailable_days)}."
             else:
@@ -227,23 +250,29 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         else:
             calendar_summary = "Calendar data not available for these dates."
 
+    # -------------------- Local recommendations + distance answers --------------------
     local_recs = ""
     distance_block = ""
 
     listing_obj_for_geo = fetch_hostaway_listing(listing_id)
     lat, lng = get_property_location(listing_obj_for_geo, reservation)
 
+    # Nearby places (only if user asked for a place type)
     place_type, keyword = detect_place_type(guest_msg)
     if place_type and lat and lng:
         places = search_google_places(keyword, lat, lng, type_hint=place_type) or []
         if places:
             local_recs = (
                 f"Nearby {keyword}s from Google Maps for this property:\n" +
-                "\n".join([f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}" for p in places[:3]])
+                "\n".join([
+                    f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}"
+                    for p in places[:3]
+                ])
             )
         else:
             local_recs = f"No {keyword}s found nearby from Google Maps."
 
+    # Distance question handling (independent of place type)
     try:
         dest_text = extract_destination_from_message(guest_msg)
         if dest_text and lat and lng:
@@ -259,13 +288,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     except Exception as e:
         logging.exception(f"[DISTANCE] Pipeline error: {e}")
 
+    # Trim reservation info for prompt
     important_res_fields = [
-        "arrivalDate","departureDate","numberOfGuests",
-        "guestFirstName","guestLastName","status","totalPrice",
-        "cancellationPolicy","listingId"
+        "arrivalDate", "departureDate", "numberOfGuests",
+        "guestFirstName", "guestLastName", "status", "totalPrice",
+        "cancellationPolicy", "listingId"
     ]
     res_trimmed = {k: res[k] for k in important_res_fields if k in res}
 
+    # Listing info (trim)
     listing_trimmed = {}
     listing_obj = listing_obj_for_geo
     if listing_obj and "result" in listing_obj and isinstance(listing_obj["result"], dict):
@@ -280,9 +311,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "amenities": (lres.get("amenities") or [])[:5],
         }
 
+    # Channel pretty label
     CHANNEL_MAP = {
-        "airbnb": "Airbnb","vrbo": "Vrbo","bookingcom": "Booking.com",
-        "direct": "Direct","expedia":"Expedia","channel":"Channel",
+        "airbnb": "Airbnb",
+        "vrbo": "Vrbo",
+        "bookingcom": "Booking.com",
+        "direct": "Direct",
+        "expedia": "Expedia",
+        "channel": "Channel",
     }
     raw_channel = (
         payload.data.get("communicationType")
@@ -292,6 +328,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     )
     channel_pretty = CHANNEL_MAP.get(str(raw_channel).lower(), str(raw_channel).capitalize())
 
+    # Address can be dict; normalize to string
     addr_raw = (
         listing_trimmed.get("address")
         or (listing_obj.get("result", {}).get("address") if listing_obj else None)
@@ -300,12 +337,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if isinstance(addr_raw, dict):
         property_address = ", ".join(
             str(addr_raw.get(k, "")).strip()
-            for k in ["address","city","state","zip","country"]
+            for k in ["address", "city", "state", "zip", "country"]
             if addr_raw.get(k)
         ) or "Address unavailable"
     else:
         property_address = str(addr_raw)
 
+    # -------------------- Build AI prompt --------------------
     ai_prompt = (
         f"Here is the conversation thread so far (newest last):\n"
         f"{context_str}\n"
@@ -335,6 +373,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt, system_prompt))
 
+    # -------------------- Slack message --------------------
     button_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -393,6 +432,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     return {"status": "ok"}
 
+# -------------------- Health --------------------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
