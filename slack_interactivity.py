@@ -24,6 +24,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
+if not SLACK_BOT_TOKEN:
+    logging.warning("SLACK_BOT_TOKEN is not set; Slack updates will fail.")
+
 
 # -------------------- Security: Slack Signature Verify --------------------
 def verify_slack_signature(request_body: str, slack_signature: str, slack_request_timestamp: str) -> bool:
@@ -247,6 +250,8 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         except Exception as e2:
             logging.error(f"views_update (final) second exception: {e2}")
 
+
+# ---------------------------- Events Endpoint ----------------------------
 @router.post("/events")
 async def slack_events(
     request: Request,
@@ -269,16 +274,68 @@ async def slack_events(
     return JSONResponse({"ok": True})
 
 
-# ---------------------------- Slack Interactivity Endpoint ----------------------------
+# ---------------- Background: send to Hostaway + update Slack ----------------
+def _background_send_and_update(meta: dict, reply_text: str):
+    try:
+        ok = send_reply_to_hostaway(meta["conv_id"], reply_text, meta.get("type", "email"))
+    except Exception as e:
+        logging.error(f"Hostaway send error: {e}")
+        ok = False
+
+    channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
+    ts = meta.get("ts")
+    if not channel or not ts:
+        logging.warning("Missing channel/ts for Slack chat_update; skipping header update.")
+        return
+
+    if ok:
+        update_slack_message_with_sent_reply(
+            slack_bot_token=SLACK_BOT_TOKEN,
+            channel=channel,
+            ts=ts,
+            guest_name=meta.get("guest_name", "Guest"),
+            guest_msg=meta.get("guest_message", ""),
+            sent_reply=reply_text,
+            communication_type=meta.get("type", "email"),
+            check_in=meta.get("check_in", "N/A"),
+            check_out=meta.get("check_out", "N/A"),
+            guest_count=meta.get("guest_count", "N/A"),
+            status=meta.get("status", "Unknown"),
+            detected_intent=meta.get("detected_intent", "Unknown"),
+            sent_label=meta.get("sent_label", "message sent"),
+            channel_pretty=meta.get("channel_pretty"),
+            property_address=meta.get("property_address"),
+        )
+    else:
+        try:
+            slack_client.chat_update(
+                channel=channel,
+                ts=ts,
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
+                }],
+                text="Failed to send reply."
+            )
+        except Exception as e:
+            logging.error(f"Slack chat_update error: {e}")
+
+
+# ---------------------------- Interactivity Endpoint ----------------------------
 @router.post("/actions")
 async def slack_actions(
     request: Request,
     background_tasks: BackgroundTasks,
     x_slack_signature: str = Header(None, alias="X-Slack-Signature"),
-    x_slack_request_timestamp: str = Header(None, alias="X-Slack-Request-Timestamp")
+    x_slack_request_timestamp: str = Header(None, alias="X-Slack-Request-Timestamp"),
+    x_slack_retry_num: str | None = Header(None, alias="X-Slack-Retry-Num"),
+    x_slack_retry_reason: str | None = Header(None, alias="X-Slack-Retry-Reason"),
 ):
+    # Handle Slack retries gracefully
     if x_slack_retry_num is not None:
+        logging.info(f"Skipping retry #{x_slack_retry_num} ({x_slack_retry_reason}) for /slack/actions")
         return JSONResponse({"ok": True})
+
     # Raw body for signature verification
     raw_body_bytes = await request.body()
     raw_body = raw_body_bytes.decode("utf-8") if raw_body_bytes else ""
@@ -298,7 +355,6 @@ async def slack_actions(
     logging.info("🎯 /slack/actions hit")
     logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
 
-   
     # -------------------- block_actions handler --------------------
     if payload.get("type") == "block_actions":
         action = payload["actions"][0]
@@ -329,7 +385,7 @@ async def slack_actions(
             )
 
             # Pull details (plus pretty channel + address if present)
-            reply = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
+            reply_text = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
             guest_name = meta.get("guest_name", "Guest")
@@ -345,7 +401,12 @@ async def slack_actions(
             channel_pretty = meta.get("channel_pretty")
             property_address = meta.get("property_address")
 
-            if not reply or not conv_id:
+            if channel:
+                meta["channel"] = channel
+            if ts:
+                meta["ts"] = ts
+
+            if not reply_text or not conv_id:
                 return JSONResponse({"text": "Missing reply or conversation ID."})
 
             # Immediately update modal to say "Sending..." (if a modal is open)
@@ -366,45 +427,8 @@ async def slack_actions(
             except Exception as e:
                 logging.error(f"Slack sending-modal update error: {e}")
 
-            # Then proceed with actual send
-            try:
-                success = send_reply_to_hostaway(conv_id, reply, communication_type)
-            except Exception as e:
-                logging.error(f"Slack SEND error: {e}")
-                success = False
-
-            if ts and channel and success:
-                update_slack_message_with_sent_reply(
-                    slack_bot_token=SLACK_BOT_TOKEN,
-                    channel=channel,
-                    ts=ts,
-                    guest_name=guest_name,
-                    guest_msg=guest_msg,
-                    sent_reply=reply,
-                    communication_type=communication_type,
-                    check_in=check_in,
-                    check_out=check_out,
-                    guest_count=guest_count,
-                    status=status,
-                    detected_intent=detected_intent,
-                    sent_label=sent_label,
-                    channel_pretty=channel_pretty ,  # keep exact value
-                    property_address=property_address,
-                )
-            elif ts and channel and not success:
-                try:
-                    slack_client.chat_update(
-                        channel=channel,
-                        ts=ts,
-                        blocks=[{
-                            "type": "section",
-                            "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
-                        }],
-                        text="Failed to send reply."
-                    )
-                except Exception as e:
-                    logging.error(f"Slack chat_update error: {e}")
-
+            # Background send+update to avoid Slack 3s timeout
+            background_tasks.add_task(_background_send_and_update, meta, reply_text)
             return JSONResponse({"response_action": "clear"})
 
         # --- WRITE OWN ---
@@ -477,7 +501,6 @@ async def slack_actions(
                 "private_metadata": json.dumps(meta),
                 "blocks": modal_blocks
             }
-            container = payload.get("container", {})
             try:
                 if container.get("type") == "message":
                     slack_client.views_open(trigger_id=trigger_id, view=modal)
@@ -643,38 +666,19 @@ async def slack_actions(
                     }
                 })
 
-            # Continue with the send
-            conv_id = meta.get("conv_id") or meta.get("conversation_id")
-            communication_type = meta.get("type", "email")
-            guest_message = meta.get("guest_message", "")
-            ai_suggestion = meta.get("ai_suggestion", "")
+            # Continue with the send (but do it in background)
+            if "conv_id" not in meta and "conversation_id" in meta:
+                meta["conv_id"] = meta["conversation_id"]
+
             channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
             ts = meta.get("ts")
+            if channel:
+                meta["channel"] = channel
+            if ts:
+                meta["ts"] = ts
 
-            send_reply_to_hostaway(conv_id, reply_text, communication_type)
-
-            if channel and ts:
-                sent_label = meta.get("sent_label", "message sent")
-                channel_pretty = meta.get("channel_pretty")
-                property_address = meta.get("property_address")
-
-                update_slack_message_with_sent_reply(
-                    slack_bot_token=SLACK_BOT_TOKEN,
-                    channel=channel,
-                    ts=ts,
-                    guest_name=meta.get("guest_name", "Guest"),
-                    guest_msg=guest_message,
-                    sent_reply=reply_text,
-                    communication_type=communication_type,
-                    check_in=meta.get("check_in", "N/A"),
-                    check_out=meta.get("check_out", "N/A"),
-                    guest_count=meta.get("guest_count", "N/A"),
-                    status=meta.get("status", "Unknown"),
-                    detected_intent=meta.get("detected_intent", "Unknown"),
-                    sent_label=sent_label,
-                    channel_pretty=channel_pretty,
-                    property_address=property_address,
-                )
+            # Queue background task to send + update Slack
+            background_tasks.add_task(_background_send_and_update, meta, reply_text)
 
             # Save checkbox state
             save_for_next_time = False
@@ -683,6 +687,8 @@ async def slack_actions(
                     save_for_next_time = True
 
             if save_for_next_time:
+                guest_message = meta.get("guest_message", "")
+                ai_suggestion = meta.get("ai_suggestion", "")
                 store_learning_example(
                     guest_message,
                     ai_suggestion,
