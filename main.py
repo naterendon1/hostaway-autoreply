@@ -6,10 +6,6 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from openai import OpenAI
 
-# Your Slack interactivity router (block_actions/view_submission)
-from slack_interactivity import router as slack_router
-app.include_router(slack_router, prefix="/slack")
-
 # Utils you already have
 from utils import (
     fetch_hostaway_listing,
@@ -31,6 +27,9 @@ from utils import (
     get_distance_drive_time,
 )
 
+# Your Slack interactivity router (events/actions)
+from slack_interactivity import router as slack_router
+
 logging.basicConfig(level=logging.INFO)
 
 # -------------------- Env checks --------------------
@@ -40,10 +39,11 @@ REQUIRED_ENV_VARS = [
     "OPENAI_API_KEY",
     "SLACK_CHANNEL",
     "SLACK_BOT_TOKEN",
-    # Optional but nice to fail-fast here too:
+    # Required Google APIs
     "GOOGLE_PLACES_API_KEY",
     "GOOGLE_DISTANCE_MATRIX_API_KEY",
 ]
+
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
     raise RuntimeError(f"Missing required environment variables: {missing}")
@@ -333,7 +333,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "property_address": property_address,  # normalized address string
     }
 
-    # (Optional) debug to ensure values aren’t N/A in the button_meta
     logging.info("button_meta: %s", json.dumps(button_meta, indent=2))
 
     blocks = [
