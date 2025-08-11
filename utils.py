@@ -562,7 +562,7 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_
         return False
 
 def get_cancellation_policy_summary(listing_result, reservation_result):
-    policy = reservation_result.get("cancellationPolicy") or listing_result.get("cancellationPolicy")
+    policy = (reservation_result or {}).get("cancellationPolicy") or (listing_result or {}).get("cancellationPolicy")
     if not policy:
         return "No cancellation policy found."
     desc = {
