@@ -481,24 +481,93 @@ def get_cancellation_policy_summary(listing_result, reservation_result):
     }
     return desc.get(policy, f"Policy: {policy}")
 
-def clean_ai_reply(reply: str):
-    reply = reply.rstrip(",. ")
-    reply = ''.join(c for c in reply if c.isprintable() and (ord(c) < 0x1F300 or ord(c) > 0x1FAD6))
+# --- Reply post-processing (tone clean-up) ---
+# Keep this near get_cancellation_policy_summary so imports above (re, datetime) are already available.
+
+BANNED_PHRASES = [
+    "thank you for your patience",
+    "we apologize for any inconvenience",
+    "kindly note",
+    "please be advised",
+    "sincerely,",
+    "best regards",
+]
+
+_CONTRACTIONS = [
+    (r"\bdo not\b", "don't"),
+    (r"\bdoes not\b", "doesn't"),
+    (r"\bdid not\b", "didn't"),
+    (r"\bit is\b", "it's"),          # keep "it was" unchanged
+    (r"\bwe are\b", "we're"),
+    (r"\bwe will\b", "we'll"),
+    (r"\bwe have\b", "we've"),
+    (r"\byou are\b", "you're"),
+    (r"\bthat is\b", "that's"),
+    (r"\bthere is\b", "there's"),
+    (r"\bI will\b", "I'll"),
+    (r"\bI have\b", "I've"),
+    (r"\bcannot\b", "can't"),
+]
+
+def _preserve_case(src: str, repl: str) -> str:
+    # If the source starts capitalized ("Do not"), capitalize the replacement ("Don't")
+    if src[:1].isupper():
+        return repl[:1].upper() + repl[1:]
+    return repl
+
+def _apply_contractions(txt: str) -> str:
+    s = txt
+    for pattern, repl in _CONTRACTIONS:
+        s = re.sub(pattern, lambda m: _preserve_case(m.group(0), repl), s, flags=re.IGNORECASE)
+    return s
+
+def clean_ai_reply(reply: str) -> str:
+    if not reply:
+        return reply
+
+    # Trim obvious junk and strip emojis/symbols in U+1F300–U+1FAFF
+    reply = reply.rstrip(",. ").strip()
+    reply = ''.join(
+        c for c in reply
+        if c.isprintable() and not (0x1F300 <= ord(c) <= 0x1FAFF)
+    )
+
+    # Seasonal line nuke if not December
     lower_reply = reply.lower()
     holiday_terms = ["enjoy your holidays", "merry christmas", "happy holidays", "happy new year"]
-    if any(term in lower_reply for term in holiday_terms):
-        if datetime.now().month != 12:
-            for term in holiday_terms:
-                reply = re.sub(term, "", reply, flags=re.IGNORECASE)
-            reply = ' '.join(reply.split())
-            reply = reply.strip()
-    for bad in ["Best,", "Best regards,", "[Your Name]", "Sincerely,", "Thanks!", "Thank you!", "All the best,", "Cheers,", "Kind regards,", "—", "--"]:
+    if any(term in lower_reply for term in holiday_terms) and datetime.now().month != 12:
+        for term in holiday_terms:
+            reply = re.sub(term, "", reply, flags=re.IGNORECASE)
+        reply = ' '.join(reply.split()).strip()
+
+    # Remove classic sign-offs and placeholders
+    for bad in [
+        r"\bBest regards,?", r"\bBest,?", r"\bSincerely,?", r"\bThanks!?",
+        r"\bThank you!?", r"\bAll the best,?", r"\bCheers,?", r"\bKind regards,?"
+    ]:
+        reply = re.sub(bad, "", reply, flags=re.IGNORECASE)
+    reply = reply.replace("—", "").replace("--", "")
         reply = reply.replace(bad, "")
     reply = reply.replace("  ", " ").replace("..", ".").strip()
     if "[your name]" in reply.lower():
         reply = reply[:reply.lower().find("[your name]")]
+
+    # Ban-list (case-insensitive): cut from the first occurrence
+    low = reply.lower()
+    for p in BANNED_PHRASES:
+        idx = low.find(p)
+        if idx != -1:
+            reply = reply[:idx].strip()
+            break
+
+    # Contractions pass (word-boundary aware)
+    reply = _apply_contractions(reply)
+
+    # Final tidy: collapse spaces, trim trailing punctuation
+    reply = re.sub(r"\s+", " ", reply).strip()
     reply = reply.rstrip(". ").strip()
     return reply
+
 
 # --- SQLite Learning Functions ---
 def _init_learning_db():
