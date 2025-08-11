@@ -37,6 +37,24 @@ from utils import (
     get_distance_drive_time,
 )
 
+from datetime import date
+
+def trip_phase(check_in: str | None, check_out: str | None) -> str:
+    try:
+        ci = date.fromisoformat(str(check_in)) if check_in else None
+        co = date.fromisoformat(str(check_out)) if check_out else None
+    except Exception:
+        return "unknown"
+    today = date.today()
+    if ci and today < ci:
+        return "upcoming"
+    if ci and co and ci <= today <= co:
+        return "during"
+    if co and today > co:
+        return "past"
+    return "unknown"
+
+
 # DB init for custom_responses.db (kept for compatibility/future use)
 from db import init_db
 init_db()
@@ -184,6 +202,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     guest_count = res.get("numberOfGuests", "N/A")
     status = (payload.data.get("status") or res.get("status") or "Unknown")
     status = status.capitalize() if isinstance(status, str) else status
+    phase = trip_phase(check_in, check_out)
+
 
     if not listing_id:
         listing_id = res.get("listingId")
@@ -353,6 +373,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         f"{local_recs}\n"
         f"{distance_block}\n"
         f"Intent: {detected_intent}\n"
+        f"Trip phase: {phase}\n"
         f"{prev_answer}\n"
         "---\n"
         "Write a brief, human reply to the most recent guest message above, using the full context. "
@@ -362,13 +383,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     system_prompt = (
         "You are a human vacation-rental host texting from your phone. "
         "Voice: modern, relaxed, concise, helpful—like a friendly pro who knows the property. "
-        "Always write in plain language with contractions (we're, it's, don't), no fluff, no filler, no emojis, no sign-offs. "
+        "Always use contractions, no fluff, no emojis, no sign-offs. "
         "Never restate the guest's message. Answer only what they need next. "
-        "Prefer short sentences and short paragraphs. "
-        "Use specifics from reservation/listing/calendar when helpful; do not fabricate. "
-        "If info is missing, ask one short clarifying question (not multiple). "
-        "If the guest already has the answer, skip repeating it. "
-        "Tone constraints: no corporate phrases. No greetings or farewells."
+        "If the message is a compliment or mentions a review, explicitly acknowledge with a natural, brief thank-you. "
+        "Use trip phase to guide phrasing:\n"
+        "- upcoming: offer help before arrival, avoid 'hope you enjoyed'.\n"
+        "- during: check if they need anything.\n"
+        "- past: thank them for staying and invite them back, avoid 'before you arrive'.\n"
+        "Tone constraints: avoid corporate phrases."
     )
 
     ai_reply = clean_ai_reply(make_ai_reply(ai_prompt, system_prompt))
