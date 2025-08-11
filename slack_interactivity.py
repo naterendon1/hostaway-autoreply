@@ -187,7 +187,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
     )
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-5-turbo",
+            model="gpt-4o-mini",
             timeout=15,
             messages=[
                 {"role": "system", "content": "You edit messages for a vacation-rental host. Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis."},
