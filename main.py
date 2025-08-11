@@ -56,7 +56,7 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 # -------------------- FastAPI --------------------
 app = FastAPI()
-app.include_router(slack_router)
+app.include_router(slack_router, prefix="/slack")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 MAX_THREAD_MESSAGES = 10
