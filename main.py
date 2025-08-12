@@ -280,21 +280,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         eci_lco_eval = evaluate_time_adjust_options(listing_id, res)
         if eci_lco_eval:
         # mark which options were actually requested
-        eci_lco_eval["early"]["requested"] = eci_lco_flags["early"]
-        eci_lco_eval["late"]["requested"]  = eci_lco_flags["late"]
+            eci_lco_eval["early"]["requested"] = eci_lco_flags["early"]
+            eci_lco_eval["late"]["requested"]  = eci_lco_flags["late"]
         # Human-readable line to feed the model (and keep it honest)
-        eci_lco_summary = (
-            "Early/Late policy (authoritative truth for this reply): "
-            f"{eci_lco_eval['policy_summary']} "
-            f"Guest requested early? {eci_lco_eval['early']['requested']}; "
-            f"late? {eci_lco_eval['late']['requested']}."
-        )
-    else:
+            eci_lco_summary = (
+                "Early/Late policy (authoritative truth for this reply): "
+                f"{eci_lco_eval['policy_summary']} "
+                f"Guest requested early? {eci_lco_eval['early']['requested']}; "
+                f"late? {eci_lco_eval['late']['requested']}."
+            )
+        else:
         # Fallback summary if evaluation failed
-         eci_lco_summary = (
-             "Early/Late policy: $50 fee each when available. "
-             "Availability depends on same-day turnovers; if there is one, "
-             "we can only confirm after cleaners finish."
+             eci_lco_summary = (
+                 "Early/Late policy: $50 fee each when available. "
+                 "Availability depends on same-day turnovers; if there is one, "
+                 "we can only confirm after cleaners finish."
         )
 
 
