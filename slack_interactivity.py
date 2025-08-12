@@ -62,11 +62,17 @@ def update_slack_message_with_sent_reply(
     detected_intent,
     sent_label="message sent",
     channel_pretty=None,
-    property_address=None
+    property_address=None,
+    saved_for_learning: bool = False,
 ):
     _client = WebClient(token=slack_bot_token)
     channel_label = channel_pretty or (communication_type.capitalize() if communication_type else "Channel")
     addr = property_address or "Address unavailable"
+
+    ctx_elems = [{"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}]
+    if saved_for_learning:
+        ctx_elems.append({"type": "mrkdwn", "text": ":bookmark_tabs: Saved for AI learning"})
+
     blocks = [
         {
             "type": "section",
@@ -82,7 +88,7 @@ def update_slack_message_with_sent_reply(
         },
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Intent:* `{detected_intent}`"}]},
+        {"type": "context", "elements": ctx_elems},  # <--- now includes the badge when set
         {"type": "section", "text": {"type": "mrkdwn", "text": f":white_check_mark: *{sent_label}*"}}
     ]
     try:
@@ -305,6 +311,7 @@ def _background_send_and_update(meta: dict, reply_text: str):
             sent_label=meta.get("sent_label", "message sent"),
             channel_pretty=meta.get("channel_pretty"),
             property_address=meta.get("property_address"),
+            saved_for_learning=bool(meta.get("saved_for_learning")),
         )
     else:
         try:
@@ -685,6 +692,8 @@ async def slack_actions(
             for block in state.values():
                 if "save_answer" in block and block["save_answer"].get("selected_options"):
                     save_for_next_time = True
+
+            meta["saved_for_learning"] = bool(save_for_next_time)
 
             if save_for_next_time:
                 guest_message = meta.get("guest_message", "")
