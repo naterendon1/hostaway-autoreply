@@ -35,6 +35,8 @@ from utils import (
     extract_destination_from_message,
     resolve_place_textsearch,
     get_distance_drive_time,
+    detect_time_adjust_request,
+    evaluate_time_adjust_options,
 )
 
 from datetime import date
@@ -270,6 +272,32 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         else:
             calendar_summary = "Calendar data not available for these dates."
 
+   # ----- ECI/LCO smart policy injection ----- #
+    eci_lco_flags = detect_time_adjust_request(guest_msg)
+    eci_lco_summary = ""
+    
+    if eci_lco_flags["early"] or eci_lco_flags["late"]:
+        eci_lco_eval = evaluate_time_adjust_options(listing_id, res)
+        if eci_lco_eval:
+        # mark which options were actually requested
+        eci_lco_eval["early"]["requested"] = eci_lco_flags["early"]
+        eci_lco_eval["late"]["requested"]  = eci_lco_flags["late"]
+        # Human-readable line to feed the model (and keep it honest)
+        eci_lco_summary = (
+            "Early/Late policy (authoritative truth for this reply): "
+            f"{eci_lco_eval['policy_summary']} "
+            f"Guest requested early? {eci_lco_eval['early']['requested']}; "
+            f"late? {eci_lco_eval['late']['requested']}."
+        )
+    else:
+        # Fallback summary if evaluation failed
+         eci_lco_summary = (
+             "Early/Late policy: $50 fee each when available. "
+             "Availability depends on same-day turnovers; if there is one, "
+             "we can only confirm after cleaners finish."
+        )
+
+
     # -------------------- Local recommendations + distance answers --------------------
     local_recs = ""
     distance_block = ""
@@ -372,6 +400,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         f"Calendar Info: {calendar_summary}\n"
         f"{local_recs}\n"
         f"{distance_block}\n"
+        f"{('' if not eci_lco_summary else eci_lco_summary + '\\n')}"
         f"Intent: {detected_intent}\n"
         f"Trip phase: {phase}\n"
         f"{prev_answer}\n"
@@ -386,6 +415,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "Always use contractions, no fluff, no emojis, no sign-offs. "
         "Never restate the guest's message. Answer only what they need next. "
         "If the message is a compliment or mentions a review, explicitly acknowledge with a natural, brief thank-you. "
+        "If the message asks about early check-in or late check-out and an explicit policy summary is provided, "
+        "you MUST follow it exactly, including fees. "
+        "If a same-day turnover blocks ECI/LCO, say we can confirm day-of after cleaners finish. "
+        "Use specifics from reservation/listing/calendar; never fabricate times. "
+        "Prefer short sentences and short paragraphs.\n"
         "Use trip phase to guide phrasing:\n"
         "- upcoming: offer help before arrival, avoid 'hope you enjoyed'.\n"
         "- during: check if they need anything.\n"
