@@ -186,8 +186,6 @@ def detect_intent(message: str) -> str:
         logging.error(f"Intent detection failed: {e}")
         return "other"
 
-# ---- Rest of your code unchanged below this line ----
-# ... (keep your functions for hostaway, db, google places, etc. as before)
 
 PROPERTY_LOCATIONS = {
     "crystal_beach": {"lat": 29.4472, "lng": -94.6296, "city": "Crystal Beach, TX"},
@@ -380,6 +378,69 @@ def build_full_prompt(
         "If an item is being sent back by your cleaner, acknowledge the cleaner's favor, not the guest's."
     )
     return prompt
+def _date(s: str | None):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s)).date()
+    except Exception:
+        return None
+
+def _fetch_calendar_day_with_res(listing_id: int, day_str: str) -> dict | None:
+    """
+    Fetch one calendar day with includeResources=1 so 'reservations' is populated.
+    """
+    token = get_hostaway_access_token()
+    if not token or not listing_id or not day_str:
+        return None
+    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}/calendar"
+    params = {
+        "startDate": day_str,
+        "endDate": day_str,
+        "includeResources": 1,
+    }
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        # Response can be list OR dict with "result" list
+        days = []
+        if isinstance(data, list):
+            days = data
+        elif isinstance(data, dict) and "result" in data:
+            if isinstance(data["result"], list):
+                days = data["result"]
+            elif isinstance(data["result"], dict):
+                # Some tenants return {"result":{"calendar":[...]}}
+                days = data["result"].get("calendar", [])
+        return days[0] if days else None
+    except Exception as e:
+        logging.error(f"[ECI/LCO] Calendar fetch error for {day_str}: {e}")
+        return None
+
+def _has_same_day_checkout(listing_id: int, arrival_str: str) -> bool:
+    """
+    True if there is another reservation whose departureDate == this arrival date.
+    """
+    day = _fetch_calendar_day_with_res(listing_id, arrival_str)
+    if not day:
+        return False
+    for resv in (day.get("reservations") or []):
+        if str(resv.get("departureDate")) == arrival_str:
+            return True
+    return False
+
+def _has_same_day_checkin(listing_id: int, departure_str: str) -> bool:
+    """
+    True if there is another reservation whose arrivalDate == this departure date.
+    """
+    day = _fetch_calendar_day_with_res(listing_id, departure_str)
+    if not day:
+        return False
+    for resv in (day.get("reservations") or []):
+        if str(resv.get("arrivalDate")) == departure_str:
+            return True
+    return False
 
 
 def fetch_hostaway_calendar(listing_id, start_date, end_date):
@@ -510,92 +571,85 @@ def _date_only(d: str | None) -> str | None:
     return d[:10]
 
 
-def evaluate_time_adjust_options(listing_id: int, reservation_result: dict) -> dict:
+def evaluate_time_adjust_options(listing_id: int, reservation_result: dict) -> dict | None:
     """
-    Business rules:
-    - ECI available if there's NOT a same-day checkout (turnover) on guest's check-in day.
-      If turnover exists: ECI not guaranteed; we can only confirm after cleaners finish (day-of).
-    - LCO available if there's NOT a same-day check-in on guest's check-out day.
-      If turnover exists: LCO not guaranteed; we can only confirm day-of after cleaners.
-    - Fees: $50 each when available/approved.
-    - If we can't read calendar, mark unknown with appropriate reasons.
+    Decide Early Check-In (ECI) / Late Check-Out (LCO) feasibility using real turnover signals.
 
-    Returns:
-      {
-        "early": {"requested": bool, "allowed": bool|None, "reason": str, "fee": 50},
-        "late":  {"requested": bool, "allowed": bool|None, "reason": str, "fee": 50},
-        "policy_summary": "human readable summary to feed into the AI"
-      }
+    Rules baked in:
+    - Each option has a $50 fee when available.
+    - ECI not available if there's a same-day checkout (someone else departs on the guest's arrival date)
+      or the day is closedOnArrival.
+    - LCO not available if there's a same-day checkin (someone else arrives on the guest's departure date)
+      or the day is closedOnDeparture.
     """
-    check_in = _date_only(reservation_result.get("arrivalDate"))
-    check_out = _date_only(reservation_result.get("departureDate"))
+    if not listing_id or not isinstance(reservation_result, dict):
+        return None
 
-    out = {
-        "early": {"requested": False, "allowed": None, "reason": "", "fee": EARLY_CHECKIN_FEE},
-        "late":  {"requested": False, "allowed": None, "reason": "", "fee": LATE_CHECKOUT_FEE},
-        "policy_summary": ""
+    ci_str = str(reservation_result.get("arrivalDate") or "").strip()
+    co_str = str(reservation_result.get("departureDate") or "").strip()
+    if not ci_str and not co_str:
+        return None
+
+    # Pull the specific day objects once (they carry closedOnArrival/Departure + reservations[])
+    arrival_day   = _fetch_calendar_day_with_res(listing_id, ci_str) if ci_str else None
+    departure_day = _fetch_calendar_day_with_res(listing_id, co_str) if co_str else None
+
+    # Turnover blockers
+    same_day_checkout = _has_same_day_checkout(listing_id, ci_str) if ci_str else False
+    same_day_checkin  = _has_same_day_checkin(listing_id, co_str) if co_str else False
+
+    closed_on_arrival   = bool(arrival_day and arrival_day.get("closedOnArrival"))
+    closed_on_departure = bool(departure_day and departure_day.get("closedOnDeparture"))
+
+    # Availability
+    early_possible = bool(ci_str) and (not same_day_checkout) and (not closed_on_arrival)
+    late_possible  = bool(co_str) and (not same_day_checkin)  and (not closed_on_departure)
+
+    early_reason = []
+    late_reason  = []
+
+    if not early_possible:
+        if same_day_checkout:
+            early_reason.append("blocked by same-day checkout")
+        if closed_on_arrival:
+            early_reason.append("arrival is closed for that date")
+    if not late_possible:
+        if same_day_checkin:
+            late_reason.append("blocked by same-day check-in")
+        if closed_on_departure:
+            late_reason.append("departure is closed for that date")
+
+    early_info = {
+        "available": early_possible,
+        "fee": EARLY_CHECKIN_FEE,
+        "currency": "USD",
+        "reason": "; ".join(early_reason) if early_reason else "",
+        "arrivalDate": ci_str,
+    }
+    late_info = {
+        "available": late_possible,
+        "fee": LATE_CHECKOUT_FEE,
+        "currency": "USD",
+        "reason": "; ".join(late_reason) if late_reason else "",
+        "departureDate": co_str,
     }
 
-    if not listing_id or not check_in or not check_out:
-        out["policy_summary"] = (
-            "Can’t evaluate ECI/LCO availability (missing listing or dates). "
-            f"ECI fee ${EARLY_CHECKIN_FEE}; LCO fee ${LATE_CHECKOUT_FEE}."
-        )
-        return out
-
-    # Pull minimal calendar around the stay (just CI/CO days)
-    cal_ci = fetch_hostaway_calendar(listing_id, check_in, check_in)
-    cal_co = fetch_hostaway_calendar(listing_id, check_out, check_out)
-
-    # Hostaway calendars can mark the *night* as unavailable when occupied.
-    # For ECI we care whether there’s a checkout happening on check_in date (i.e., the night before was booked).
-    # For LCO we care whether there’s a check-in on check_out date (i.e., the night of checkout is booked).
-    def _is_available(day_list):
-        if not day_list:
-            return None
-        d = day_list[0]
-        return bool(d.get("isAvailable") or d.get("status") == "available")
-
-    ci_available = _is_available(cal_ci)  # True means no turnover pressure that day
-    co_available = _is_available(cal_co)
-
-    # Interpret availability:
-    # If CI day is marked available, no same-day checkout pressure → ECI likely OK
-    # If CI day unavailable, there’s likely a turnover → ECI not guaranteed (cleaner-done fallback)
-    if ci_available is True:
-        out["early"]["allowed"] = True
-        out["early"]["reason"] = "No same-day checkout; early check-in is generally available (fee applies)."
-    elif ci_available is False:
-        out["early"]["allowed"] = False
-        out["early"]["reason"] = (
-            "There’s a same-day checkout on your arrival date; early check-in isn’t guaranteed. "
-            "We can confirm day-of after cleaners finish."
-        )
+    # Human summary for the model (this is what you feed in your prompt)
+    if early_possible and late_possible:
+        summary = "Early check-in and late check-out are both potentially available for $50 each (subject to turnover)."
+    elif early_possible and not late_possible:
+        summary = "Early check-in is potentially available for $50. Late check-out is not available (" + (late_info["reason"] or "conflict") + ")."
+    elif not early_possible and late_possible:
+        summary = "Late check-out is potentially available for $50. Early check-in is not available (" + (early_info["reason"] or "conflict") + ")."
     else:
-        out["early"]["allowed"] = None
-        out["early"]["reason"] = "Calendar status unknown for check-in day."
+        summary = "Neither early check-in nor late check-out is available due to turnover/arrival/departure constraints."
 
-    # If CO day is marked available, no same-day check-in pressure → LCO likely OK
-    # If CO day unavailable, there’s likely a turnover → LCO not guaranteed (cleaner-done fallback)
-    if co_available is True:
-        out["late"]["allowed"] = True
-        out["late"]["reason"] = "No same-day check-in; late check-out is generally available (fee applies)."
-    elif co_available is False:
-        out["late"]["allowed"] = False
-        out["late"]["reason"] = (
-            "There’s a same-day check-in on your departure date; late check-out isn’t guaranteed. "
-            "We can confirm day-of after cleaners finish."
-        )
-    else:
-        out["late"]["allowed"] = None
-        out["late"]["reason"] = "Calendar status unknown for check-out day."
+    return {
+        "policy_summary": summary,
+        "early": early_info,
+        "late":  late_info,
+    }
 
-    out["policy_summary"] = (
-        f"ECI=${EARLY_CHECKIN_FEE}, LCO=${LATE_CHECKOUT_FEE}. "
-        f"ECI allowed: {out['early']['allowed']} ({out['early']['reason']}). "
-        f"LCO allowed: {out['late']['allowed']} ({out['late']['reason']})."
-    )
-    return out
 
 
 def fetch_hostaway_resource(resource: str, resource_id: int):
