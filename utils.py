@@ -76,6 +76,17 @@ def extract_destination_from_message(msg: str) -> str | None:
         return None
     return cleaned
 
+def detect_deposit_request(msg: str) -> bool:
+    if not msg:
+        return False
+    m = msg.lower()
+    triggers = [
+        "deposit", "pay the deposit", "payment link", "pay link", "invoice",
+        "payment portal", "pay my balance", "balance due", "pay the balance",
+        "link to pay", "how do i pay", "make a payment"
+    ]
+    return any(t in m for t in triggers)
+
 def resolve_place_textsearch(query: str, lat: float | None = None, lng: float | None = None) -> dict | None:
     """
     Uses Google Places Text Search to resolve arbitrary destination names.
