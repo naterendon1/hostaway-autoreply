@@ -37,9 +37,11 @@ from utils import (
     get_distance_drive_time,
     detect_time_adjust_request,
     evaluate_time_adjust_options,
+    detect_deposit_request,
 )
 
 from datetime import date
+
 
 def trip_phase(check_in: str | None, check_out: str | None) -> str:
     try:
@@ -57,13 +59,25 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
     return "unknown"
 
 
+# Optional: safer status normalizer (handles camelCase etc.)
+def pretty_status(s: str | None) -> str:
+    if not isinstance(s, str):
+        return "Unknown"
+    m = s.strip().replace("_", " ").replace("-", " ")
+    if not m:
+        return "Unknown"
+    return m[:1].upper() + m[1:]
+
+
 # DB init for custom_responses.db (kept for compatibility/future use)
 from db import init_db
+
 init_db()
 
 # --- Admin + DB paths ---
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")  # set this on Render
+
 
 def require_admin(
     x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
@@ -73,13 +87,15 @@ def require_admin(
     if supplied != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
 # ---------- Admin endpoints (Option A: point to learning.db) ----------
 @app.get("/learning", dependencies=[Depends(require_admin)])
 def list_learning(limit: int = 100) -> List[Dict]:
     conn = sqlite3.connect(LEARNING_DB_PATH)
     conn.row_factory = sqlite3.Row
     # ensure table exists
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS learning_examples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guest_message TEXT,
@@ -89,19 +105,23 @@ def list_learning(limit: int = 100) -> List[Dict]:
             guest_id TEXT,
             created_at TEXT
         )
-    """)
+    """
+    )
     rows = conn.execute(
         "SELECT id, guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at "
-        "FROM learning_examples ORDER BY id DESC LIMIT ?", (limit,)
+        "FROM learning_examples ORDER BY id DESC LIMIT ?",
+        (limit,),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
 
 @app.get("/feedback", dependencies=[Depends(require_admin)])
 def list_feedback(limit: int = 100) -> List[Dict]:
     conn = sqlite3.connect(LEARNING_DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS ai_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conversation_id TEXT,
@@ -111,13 +131,16 @@ def list_feedback(limit: int = 100) -> List[Dict]:
             user TEXT,
             created_at TEXT
         )
-    """)
+    """
+    )
     rows = conn.execute(
         "SELECT id, conversation_id, question, ai_answer, rating, user, created_at "
-        "FROM ai_feedback ORDER BY id DESC LIMIT ?", (limit,)
+        "FROM ai_feedback ORDER BY id DESC LIMIT ?",
+        (limit,),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
 
 # -------------------- Env checks --------------------
 REQUIRED_ENV_VARS = [
@@ -143,6 +166,7 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 MAX_THREAD_MESSAGES = 10
 
+
 # -------------------- Models --------------------
 class HostawayUnifiedWebhook(BaseModel):
     object: str
@@ -152,6 +176,7 @@ class HostawayUnifiedWebhook(BaseModel):
     body: str | None = None
     listingName: str | None = None
     date: str | None = None
+
 
 # -------------------- AI helper --------------------
 def make_ai_reply(prompt: str, system_prompt: str) -> str:
@@ -169,6 +194,7 @@ def make_ai_reply(prompt: str, system_prompt: str) -> str:
     except Exception as e:
         logging.error(f"❌ OpenAI error: {e}")
         return "(Error generating reply.)"
+
 
 # -------------------- Webhook --------------------
 @app.post("/unified-webhook")
@@ -202,15 +228,129 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     check_in = res.get("arrivalDate", "N/A")
     check_out = res.get("departureDate", "N/A")
     guest_count = res.get("numberOfGuests", "N/A")
-    status = (payload.data.get("status") or res.get("status") or "Unknown")
-    status = status.capitalize() if isinstance(status, str) else status
-    phase = trip_phase(check_in, check_out)
 
+    # safer status formatting
+    status_raw = payload.data.get("status") or res.get("status") or "Unknown"
+    status = pretty_status(status_raw)
+
+    phase = trip_phase(check_in, check_out)
 
     if not listing_id:
         listing_id = res.get("listingId")
     if not guest_id:
         guest_id = res.get("guestId", "")
+
+    # --- Build channel_pretty and property_address early so headers look right ---
+    CHANNEL_MAP = {
+        "airbnb": "Airbnb",
+        "vrbo": "Vrbo",
+        "bookingcom": "Booking.com",
+        "direct": "Direct",
+        "expedia": "Expedia",
+        "channel": "Channel",
+    }
+    raw_channel = payload.data.get("communicationType") or res.get("source") or res.get("channelId") or "channel"
+    channel_pretty = CHANNEL_MAP.get(str(raw_channel).lower(), str(raw_channel).capitalize())
+
+    # Fetch listing to build address (we'll reuse it later for geo)
+    listing_obj_for_geo = fetch_hostaway_listing(listing_id)
+    addr_raw = (
+        (listing_obj_for_geo or {}).get("result", {}).get("address") or "Address unavailable"
+    )
+    if isinstance(addr_raw, dict):
+        property_address = (
+            ", ".join(
+                str(addr_raw.get(k, "")).strip()
+                for k in ["address", "city", "state", "zip", "country"]
+                if addr_raw.get(k)
+            )
+            or "Address unavailable"
+        )
+    else:
+        property_address = str(addr_raw)
+
+    # --- Deterministic payment/deposit response (bypass AI when possible) ---
+    if detect_deposit_request(guest_msg):
+        guest_portal = (res.get("guestPortalUrl") or "").strip()
+        if guest_portal:
+            ai_reply = (
+                f"Here’s your secure guest portal to pay the deposit: {guest_portal}. "
+                "If anything looks off, tell me and I’ll double-check."
+            )
+
+            button_meta = {
+                "conv_id": conv_id,
+                "listing_id": listing_id,
+                "guest_id": guest_id,
+                "type": communication_type,
+                "guest_name": guest_name,
+                "guest_message": guest_msg,
+                "ai_suggestion": ai_reply,
+                "check_in": check_in,
+                "check_out": check_out,
+                "guest_count": guest_count,
+                "status": status,
+                "detected_intent": "booking inquiry",
+                "channel_pretty": channel_pretty,
+                "property_address": property_address,
+            }
+
+            from slack_sdk import WebClient
+
+            slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+            try:
+                slack_client.chat_postMessage(
+                    channel=os.getenv("SLACK_CHANNEL"),
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"*{channel_pretty} message* from *{guest_name}*\n"
+                                    f"Property: *{property_address}*\n"
+                                    f"Dates: *{check_in} → {check_out}*\n"
+                                    f"Guests: *{guest_count}* | Status: *{status}*"
+                                ),
+                            },
+                        },
+                        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"},
+                        },
+                        {"type": "context", "elements": [{"type": "mrkdwn", "text": "*Intent:* booking inquiry"}]},
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "✅ Send"},
+                                    "value": json.dumps({**button_meta, "action": "send"}),
+                                    "action_id": "send",
+                                },
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "✏️ Edit"},
+                                    "value": json.dumps({**button_meta, "action": "edit"}),
+                                    "action_id": "edit",
+                                },
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "📝 Write Your Own"},
+                                    "value": json.dumps({**button_meta, "action": "write_own"}),
+                                    "action_id": "write_own",
+                                },
+                            ],
+                        },
+                    ],
+                    text="New message from guest",
+                )
+            except Exception as e:
+                logging.error(f"❌ Slack send error (deposit flow): {e}")
+
+            return {"status": "ok"}  # short-circuit when link exists
+        # else: no guestPortalUrl — fall through to normal AI flow
 
     # Conversation context (last few)
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
@@ -243,21 +383,49 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # Calendar check if query looks date-ish
     calendar_summary = "No calendar check for this inquiry."
-    if any(word in guest_msg.lower() for word in [
-        "available", "availability", "book", "open", "stay", "dates", "night",
-        "reserve", "weekend", "extend", "extra night", "holiday", "christmas",
-        "spring break", "july", "august", "september", "october", "november",
-        "december", "january", "february", "march", "april", "may", "june", "thanksgiving"
-    ]):
+    if any(
+        word in guest_msg.lower()
+        for word in [
+            "available",
+            "availability",
+            "book",
+            "open",
+            "stay",
+            "dates",
+            "night",
+            "reserve",
+            "weekend",
+            "extend",
+            "extra night",
+            "holiday",
+            "christmas",
+            "spring break",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "thanksgiving",
+        ]
+    ):
         start_date, end_date = extract_date_range_from_message(guest_msg, res)
         calendar_days = fetch_hostaway_calendar(listing_id, start_date, end_date)
         if calendar_days:
             available_days = [
-                d["date"] for d in calendar_days
+                d["date"]
+                for d in calendar_days
                 if d.get("isAvailable") or d.get("status") == "available"
             ]
             unavailable_days = [
-                d["date"] for d in calendar_days
+                d["date"]
+                for d in calendar_days
                 if not (d.get("isAvailable") or d.get("status") == "available")
             ]
             if available_days:
@@ -272,17 +440,16 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         else:
             calendar_summary = "Calendar data not available for these dates."
 
-   # ----- ECI/LCO smart policy injection ----- #
+    # ----- ECI/LCO smart policy injection -----
     eci_lco_flags = detect_time_adjust_request(guest_msg)
     eci_lco_summary = ""
-    
     if eci_lco_flags["early"] or eci_lco_flags["late"]:
         eci_lco_eval = evaluate_time_adjust_options(listing_id, res)
         if eci_lco_eval:
-        # mark which options were actually requested
+            # mark which options were actually requested
             eci_lco_eval["early"]["requested"] = eci_lco_flags["early"]
-            eci_lco_eval["late"]["requested"]  = eci_lco_flags["late"]
-        # Human-readable line to feed the model (and keep it honest)
+            eci_lco_eval["late"]["requested"] = eci_lco_flags["late"]
+            # Human-readable line to feed the model (and keep it honest)
             eci_lco_summary = (
                 "Early/Late policy (authoritative truth for this reply): "
                 f"{eci_lco_eval['policy_summary']} "
@@ -290,19 +457,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 f"late? {eci_lco_eval['late']['requested']}."
             )
         else:
-        # Fallback summary if evaluation failed
-             eci_lco_summary = (
-                 "Early/Late policy: $50 fee each when available. "
-                 "Availability depends on same-day turnovers; if there is one, "
-                 "we can only confirm after cleaners finish."
-        )
-
+            # Fallback summary if evaluation failed
+            eci_lco_summary = (
+                "Early/Late policy: $50 fee each when available. "
+                "Availability depends on same-day turnovers; if there is one, "
+                "we can only confirm after cleaners finish."
+            )
 
     # -------------------- Local recommendations + distance answers --------------------
     local_recs = ""
     distance_block = ""
 
-    listing_obj_for_geo = fetch_hostaway_listing(listing_id)
     lat, lng = get_property_location(listing_obj_for_geo, reservation)
 
     # Nearby places (only if user asked for a place type)
@@ -311,11 +476,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         places = search_google_places(keyword, lat, lng, type_hint=place_type) or []
         if places:
             local_recs = (
-                f"Nearby {keyword}s from Google Maps for this property:\n" +
-                "\n".join([
-                    f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}"
-                    for p in places[:3]
-                ])
+                f"Nearby {keyword}s from Google Maps for this property:\n"
+                + "\n".join([f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}" for p in places[:3]])
             )
         else:
             local_recs = f"No {keyword}s found nearby from Google Maps."
@@ -330,7 +492,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 if resolved and resolved.get("lat") and resolved.get("lng")
                 else dest_text
             )
-            distance_sentence = get_distance_drive_time(lat, lng, destination_for_matrix, units="imperial")
+            distance_sentence = get_distance_drive_time(
+                lat, lng, destination_for_matrix, units="imperial"
+            )
             pretty_name = resolved["name"] if resolved and resolved.get("name") else dest_text
             distance_block = f"From the property to {pretty_name}: {distance_sentence}"
     except Exception as e:
@@ -338,17 +502,24 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # Trim reservation info for prompt
     important_res_fields = [
-        "arrivalDate", "departureDate", "numberOfGuests",
-        "guestFirstName", "guestLastName", "status", "totalPrice",
-        "cancellationPolicy", "listingId"
+        "arrivalDate",
+        "departureDate",
+        "numberOfGuests",
+        "guestFirstName",
+        "guestLastName",
+        "status",
+        "totalPrice",
+        "cancellationPolicy",
+        "listingId",
     ]
     res_trimmed = {k: res[k] for k in important_res_fields if k in res}
 
     # Listing info (trim)
     listing_trimmed = {}
-    listing_obj = listing_obj_for_geo
-    if listing_obj and "result" in listing_obj and isinstance(listing_obj["result"], dict):
-        lres = listing_obj["result"] or {}
+    if listing_obj_for_geo and "result" in listing_obj_for_geo and isinstance(
+        listing_obj_for_geo["result"], dict
+    ):
+        lres = listing_obj_for_geo["result"] or {}
         listing_trimmed = {
             "name": lres.get("name"),
             "address": lres.get("address"),
@@ -358,38 +529,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "maxGuests": lres.get("maxGuests"),
             "amenities": (lres.get("amenities") or [])[:5],
         }
-
-    # Channel pretty label
-    CHANNEL_MAP = {
-        "airbnb": "Airbnb",
-        "vrbo": "Vrbo",
-        "bookingcom": "Booking.com",
-        "direct": "Direct",
-        "expedia": "Expedia",
-        "channel": "Channel",
-    }
-    raw_channel = (
-        payload.data.get("communicationType")
-        or res.get("source")
-        or res.get("channelId")
-        or "channel"
-    )
-    channel_pretty = CHANNEL_MAP.get(str(raw_channel).lower(), str(raw_channel).capitalize())
-
-    # Address can be dict; normalize to string
-    addr_raw = (
-        listing_trimmed.get("address")
-        or (listing_obj.get("result", {}).get("address") if listing_obj else None)
-        or "Address unavailable"
-    )
-    if isinstance(addr_raw, dict):
-        property_address = ", ".join(
-            str(addr_raw.get(k, "")).strip()
-            for k in ["address", "city", "state", "zip", "country"]
-            if addr_raw.get(k)
-        ) or "Address unavailable"
-    else:
-        property_address = str(addr_raw)
 
     # -------------------- Build AI prompt --------------------
     ai_prompt = (
@@ -450,6 +589,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info("button_meta: %s", json.dumps(button_meta, indent=2))
 
     from slack_sdk import WebClient
+
     slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     try:
         slack_client.chat_postMessage(
@@ -457,27 +597,46 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             blocks=[
                 {
                     "type": "section",
-                    "text": {"type": "mrkdwn",
+                    "text": {
+                        "type": "mrkdwn",
                         "text": (
                             f"*{channel_pretty} message* from *{guest_name}*\n"
                             f"Property: *{property_address}*\n"
                             f"Dates: *{check_in} → {check_out}*\n"
                             f"Guests: *{guest_count}* | Status: *{status}*"
-                        )
+                        ),
                     },
                 },
                 {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
-                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}"}]},
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"},
+                },
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}"}],
+                },
                 {
                     "type": "actions",
                     "elements": [
-                        {"type": "button","text":{"type":"plain_text","text":"✅ Send"},
-                         "value": json.dumps({**button_meta, "action":"send"}),"action_id":"send"},
-                        {"type": "button","text":{"type":"plain_text","text":"✏️ Edit"},
-                         "value": json.dumps({**button_meta, "action":"edit"}),"action_id":"edit"},
-                        {"type": "button","text":{"type":"plain_text","text":"📝 Write Your Own"},
-                         "value": json.dumps({**button_meta, "action":"write_own"}),"action_id":"write_own"},
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✅ Send"},
+                            "value": json.dumps({**button_meta, "action": "send"}),
+                            "action_id": "send",
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✏️ Edit"},
+                            "value": json.dumps({**button_meta, "action": "edit"}),
+                            "action_id": "edit",
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "📝 Write Your Own"},
+                            "value": json.dumps({**button_meta, "action": "write_own"}),
+                            "action_id": "write_own",
+                        },
                     ],
                 },
             ],
@@ -487,6 +646,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error(f"❌ Slack send error: {e}")
 
     return {"status": "ok"}
+
 
 # -------------------- Health --------------------
 @app.get("/ping")
