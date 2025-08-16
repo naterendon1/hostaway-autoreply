@@ -6,65 +6,42 @@ import logging
 import json
 import sqlite3
 from typing import List, Dict
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
 
-# New guarded AI core
-from assistant_core import compose_reply as ac_compose
-
-# Slack interactivity (events/actions) router
+# Slack interactivity router
 from slack_interactivity import router as slack_router
 
-# DB init
+# DB bootstrap (legacy custom_responses)
 from db import init_db
 
-# Utils (keep only what we actually use)
+# Guarded AI composer
+from assistant_core import compose_reply as ac_compose
+
+# Utils you already have
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
-    get_cancellation_policy_summary,
     clean_ai_reply,
-    extract_date_range_from_message,
-    fetch_hostaway_calendar,
-    is_date_available,
-    next_available_dates,
-    detect_intent,
-    get_property_location,
-    search_google_places,
-    detect_place_type,
-    extract_destination_from_message,
-    resolve_place_textsearch,
-    get_distance_drive_time,
-    detect_time_adjust_request,
-    evaluate_time_adjust_options,
-    detect_deposit_request,
 )
 
+# ---- App & logging ----
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 app.include_router(slack_router, prefix="/slack")
 init_db()
 
-# -------------------- Admin + DB paths --------------------
+# ---- Env checks ----
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")
 
-def require_admin(
-    x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
-    token: str | None = Query(None),
-):
-    supplied = x_admin_token or token
-    if supplied != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-# -------------------- Env checks --------------------
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
-    "OPENAI_API_KEY",
+    "OPENAI_API_KEY",           # assistant_core needs this
     "SLACK_CHANNEL",
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
@@ -75,11 +52,104 @@ missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
     raise RuntimeError(f"Missing required environment variables: {missing}")
 
-HOSTAWAY_API_BASE = "https://api.hostaway.com/v1"
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
 MAX_THREAD_MESSAGES = 10
 
-# -------------------- Helpers --------------------
+# ---------- Helpers for Slack header formatting ----------
+CHANNEL_ID_MAP = {
+    2018: "Airbnb (Official)",
+    2002: "HomeAway",
+    2005: "Booking.com",
+    2007: "Expedia",
+    2009: "HomeAway (iCal)",
+    2010: "Vrbo (iCal)",
+    2000: "Direct",
+    2013: "Booking Engine",
+    2015: "Custom iCal",
+    2016: "TripAdvisor (iCal)",
+    2017: "WordPress",
+    2019: "Marriott",
+    2020: "Partner",
+    2021: "GDS",
+    2022: "Google",
+}
+
+COMM_TYPE_MAP = {
+    "airbnb": "Airbnb",
+    "airbnbofficial": "Airbnb (Official)",
+    "vrbo": "Vrbo",
+    "bookingcom": "Booking.com",
+    "direct": "Direct",
+    "expedia": "Expedia",
+    "channel": "Channel",
+}
+
+RES_STATUS_ALLOWED = {
+    "new": "New",
+    "modified": "Modified",
+    "cancelled": "Cancelled",
+    "ownerstay": "Owner Stay",
+    "pending": "Pending",
+    "awaitingpayment": "Awaiting Payment",
+    "declined": "Declined",
+    "expired": "Expired",
+    "inquiry": "Inquiry",
+    "inquirypreapproved": "Inquiry (Preapproved)",
+    "inquirydenied": "Inquiry (Denied)",
+    "inquirytimedout": "Inquiry (Timed Out)",
+    "inquirynotpossible": "Inquiry (Not Possible)",
+}
+
+def format_us_date(d: str | None) -> str:
+    """
+    Converts 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM:SS' -> 'MM/DD/YYYY'.
+    Returns original string if parsing fails.
+    """
+    if not d:
+        return "N/A"
+    s = str(d).strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(s[:19], fmt)
+            return dt.strftime("%m/%d/%Y")
+        except Exception:
+            continue
+    return s
+
+def format_price(amount, currency: str | None = "USD") -> str:
+    try:
+        val = float(amount)
+    except (TypeError, ValueError):
+        return "—"
+    cur = (currency or "USD").upper()
+    symbol = "$" if cur == "USD" else f"{cur} "
+    return f"{symbol}{val:,.2f}"
+
+def pretty_res_status(s: str | None) -> str:
+    if not s:
+        return "Unknown"
+    key = str(s).strip().lower().replace("_", "").replace("-", "")
+    return RES_STATUS_ALLOWED.get(key, s.capitalize())
+
+def pretty_status(s: str | None) -> str:
+    if not isinstance(s, str):
+        return "Unknown"
+    m = s.strip().replace("_", " ").replace("-", " ")
+    return m[:1].upper() + m[1:] if m else "Unknown"
+
+def channel_label_from(channel_id: int | None, communication_type: str | None) -> str:
+    if isinstance(channel_id, int) and channel_id in CHANNEL_ID_MAP:
+        name = CHANNEL_ID_MAP[channel_id]
+        # Normalize to clean labels
+        if "vrbo" in name.lower():
+            return "Vrbo"
+        if "airbnb" in name.lower():
+            return "Airbnb"
+        return name
+    if communication_type:
+        key = str(communication_type).lower().strip()
+        return COMM_TYPE_MAP.get(key, key.capitalize())
+    return "Channel"
+
 def trip_phase(check_in: str | None, check_out: str | None) -> str:
     try:
         ci = date.fromisoformat(str(check_in)) if check_in else None
@@ -95,31 +165,15 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
         return "past"
     return "unknown"
 
-def pretty_status(s: str | None) -> str:
-    if not isinstance(s, str):
-        return "Unknown"
-    m = s.strip().replace("_", " ").replace("-", " ")
-    return m[:1].upper() + m[1:] if m else "Unknown"
+# ---------- Admin endpoints ----------
+def require_admin(
+    x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
+    token: str | None = Query(None),
+):
+    supplied = x_admin_token or token
+    if supplied != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-def _listing_times(listing_obj: dict) -> Dict[str, str]:
-    """Extract check-in/out times with defaults (why: prevents ECI/LCO misconfirmations)."""
-    res = (listing_obj or {}).get("result", {}) if isinstance(listing_obj, dict) else {}
-    return {
-        "checkin_time": res.get("checkInTime") or "4:00 PM",
-        "checkout_time": res.get("checkOutTime") or "11:00 AM",
-    }
-
-# -------------------- Models --------------------
-class HostawayUnifiedWebhook(BaseModel):
-    object: str
-    event: str
-    accountId: int
-    data: dict
-    body: str | None = None
-    listingName: str | None = None
-    date: str | None = None
-
-# -------------------- Admin endpoints --------------------
 @app.get("/learning", dependencies=[Depends(require_admin)])
 def list_learning(limit: int = 100) -> List[Dict]:
     conn = sqlite3.connect(LEARNING_DB_PATH)
@@ -135,7 +189,7 @@ def list_learning(limit: int = 100) -> List[Dict]:
             guest_id TEXT,
             created_at TEXT
         )
-        """
+    """
     )
     rows = conn.execute(
         "SELECT id, guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at "
@@ -160,7 +214,7 @@ def list_feedback(limit: int = 100) -> List[Dict]:
             user TEXT,
             created_at TEXT
         )
-        """
+    """
     )
     rows = conn.execute(
         "SELECT id, conversation_id, question, ai_answer, rating, user, created_at "
@@ -170,7 +224,16 @@ def list_feedback(limit: int = 100) -> List[Dict]:
     conn.close()
     return [dict(r) for r in rows]
 
-# -------------------- Webhook --------------------
+# ---------- Webhook ----------
+class HostawayUnifiedWebhook(BaseModel):
+    object: str
+    event: str
+    accountId: int
+    data: dict
+    body: str | None = None
+    listingName: str | None = None
+    date: str | None = None
+
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
@@ -192,7 +255,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     reservation_id = payload.data.get("reservationId")
     listing_id = payload.data.get("listingMapId")
     guest_id = payload.data.get("userId", "")
-    communication_type = payload.data.get("communicationType", "channel")  # airbnb, vrbo, direct
+    communication_type = payload.data.get("communicationType", "channel")
+    channel_id = payload.data.get("channelId")
 
     # Reservation
     reservation = fetch_hostaway_reservation(reservation_id) or {}
@@ -202,8 +266,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     check_in = res.get("arrivalDate", "N/A")
     check_out = res.get("departureDate", "N/A")
     guest_count = res.get("numberOfGuests", "N/A")
-    status_raw = payload.data.get("status") or res.get("status") or "Unknown"
-    status = pretty_status(status_raw)
+
+    # Reservation status & total price
+    res_status_pretty = pretty_res_status(res.get("status"))
+    total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
+
+    # Message transport status (from webhook payload)
+    msg_status = pretty_status(payload.data.get("status") or "sent")
+
     phase = trip_phase(check_in, check_out)
 
     if not listing_id:
@@ -211,19 +281,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_id:
         guest_id = res.get("guestId", "")
 
-    # Channel label
-    CHANNEL_MAP = {
-        "airbnb": "Airbnb",
-        "vrbo": "Vrbo",
-        "bookingcom": "Booking.com",
-        "direct": "Direct",
-        "expedia": "Expedia",
-        "channel": "Channel",
-    }
-    raw_channel = payload.data.get("communicationType") or res.get("source") or res.get("channelId") or "channel"
-    channel_pretty = CHANNEL_MAP.get(str(raw_channel).lower(), str(raw_channel).capitalize())
+    # Channel label from channelId/communicationType
+    channel_pretty = channel_label_from(channel_id, communication_type)
 
-    # Listing (for address + check-in/out times)
+    # Fetch listing to build address
     listing_obj = fetch_hostaway_listing(listing_id)
     addr_raw = (listing_obj or {}).get("result", {}).get("address") or "Address unavailable"
     if isinstance(addr_raw, dict):
@@ -244,135 +305,40 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
 
-    # -------------------- Local recs + distance (optional) --------------------
-    # These enrich Slack context and can be used by your human follow-up.
-    local_recs = ""
-    distance_block = ""
-
-    lat, lng = get_property_location(listing_obj, reservation)
-
-    place_type, keyword = detect_place_type(guest_msg)
-    if place_type and lat and lng:
-        places = search_google_places(keyword, lat, lng, type_hint=place_type) or []
-        if places:
-            local_recs = (
-                f"Nearby {keyword}s from Google Maps for this property:\n"
-                + "\n".join([f"- {p['name']} ({p.get('rating','N/A')}) – {p['address']}" for p in places[:3]])
-            )
-
-    try:
-        dest_text = extract_destination_from_message(guest_msg)
-        if dest_text and lat and lng:
-            resolved = resolve_place_textsearch(dest_text, lat=lat, lng=lng)
-            destination_for_matrix = (
-                f"{resolved['lat']},{resolved['lng']}"
-                if resolved and resolved.get("lat") and resolved.get("lng")
-                else dest_text
-            )
-            distance_sentence = get_distance_drive_time(lat, lng, destination_for_matrix, units="imperial")
-            pretty_name = resolved["name"] if resolved and resolved.get("name") else dest_text
-            distance_block = f"From the property to {pretty_name}: {distance_sentence}"
-    except Exception as e:
-        logging.exception(f"[DISTANCE] Pipeline error: {e}")
-
-    # -------------------- Calendar peek if guest asked about dates --------------------
-    calendar_summary = "No calendar check for this inquiry."
-    if any(
-        word in guest_msg.lower()
-        for word in [
-            "available",
-            "availability",
-            "book",
-            "open",
-            "stay",
-            "dates",
-            "night",
-            "reserve",
-            "weekend",
-            "extend",
-            "extra night",
-            "holiday",
-            "christmas",
-            "spring break",
-            "july",
-            "august",
-            "september",
-            "october",
-            "november",
-            "december",
-            "january",
-            "february",
-            "march",
-            "april",
-            "may",
-            "june",
-            "thanksgiving",
-        ]
-    ):
-        start_date, end_date = extract_date_range_from_message(guest_msg, res)
-        calendar_days = fetch_hostaway_calendar(listing_id, start_date, end_date)
-        if calendar_days:
-            available_days = [
-                d["date"]
-                for d in calendar_days
-                if d.get("isAvailable") or d.get("status") == "available"
-            ]
-            unavailable_days = [
-                d["date"]
-                for d in calendar_days
-                if not (d.get("isAvailable") or d.get("status") == "available")
-            ]
-            if available_days:
-                calendar_summary = (
-                    f"For {start_date} to {end_date}: "
-                    f"Available nights: {', '.join(available_days)}."
-                )
-                if unavailable_days:
-                    calendar_summary += f" Unavailable: {', '.join(unavailable_days)}."
-            else:
-                calendar_summary = f"No available nights between {start_date} and {end_date}."
-        else:
-            calendar_summary = "Calendar data not available for these dates."
-
-    # -------------------- ECI/LCO smart policy injection (optional info) --------------------
-    eci_lco_flags = detect_time_adjust_request(guest_msg)
-    if eci_lco_flags["early"] or eci_lco_flags["late"]:
-        _ = evaluate_time_adjust_options(listing_id, res)  # assistant_core enforces guardrails
-
-    # -------------------- Build conversation history for the AI --------------------
+    # ---- Guarded AI (assistant_core) ----
     conversation_history = [
         {"role": "guest" if m.get("isIncoming") else "host", "text": m.get("body", "")}
         for m in msgs[-MAX_THREAD_MESSAGES:]
         if m.get("body")
     ]
 
-    # -------------------- Property profile + meta for assistant_core --------------------
-    property_profile = _listing_times(listing_obj)
+    # Minimal property profile (sane defaults; assistant_core also has defaults)
+    property_profile = {"checkin_time": "4:00 PM", "checkout_time": "11:00 AM"}
+
     meta_for_ai = {
-        "listing_id": str(listing_id) if listing_id is not None else "",
+        "listing_id": (str(listing_id) if listing_id is not None else ""),
         "listing_map_id": listing_id,
         "reservation_id": reservation_id,
         "check_in": check_in if isinstance(check_in, str) else str(check_in),
         "check_out": check_out if isinstance(check_out, str) else str(check_out),
-        "reservation_status": (res.get("status") or "").strip(),  # e.g., pending, awaitingPayment, inquiry
+        "reservation_status": (res.get("status") or "").strip(),  # raw status for guards
         "property_profile": property_profile,
-        "policies": {
-            # Optionally override defaults via env:
-            # "early_checkin_fee": 50,
-            # "late_checkout_fee": 50,
-        },
+        "policies": {},
     }
 
-    # -------------------- Call guarded AI --------------------
-    ai_json, _unused = ac_compose(
+    ai_json, _unused_blocks = ac_compose(
         guest_message=guest_msg,
         conversation_history=conversation_history,
         meta=meta_for_ai,
     )
     ai_reply = clean_ai_reply(ai_json.get("reply", "") or "")
-    detected_intent = ai_json.get("intent", detect_intent(guest_msg))
+    detected_intent = ai_json.get("intent", "other")
 
-    # -------------------- Slack message --------------------
+    # US dates
+    us_check_in = format_us_date(check_in)
+    us_check_out = format_us_date(check_out)
+
+    # Slack button meta
     button_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -384,18 +350,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "check_in": check_in,
         "check_out": check_out,
         "guest_count": guest_count,
-        "status": status,
+        "status": res_status_pretty,  # reservation status
         "detected_intent": detected_intent,
         "channel_pretty": channel_pretty,
         "property_address": property_address,
-        # Optional context if you want to see what the AI used:
-        # "calendar_summary": calendar_summary,
-        # "local_recs": local_recs,
-        # "distance_block": distance_block,
+        "price": total_price_str,
     }
-
     logging.info("button_meta: %s", json.dumps(button_meta, indent=2))
 
+    # Slack blocks
     from slack_sdk import WebClient
     slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     try:
@@ -409,8 +372,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                         "text": (
                             f"*{channel_pretty} message* from *{guest_name}*\n"
                             f"Property: *{property_address}*\n"
-                            f"Dates: *{check_in} → {check_out}*\n"
-                            f"Guests: *{guest_count}* | Status: *{status}*"
+                            f"Dates: *{us_check_in} → {us_check_out}*\n"
+                            f"Guests: *{guest_count}* | Res: *{res_status_pretty}* | Price: *{total_price_str}*"
                         ),
                     },
                 },
@@ -421,7 +384,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 },
                 {
                     "type": "context",
-                    "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}"}],
+                    "elements": [
+                        {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Msg:* {msg_status}"}
+                    ],
                 },
                 {
                     "type": "actions",
@@ -454,7 +419,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     return {"status": "ok"}
 
-# -------------------- Health --------------------
+# ---------- Health ----------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
