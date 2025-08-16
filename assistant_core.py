@@ -89,7 +89,7 @@ class AIResponse(BaseModel):
     needs_clarification: bool
     clarifying_question: str
     reply: str
-    citations: conlist(str, max_items=10) = []
+    citations: conlist(str, max_length=10) = []
     actions: Actions
 
 # ---------- Learning store ----------
