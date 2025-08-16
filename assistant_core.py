@@ -95,43 +95,38 @@ class AIResponse(BaseModel):
 
 # ---------- Learning store ----------
 def _init_db(path: str = LEARNING_DB_PATH) -> None:
+    """
+    Create/upgrade the learning_examples table safely across old/new schemas.
+    NOTE: SQLite does not allow parameter placeholders in DDL; build statements directly.
+    """
     conn = sqlite3.connect(path)
     cur = conn.cursor()
 
-    # Ensure table exists (old installs might already have a different schema)
+    # Ensure table exists (minimal form)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS learning_examples (
             id INTEGER PRIMARY KEY AUTOINCREMENT
         )
     """)
+    conn.commit()
 
     # Inspect current columns
     cur.execute("PRAGMA table_info(learning_examples)")
     cols = {row[1] for row in cur.fetchall()}
 
-    # Old schema used: guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at
-    # New schema wants: intent, question, answer, created_at
-    # Add missing columns safely.
-    to_add = []
+    # Add missing columns for new schema
     if "intent" not in cols:
-        to_add.append(("intent", "TEXT", ""))
+        cur.execute("ALTER TABLE learning_examples ADD COLUMN intent TEXT")
     if "question" not in cols:
-        to_add.append(("question", "TEXT", ""))
+        cur.execute("ALTER TABLE learning_examples ADD COLUMN question TEXT")
     if "answer" not in cols:
-        to_add.append(("answer", "TEXT", ""))
+        cur.execute("ALTER TABLE learning_examples ADD COLUMN answer TEXT")
     if "created_at" not in cols:
-        to_add.append(("created_at", "TEXT", "CURRENT_TIMESTAMP"))
-
-    for name, typ, default in to_add:
-        if default == "CURRENT_TIMESTAMP":
-            cur.execute(f"ALTER TABLE learning_examples ADD COLUMN {name} {typ} DEFAULT {default}")
-        else:
-            cur.execute(f"ALTER TABLE learning_examples ADD COLUMN {name} {typ} DEFAULT ?", (default,))
+        cur.execute("ALTER TABLE learning_examples ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP")
     conn.commit()
 
-    # If we had old columns, backfill question/answer from them (once).
+    # If old columns exist, backfill once
     if {"guest_message", "ai_suggestion"}.issubset(cols):
-        # Only backfill rows where new fields are empty
         cur.execute("""
             UPDATE learning_examples
             SET question = COALESCE(NULLIF(question, ''), guest_message),
@@ -142,8 +137,6 @@ def _init_db(path: str = LEARNING_DB_PATH) -> None:
         conn.commit()
 
     conn.close()
-
-# --- add/replace in assistant_core.py ---
 
 def _ensure_learning_schema(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
@@ -161,8 +154,7 @@ def _ensure_learning_schema(conn: sqlite3.Connection) -> None:
     cur.execute("PRAGMA table_info(learning_examples)")
     cols = {row[1] for row in cur.fetchall()}
 
-    # Old schema columns → add what we need for new code to work
-    # Old schema likely had: guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at
+    # Add missing columns if running against an old table
     if "question" not in cols:
         try:
             cur.execute("ALTER TABLE learning_examples ADD COLUMN question TEXT")
@@ -180,7 +172,6 @@ def _ensure_learning_schema(conn: sqlite3.Connection) -> None:
             pass
 
     conn.commit()
-
 
 def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
     conn = sqlite3.connect(LEARNING_DB_PATH)
@@ -240,7 +231,6 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
         conn.close()
 
     return examples
-
 
 # ---------- Hostaway helpers ----------
 def _token() -> Optional[str]:
