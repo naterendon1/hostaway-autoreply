@@ -17,6 +17,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ---------- Env / Clients ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+assert OPENAI_API_KEY, "OPENAI_API_KEY is required"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -382,9 +383,9 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
 
     if ai.intent in (Intent.early_check_in, Intent.late_checkout, Intent.extend_stay):
         ci, co = prof.get("checkin_time", DEFAULT_CHECKIN), prof.get("checkout_time", DEFAULT_CHECKOUT)
-        if ai.intent is Intent.early_check_in:
+        if ai.intent == Intent.early_check_in:
             text = f"Standard check-in is {ci}. I can request early check-in if the schedule allows (typically ${pol.get('early_checkin_fee', EARLY_FEE)})."
-        elif ai.intent is Intent.late_checkout:
+        elif ai.intent == Intent.late_checkout:
             text = f"Check-out is {co}. I can request late checkout if possible (typically ${pol.get('late_checkout_fee', LATE_FEE)})."
         else:
             text = "I can check an extension for you and confirm if the dates are open."
@@ -392,11 +393,12 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
         ai.clarifying_question = ai.clarifying_question or "What time are you hoping for?"
         ai.actions.check_calendar = True
 
-    if any(w in latest for w in _CLEAN) or ai.intent is Intent.issue_report:
+    if any(w in latest for w in _CLEAN) or ai.intent == Intent.issue_report:
         if "sorry" not in text.lower() and "apolog" not in text.lower():
             text = "I’m sorry about that. " + text
         if "cleaner" not in text.lower():
             text += (" " if text else "") + "I can send our cleaners back—what time works for you?"
+        # Remove any suggestion to guest-clean
         text = re.sub(r"(we can leave|i can leave|there are) (a )?(vacuum|broom|cleaning supplies).*", "", text, flags=re.IGNORECASE).strip()
 
     if any(ev in latest for ev in _EVENTS) and "tip" not in text.lower():
