@@ -97,6 +97,57 @@ class AIResponse(BaseModel):
 def _init_db(path: str = LEARNING_DB_PATH) -> None:
     conn = sqlite3.connect(path)
     cur = conn.cursor()
+
+    # Ensure table exists (old installs might already have a different schema)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS learning_examples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT
+        )
+    """)
+
+    # Inspect current columns
+    cur.execute("PRAGMA table_info(learning_examples)")
+    cols = {row[1] for row in cur.fetchall()}
+
+    # Old schema used: guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at
+    # New schema wants: intent, question, answer, created_at
+    # Add missing columns safely.
+    to_add = []
+    if "intent" not in cols:
+        to_add.append(("intent", "TEXT", ""))
+    if "question" not in cols:
+        to_add.append(("question", "TEXT", ""))
+    if "answer" not in cols:
+        to_add.append(("answer", "TEXT", ""))
+    if "created_at" not in cols:
+        to_add.append(("created_at", "TEXT", "CURRENT_TIMESTAMP"))
+
+    for name, typ, default in to_add:
+        if default == "CURRENT_TIMESTAMP":
+            cur.execute(f"ALTER TABLE learning_examples ADD COLUMN {name} {typ} DEFAULT {default}")
+        else:
+            cur.execute(f"ALTER TABLE learning_examples ADD COLUMN {name} {typ} DEFAULT ?", (default,))
+    conn.commit()
+
+    # If we had old columns, backfill question/answer from them (once).
+    if {"guest_message", "ai_suggestion"}.issubset(cols):
+        # Only backfill rows where new fields are empty
+        cur.execute("""
+            UPDATE learning_examples
+            SET question = COALESCE(NULLIF(question, ''), guest_message),
+                answer   = COALESCE(NULLIF(answer, ''), ai_suggestion)
+            WHERE (question IS NULL OR question = '')
+               OR (answer   IS NULL OR answer   = '')
+        """)
+        conn.commit()
+
+    conn.close()
+
+# --- add/replace in assistant_core.py ---
+
+def _ensure_learning_schema(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    # Create if missing (new schema)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS learning_examples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,20 +157,90 @@ def _init_db(path: str = LEARNING_DB_PATH) -> None:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Check existing columns
+    cur.execute("PRAGMA table_info(learning_examples)")
+    cols = {row[1] for row in cur.fetchall()}
+
+    # Old schema columns → add what we need for new code to work
+    # Old schema likely had: guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at
+    if "question" not in cols:
+        try:
+            cur.execute("ALTER TABLE learning_examples ADD COLUMN question TEXT")
+        except Exception:
+            pass
+    if "answer" not in cols:
+        try:
+            cur.execute("ALTER TABLE learning_examples ADD COLUMN answer TEXT")
+        except Exception:
+            pass
+    if "intent" not in cols:
+        try:
+            cur.execute("ALTER TABLE learning_examples ADD COLUMN intent TEXT")
+        except Exception:
+            pass
+
     conn.commit()
-    conn.close()
+
 
 def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
     conn = sqlite3.connect(LEARNING_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _ensure_learning_schema(conn)
     cur = conn.cursor()
-    cur.execute("""
-        SELECT intent, question, answer FROM learning_examples
-        WHERE question LIKE ? OR answer LIKE ?
-        ORDER BY id DESC LIMIT ?
-    """, (f"%{q[:200]}%", f"%{q[:200]}%", limit))
-    rows = cur.fetchall()
-    conn.close()
-    return [{"intent": r[0] or "", "question": r[1] or "", "answer": r[2] or ""} for r in rows]
+
+    # Inspect columns to choose the right query
+    cur.execute("PRAGMA table_info(learning_examples)")
+    cols = {row[1] for row in cur.fetchall()}
+
+    examples: List[Dict[str, str]] = []
+
+    try:
+        if {"question", "answer"}.issubset(cols):
+            # New schema
+            cur.execute(
+                """
+                SELECT COALESCE(intent,'') AS intent,
+                       COALESCE(question,'') AS question,
+                       COALESCE(answer,'') AS answer
+                FROM learning_examples
+                WHERE (question LIKE ? OR answer LIKE ?)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (f"%{q[:200]}%", f"%{q[:200]}%", limit)
+            )
+            rows = cur.fetchall()
+            examples = [{"intent": r["intent"], "question": r["question"], "answer": r["answer"]} for r in rows]
+
+        elif {"guest_message", "ai_suggestion", "user_reply"}.issubset(cols):
+            # Old schema → map to new field names
+            cur.execute(
+                """
+                SELECT COALESCE(guest_message,'') AS guest_message,
+                       COALESCE(user_reply,'') AS user_reply,
+                       COALESCE(ai_suggestion,'') AS ai_suggestion
+                FROM learning_examples
+                WHERE (guest_message LIKE ? OR user_reply LIKE ? OR ai_suggestion LIKE ?)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (f"%{q[:200]}%", f"%{q[:200]}%", f"%{q[:200]}%", limit)
+            )
+            rows = cur.fetchall()
+            examples = [{
+                "intent": "",
+                "question": r["guest_message"],
+                "answer": r["user_reply"] or r["ai_suggestion"]
+            } for r in rows]
+        else:
+            # Unknown/mixed schema → return empty gracefully
+            examples = []
+
+    finally:
+        conn.close()
+
+    return examples
+
 
 # ---------- Hostaway helpers ----------
 def _token() -> Optional[str]:
