@@ -156,20 +156,14 @@ def _ensure_learning_schema(conn: sqlite3.Connection) -> None:
 
     # Add missing columns if running against an old table
     if "question" not in cols:
-        try:
-            cur.execute("ALTER TABLE learning_examples ADD COLUMN question TEXT")
-        except Exception:
-            pass
+        try: cur.execute("ALTER TABLE learning_examples ADD COLUMN question TEXT")
+        except Exception: pass
     if "answer" not in cols:
-        try:
-            cur.execute("ALTER TABLE learning_examples ADD COLUMN answer TEXT")
-        except Exception:
-            pass
+        try: cur.execute("ALTER TABLE learning_examples ADD COLUMN answer TEXT")
+        except Exception: pass
     if "intent" not in cols:
-        try:
-            cur.execute("ALTER TABLE learning_examples ADD COLUMN intent TEXT")
-        except Exception:
-            pass
+        try: cur.execute("ALTER TABLE learning_examples ADD COLUMN intent TEXT")
+        except Exception: pass
 
     conn.commit()
 
@@ -439,6 +433,62 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
         "deposit_facts": deposit_facts,
     }
 
+# ---------- Coercion / normalization for LLM JSON ----------
+_INTENT_SYNONYMS = {
+    "report_issue": "issue_report",
+    "issue": "issue_report",
+    "complaint": "issue_report",
+    "question_general": "question",
+    "checkin": "checkin_help",
+    "checkout": "checkout_help",
+}
+
+def _coerce_ai_json(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize LLM JSON so Pydantic validation won't fail on minor variations."""
+    out = dict(d or {})
+
+    # intent mapping
+    intent = str(out.get("intent", "other") or "other").lower()
+    intent = _INTENT_SYNONYMS.get(intent, intent)
+    # ensure it matches our Enum values
+    if intent not in {i.value for i in Intent}:
+        intent = "other"
+    out["intent"] = intent
+
+    # booleans / numbers
+    out["needs_clarification"] = bool(out.get("needs_clarification", False))
+    try:
+        out["confidence"] = float(out.get("confidence", 0.6))
+    except Exception:
+        out["confidence"] = 0.6
+
+    # strings
+    cq = out.get("clarifying_question")
+    out["clarifying_question"] = "" if cq is None else str(cq)
+    rep = out.get("reply")
+    out["reply"] = "" if rep is None else str(rep)
+
+    # citations: list of strings, ≤10
+    cits = out.get("citations")
+    if not isinstance(cits, list):
+        cits = []
+    cits = [str(x) for x in cits][:10]
+    out["citations"] = cits
+
+    # actions object
+    actions = out.get("actions")
+    if not isinstance(actions, dict):
+        actions = {}
+    out["actions"] = {
+        "check_calendar": bool(actions.get("check_calendar", False)),
+        "create_hostaway_offer": bool(actions.get("create_hostaway_offer", False)),
+        "send_house_manual": bool(actions.get("send_house_manual", False)),
+        "log_issue": bool(actions.get("log_issue", False)),
+        "tag_learning_example": bool(actions.get("tag_learning_example", False)),
+    }
+
+    return out
+
 # ---------- LLM call + validation ----------
 def _llm(system_prompt: str, ctx: Dict[str, Any]) -> AIResponse:
     resp = client.chat.completions.create(
@@ -454,7 +504,10 @@ def _llm(system_prompt: str, ctx: Dict[str, Any]) -> AIResponse:
     )
     raw = (resp.choices[0].message.content or "").strip()
     try:
-        return AIResponse(**json.loads(raw))
+        # First parse as dict, then coerce, then validate
+        parsed = json.loads(raw)
+        coerced = _coerce_ai_json(parsed)
+        return AIResponse(**coerced)
     except ValidationError as ve:
         logging.error(f"AI JSON validation error: {ve.errors()}; raw={raw[:300]}")
     except Exception as e:
