@@ -8,6 +8,7 @@ import sqlite3
 import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
 
 import requests
 from pydantic import BaseModel, Field, ValidationError, conlist
@@ -226,10 +227,7 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
 
     return examples
 
-# ---------- Hostaway helpers ----------
-# put near other helpers
-from datetime import datetime, timedelta
-
+# ---------- Calendar helpers ----------
 def _day_before(date_iso: str) -> Optional[str]:
     try:
         d = datetime.fromisoformat(date_iso[:10])
@@ -244,7 +242,7 @@ def _day_after(date_iso: str) -> Optional[str]:
     except Exception:
         return None
 
-
+# ---------- Hostaway helpers ----------
 def _token() -> Optional[str]:
     if not HOSTAWAY_CLIENT_ID or not HOSTAWAY_CLIENT_SECRET:
         return None
@@ -408,20 +406,39 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
     pol = _policies(meta)
     learned = _similar_examples(guest_message, 3)
 
+    # Latest guest message in history
     latest_guest_msg = None
     for m in reversed(history or []):
         if (m.get("role") or "").lower() == "guest" and (m.get("text") or "").strip():
             latest_guest_msg = m["text"].strip()
             break
 
+    # Calendar facts (make sure variables are defined before use)
     calendar: Dict[str, Any] = {"looked_up": False}
-    listing_id, ci, co = meta.get("listing_id"), meta.get("check_in"), meta.get("check_out")
+    listing_id = meta.get("listing_id")
+    ci = meta.get("check_in")
+    co = meta.get("check_out")
+
     if listing_id and ci and co:
         cal_payload = _fetch_calendar(str(listing_id), ci, co)
         calendar["looked_up"] = bool(cal_payload.get("ok"))
         calendar["checkin_available"] = _is_available(cal_payload, ci) if calendar["looked_up"] else None
         calendar["checkout_available"] = _is_available(cal_payload, co) if calendar["looked_up"] else None
 
+        # Also peek at the day before/after to enable upsell logic
+        day_before = _day_before(ci)
+        day_after = _day_after(co)
+        if day_before or day_after:
+            span_start = day_before or ci
+            span_end = day_after or co
+            span_payload = _fetch_calendar(str(listing_id), span_start, span_end)
+            calendar["looked_up_span"] = bool(span_payload.get("ok"))
+            if day_before:
+                calendar["day_before_available"] = _is_available(span_payload, day_before)
+            if day_after:
+                calendar["day_after_available"] = _is_available(span_payload, day_after)
+
+    # Payments / deposit
     reservation_id = meta.get("reservation_id")
     listing_map_id = meta.get("listing_map_id") or listing_id
     charges_payload = _fetch_guest_charges(int(reservation_id) if reservation_id else None,
@@ -468,7 +485,6 @@ def _coerce_ai_json(d: Dict[str, Any]) -> Dict[str, Any]:
     # intent mapping
     intent = str(out.get("intent", "other") or "other").lower()
     intent = _INTENT_SYNONYMS.get(intent, intent)
-    # ensure it matches our Enum values
     if intent not in {i.value for i in Intent}:
         intent = "other"
     out["intent"] = intent
@@ -522,7 +538,6 @@ def _llm(system_prompt: str, ctx: Dict[str, Any]) -> AIResponse:
     )
     raw = (resp.choices[0].message.content or "").strip()
     try:
-        # First parse as dict, then coerce, then validate
         parsed = json.loads(raw)
         coerced = _coerce_ai_json(parsed)
         return AIResponse(**coerced)
@@ -565,15 +580,36 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
 
     if ai.intent in (Intent.early_check_in, Intent.late_checkout, Intent.extend_stay):
         ci, co = prof.get("checkin_time", DEFAULT_CHECKIN), prof.get("checkout_time", DEFAULT_CHECKOUT)
+
+        cal = ctx.get("calendar") or {}
+        checkin_avail = cal.get("checkin_available")
+        checkout_avail = cal.get("checkout_available")
+        day_after_open = cal.get("day_after_available")
+
         if ai.intent == Intent.early_check_in:
-            text = f"Standard check-in is {ci}. I can request early check-in if the schedule allows (typically ${pol.get('early_checkin_fee', EARLY_FEE)})."
+            text = f"Standard check-in is {ci}."
+            if checkin_avail:
+                text += f" I can request early check-in if the schedule allows (typically ${pol.get('early_checkin_fee', EARLY_FEE)})."
+            else:
+                text += " The night before is booked, so early check-in may not be possible."
+
         elif ai.intent == Intent.late_checkout:
-            text = f"Check-out is {co}. I can request late checkout if possible (typically ${pol.get('late_checkout_fee', LATE_FEE)})."
-        else:
+            text = f"Check-out is {co}."
+            if checkout_avail:
+                text += f" I can request late checkout if possible (typically ${pol.get('late_checkout_fee', LATE_FEE)})."
+            else:
+                text += " The next guest arrives the same day, so late checkout may not be possible."
+
+        else:  # extend_stay
             text = "I can check an extension for you and confirm if the dates are open."
+
         ai.needs_clarification = True
         ai.clarifying_question = ai.clarifying_question or "What time are you hoping for?"
         ai.actions.check_calendar = True
+
+        # Gentle upsell if the night after is open
+        if (ai.intent in (Intent.early_check_in, Intent.late_checkout)) and day_after_open:
+            text += " By the way, the night after is open—would you like me to check if extending your stay works?"
 
     if any(w in latest for w in _CLEAN) or ai.intent == Intent.issue_report:
         if "sorry" not in text.lower() and "apolog" not in text.lower():
