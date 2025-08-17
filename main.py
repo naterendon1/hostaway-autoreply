@@ -5,7 +5,7 @@ import os
 import logging
 import json
 import sqlite3
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
@@ -32,7 +32,7 @@ from utils import (
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 app.include_router(slack_router, prefix="/slack")
-init_db()
+init_db()  # keeps your legacy table alive
 
 # ---- Env checks ----
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
@@ -53,6 +53,70 @@ if missing:
     raise RuntimeError(f"Missing required environment variables: {missing}")
 
 MAX_THREAD_MESSAGES = 10
+
+# ---------- Tiny local tables in learning.db ----------
+def _conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(LEARNING_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _ensure_aux_tables() -> None:
+    conn = _conn()
+    cur = conn.cursor()
+    # Stores Slack thread ts per Hostaway conversation
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS slack_threads (
+            conv_id TEXT PRIMARY KEY,
+            thread_ts TEXT NOT NULL
+        )
+    """)
+    # Tracks guest email seen count to detect returning guests
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guest_contacts (
+            email TEXT PRIMARY KEY,
+            seen_count INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+_ensure_aux_tables()
+
+def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
+    if not conv_id: return None
+    conn = _conn()
+    row = conn.execute("SELECT thread_ts FROM slack_threads WHERE conv_id = ?", (str(conv_id),)).fetchone()
+    conn.close()
+    return row["thread_ts"] if row else None
+
+def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
+    if not conv_id or not ts: return
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO slack_threads (conv_id, thread_ts) VALUES (?, ?) ON CONFLICT(conv_id) DO UPDATE SET thread_ts=excluded.thread_ts",
+        (str(conv_id), ts),
+    )
+    conn.commit()
+    conn.close()
+
+def _bump_guest_seen(email: Optional[str]) -> int:
+    """Increment and return new seen_count. Returns 1 for first time."""
+    if not email: return 0
+    key = email.strip().lower()
+    if not key: return 0
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT seen_count FROM guest_contacts WHERE email = ?", (key,))
+    row = cur.fetchone()
+    if row:
+        seen = int(row["seen_count"]) + 1
+        cur.execute("UPDATE guest_contacts SET seen_count = ? WHERE email = ?", (seen, key))
+    else:
+        seen = 1
+        cur.execute("INSERT INTO guest_contacts (email, seen_count) VALUES (?, ?)", (key, seen))
+    conn.commit()
+    conn.close()
+    return seen
 
 # ---------- Helpers for Slack header formatting ----------
 CHANNEL_ID_MAP = {
@@ -81,6 +145,7 @@ COMM_TYPE_MAP = {
     "direct": "Direct",
     "expedia": "Expedia",
     "channel": "Channel",
+    "email": "Email",
 }
 
 RES_STATUS_ALLOWED = {
@@ -100,10 +165,7 @@ RES_STATUS_ALLOWED = {
 }
 
 def format_us_date(d: str | None) -> str:
-    """
-    Converts 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM:SS' -> 'MM/DD/YYYY'.
-    Returns original string if parsing fails.
-    """
+    """YYYY-MM-DD / YYYY-MM-DDTHH:MM:SS -> MM/DD/YYYY"""
     if not d:
         return "N/A"
     s = str(d).strip()
@@ -139,7 +201,6 @@ def pretty_status(s: str | None) -> str:
 def channel_label_from(channel_id: int | None, communication_type: str | None) -> str:
     if isinstance(channel_id, int) and channel_id in CHANNEL_ID_MAP:
         name = CHANNEL_ID_MAP[channel_id]
-        # Normalize to clean labels
         if "vrbo" in name.lower():
             return "Vrbo"
         if "airbnb" in name.lower():
@@ -222,7 +283,7 @@ def list_feedback(limit: int = 100) -> List[Dict]:
         (limit,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [dict(r) for r]  # <-- keep legacy admin endpoints unchanged
 
 # ---------- Webhook ----------
 class HostawayUnifiedWebhook(BaseModel):
@@ -263,6 +324,28 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     res = reservation.get("result", {}) or {}
 
     guest_name = res.get("guestFirstName", "Guest")
+    # Try to capture guest email and picture
+    guest_email = res.get("guestEmail") or None
+
+    # Conversation (for picture/email fallback)
+    convo_obj = fetch_hostaway_conversation(conv_id) or {}
+    convo_res = convo_obj.get("result", {}) or {}
+    guest_photo = (
+        convo_res.get("recipientPicture")
+        or convo_res.get("guestPicture")
+        or res.get("guestPicture")
+        or None
+    )
+    if not guest_email:
+        guest_email = convo_res.get("guestEmail") or convo_res.get("recipientEmail")
+
+    # Returning guest tag
+    returning_tag = ""
+    if guest_email:
+        seen_count = _bump_guest_seen(guest_email)
+        if seen_count > 1:
+            returning_tag = " • Returning guest!"
+
     check_in = res.get("arrivalDate", "N/A")
     check_out = res.get("departureDate", "N/A")
     guest_count = res.get("numberOfGuests", "N/A")
@@ -270,6 +353,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Reservation status & total price
     res_status_pretty = pretty_res_status(res.get("status"))
     total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
+
+    # Payment link eligibility (pending/awaitingPayment + guestPortalUrl)
+    raw_status = (res.get("status") or "").strip().lower()
+    guest_portal_url = (res.get("guestPortalUrl") or "").strip() or None
+    show_payment_button = bool(
+        guest_portal_url and raw_status in {"pending", "awaitingpayment"}
+    )
 
     # Message transport status (from webhook payload)
     msg_status = pretty_status(payload.data.get("status") or "sent")
@@ -300,7 +390,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         property_address = str(addr_raw)
 
     # Conversation context (last few)
-    convo_obj = fetch_hostaway_conversation(conv_id) or {}
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
@@ -355,65 +444,96 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "channel_pretty": channel_pretty,
         "property_address": property_address,
         "price": total_price_str,
+        "guest_portal_url": guest_portal_url,
     }
     logging.info("button_meta: %s", json.dumps(button_meta, indent=2))
 
     # Slack blocks
+    header_text = (
+        f"*{channel_pretty} message* from *{guest_name}*{returning_tag}\n"
+        f"Property: *{property_address}*\n"
+        f"Dates: *{us_check_in} → {us_check_out}*\n"
+        f"Guests: *{guest_count}* | Res: *{res_status_pretty}* | Price: *{total_price_str}*"
+    )
+    header_block: Dict = {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": header_text},
+    }
+    # Add guest photo as accessory if available
+    if guest_photo:
+        header_block["accessory"] = {
+            "type": "image",
+            "image_url": guest_photo,
+            "alt_text": guest_name or "Guest photo",
+        }
+
+    # Build buttons
+    actions_elements = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "✅ Send"},
+            "value": json.dumps({**button_meta, "action": "send"}),
+            "action_id": "send",
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "✏️ Edit"},
+            "value": json.dumps({**button_meta, "action": "edit"}),
+            "action_id": "edit",
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "🙈 Ignore"},
+            "value": json.dumps({**button_meta, "action": "ignore"}),
+            "action_id": "ignore",
+        },
+    ]
+    if show_payment_button:
+        actions_elements.append(
+            {
+                "type": "button",
+                "style": "primary",
+                "text": {"type": "plain_text", "text": "💳 Send payment link"},
+                "value": json.dumps({**button_meta, "action": "send_payment_link"}),
+                "action_id": "send_payment_link",
+            }
+        )
+
+    blocks = [
+        header_block,
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Msg:* {msg_status}"}],
+        },
+        {"type": "actions", "elements": actions_elements},
+    ]
+
+    # Post to Slack — thread-aware
     from slack_sdk import WebClient
     slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+    slack_channel = os.getenv("SLACK_CHANNEL")
+
     try:
-        slack_client.chat_postMessage(
-            channel=os.getenv("SLACK_CHANNEL"),
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": (
-                            f"*{channel_pretty} message* from *{guest_name}*\n"
-                            f"Property: *{property_address}*\n"
-                            f"Dates: *{us_check_in} → {us_check_out}*\n"
-                            f"Guests: *{guest_count}* | Res: *{res_status_pretty}* | Price: *{total_price_str}*"
-                        ),
-                    },
-                },
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"},
-                },
-                {
-                    "type": "context",
-                    "elements": [
-                        {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Msg:* {msg_status}"}
-                    ],
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "✅ Send"},
-                            "value": json.dumps({**button_meta, "action": "send"}),
-                            "action_id": "send",
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "✏️ Edit"},
-                            "value": json.dumps({**button_meta, "action": "edit"}),
-                            "action_id": "edit",
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "📝 Write Your Own"},
-                            "value": json.dumps({**button_meta, "action": "write_own"}),
-                            "action_id": "write_own",
-                        },
-                    ],
-                },
-            ],
-            text="New message from guest",
-        )
+        existing_thread = _get_thread_ts(conv_id)
+        if existing_thread:
+            resp = slack_client.chat_postMessage(
+                channel=slack_channel,
+                thread_ts=existing_thread,
+                blocks=blocks,
+                text="New guest message",
+            )
+        else:
+            resp = slack_client.chat_postMessage(
+                channel=slack_channel,
+                blocks=blocks,
+                text="New guest message",
+            )
+            # First post creates the thread
+            ts = resp.get("ts")
+            if ts:
+                _set_thread_ts(conv_id, ts)
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
 
