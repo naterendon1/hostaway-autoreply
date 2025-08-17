@@ -227,6 +227,24 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
     return examples
 
 # ---------- Hostaway helpers ----------
+# put near other helpers
+from datetime import datetime, timedelta
+
+def _day_before(date_iso: str) -> Optional[str]:
+    try:
+        d = datetime.fromisoformat(date_iso[:10])
+        return (d - timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def _day_after(date_iso: str) -> Optional[str]:
+    try:
+        d = datetime.fromisoformat(date_iso[:10])
+        return (d + timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
 def _token() -> Optional[str]:
     if not HOSTAWAY_CLIENT_ID or not HOSTAWAY_CLIENT_SECRET:
         return None
