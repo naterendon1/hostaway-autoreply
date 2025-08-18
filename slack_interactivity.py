@@ -27,6 +27,7 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 if not SLACK_BOT_TOKEN:
     logging.warning("SLACK_BOT_TOKEN is not set; Slack updates will fail.")
 
+
 # -------------------- Security: Slack Signature Verify --------------------
 def verify_slack_signature(request_body: str, slack_signature: str, slack_request_timestamp: str) -> bool:
     if not SLACK_SIGNING_SECRET:
@@ -40,6 +41,17 @@ def verify_slack_signature(request_body: str, slack_signature: str, slack_reques
         hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(my_signature, slack_signature or "")
+
+
+def _post_thread_note(channel: str | None, ts: str | None, text: str) -> None:
+    """Lightweight helper to post a small note into the message thread."""
+    if not channel or not ts:
+        return
+    try:
+        slack_client.chat_postMessage(channel=channel, thread_ts=ts, text=text)
+    except Exception as e:
+        logging.error(f"Thread note failed: {e}")
+
 
 def update_slack_message_with_sent_reply(
     slack_bot_token,
@@ -82,6 +94,7 @@ def update_slack_message_with_sent_reply(
         _client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Reply sent to guest!")
     except Exception as e:
         logging.error(f"❌ Failed to update Slack message with sent reply: {e}")
+
 
 # --------- PATCHED MODAL BLOCKS ----------
 def get_modal_blocks(
@@ -133,6 +146,7 @@ def get_modal_blocks(
         learning_checkbox
     ]
 
+
 def add_undo_button(blocks, meta):
     if "previous_draft" in meta and meta["previous_draft"]:
         blocks.append({
@@ -143,6 +157,7 @@ def add_undo_button(blocks, meta):
             ]
         })
     return blocks
+
 
 # ---------------- Background: improve + final views.update (with hash) ----------------
 def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest_name, guest_msg):
@@ -211,6 +226,7 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
         except Exception as e2:
             logging.error(f"views_update (final) second exception: {e2}")
 
+
 # ---------------------------- Events Endpoint ----------------------------
 @router.post("/events")
 async def slack_events(
@@ -226,6 +242,7 @@ async def slack_events(
     if payload.get("type") == "url_verification":
         return JSONResponse({"challenge": payload.get("challenge")})
     return JSONResponse({"ok": True})
+
 
 # ---------------- Background: send to Hostaway + update Slack ----------------
 def _background_send_and_update(meta: dict, reply_text: str):
@@ -270,6 +287,7 @@ def _background_send_and_update(meta: dict, reply_text: str):
             )
         except Exception as e:
             logging.error(f"Slack chat_update error: {e}")
+
 
 # ---------------------------- Interactivity Endpoint ----------------------------
 @router.post("/actions")
@@ -322,10 +340,6 @@ async def slack_actions(
 
             reply_text = meta.get("reply", meta.get("ai_suggestion", "(No reply provided.)"))
             conv_id = meta.get("conv_id")
-            guest_name = meta.get("guest_name", "Guest")
-            guest_msg = meta.get("guest_message", "(Message unavailable)")
-            sent_label = meta.get("sent_label", "message sent")
-
             meta["channel"] = channel or meta.get("channel")
             meta["ts"] = ts or meta.get("ts")
 
@@ -428,7 +442,6 @@ async def slack_actions(
             for key in ("reply_input_ai", "reply_input"):
                 block = state.get(key, {})
                 if block:
-                    # take any entry with "value"
                     for v in block.values():
                         if isinstance(v, dict) and v.get("value"):
                             edited_text = v["value"]
@@ -526,6 +539,38 @@ async def slack_actions(
                 logging.error(f"Slack views push/open error: {e}")
             return JSONResponse({})
 
+        # --- IGNORE ---
+        if action_id == "ignore":
+            meta = get_meta_from_action(action)
+            container = payload.get("container", {}) or {}
+            channel = meta.get("channel") or container.get("channel_id") or payload.get("channel", {}).get("id")
+            ts = meta.get("ts") or container.get("message_ts") or payload.get("message", {}).get("ts")
+            _post_thread_note(channel, ts, "👀 Ignored.")
+            return JSONResponse({})
+
+        # --- SEND PAYMENT LINK ---
+        if action_id == "send_payment_link":
+            meta = get_meta_from_action(action)
+            container = payload.get("container", {}) or {}
+            channel = meta.get("channel") or container.get("channel_id") or payload.get("channel", {}).get("id")
+            ts = meta.get("ts") or container.get("message_ts") or payload.get("message", {}).get("ts")
+            conv_id = meta.get("conv_id")
+            communication_type = meta.get("type", "email")
+            url = meta.get("guest_portal_url")
+            if not url:
+                _post_thread_note(channel, ts, "⚠️ No payment link available for this reservation.")
+                return JSONResponse({})
+            try:
+                ok = send_reply_to_hostaway(conv_id, f"Here’s your secure payment link: {url}", communication_type)
+                if ok:
+                    _post_thread_note(channel, ts, "💳 Payment link sent to guest.")
+                else:
+                    _post_thread_note(channel, ts, "⚠️ Failed to send payment link.")
+            except Exception as e:
+                logging.error(f"Payment link send error: {e}")
+                _post_thread_note(channel, ts, "⚠️ Failed to send payment link.")
+            return JSONResponse({})
+
     # -------------------- view_submission handler --------------------
     if payload.get("type") == "view_submission":
         try:
@@ -533,8 +578,8 @@ async def slack_actions(
             state = view.get("state", {}).get("values", {})
             meta = json.loads(view.get("private_metadata", "{}") or "{}")
 
-            reply_text = None
             # Prefer AI field if present, otherwise original
+            reply_text = None
             for block_id, block in state.items():
                 if "reply_ai" in block:
                     reply_text = block["reply_ai"]["value"]
@@ -557,8 +602,10 @@ async def slack_actions(
             if channel: meta["channel"] = channel
             if ts: meta["ts"] = ts
 
+            # Queue background send & update
             background_tasks.add_task(_background_send_and_update, meta, reply_text)
 
+            # Save “learn for next time” checkbox (legacy learning store)
             save_for_next_time = False
             for block in state.values():
                 if "save_answer" in block and block["save_answer"].get("selected_options"):
@@ -572,6 +619,32 @@ async def slack_actions(
                     meta.get("listing_id"),
                     meta.get("guest_id")
                 )
+
+            # ---- ALSO store edit in learning.db (your snippet) ----
+            try:
+                import sqlite3
+                DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
+                conn = sqlite3.connect(DB_PATH)
+                cur = conn.cursor()
+                cur.execute("""
+                  CREATE TABLE IF NOT EXISTS learning_examples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    intent TEXT,
+                    question TEXT,
+                    answer TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """)
+                guest_msg = meta.get("guest_message", "") or ""
+                final_text = reply_text or ""
+                cur.execute(
+                  "INSERT INTO learning_examples (intent, question, answer) VALUES (?, ?, ?)",
+                  ("other", guest_msg[:2000], final_text[:4000])
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logging.error(f"learning_examples insert failed: {e}")
 
             return JSONResponse({"response_action": "clear"})
         except Exception as e:
