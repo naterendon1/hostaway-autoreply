@@ -27,6 +27,8 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 if not SLACK_BOT_TOKEN:
     logging.warning("SLACK_BOT_TOKEN is not set; Slack updates will fail.")
 
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") or None, timeout=15)
+
 
 # -------------------- Security: Slack Signature Verify --------------------
 def verify_slack_signature(request_body: str, slack_signature: str, slack_request_timestamp: str) -> bool:
@@ -172,7 +174,6 @@ def _background_improve_and_update(view_id, hash_value, meta, edited_text, guest
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            timeout=15,
             messages=[
                 {"role": "system", "content": "You edit messages for a vacation-rental host. Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis."},
                 {"role": "user", "content": prompt}
@@ -516,7 +517,7 @@ async def slack_actions(
             previous_draft = meta.get("previous_draft", "")
             checkbox_checked = meta.get("checkbox_checked", False)
             blocks = get_modal_blocks(
-                guest_name, guest_message=guest_msg, action_id="edit",
+                guest_name, guest_msg, action_id="edit",
                 draft_text=previous_draft, checkbox_checked=checkbox_checked,
                 input_block_id="reply_input", input_action_id="reply",
             )
