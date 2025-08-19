@@ -986,7 +986,7 @@ def get_listing_amenities(listing_id):
         logging.error("[AMENITY] No Hostaway API token")
         return []
     try:
-        url = "https://api.hostaway.com/v1/amenities"
+        url = f"{HOSTAWAY_API_BASE}/amenities"
         headers = {"Authorization": f"Bearer {token}"}
         resp = requests.get(url, headers=headers)
         resp.raise_for_status()
