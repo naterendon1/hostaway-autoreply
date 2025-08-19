@@ -54,66 +54,46 @@ if missing:
 
 MAX_THREAD_MESSAGES = 10
 
-# ---------- Tiny local tables in learning.db ----------
-def _conn() -> sqlite3.Connection:
+# ---------- Tiny helpers wired to db.py ----------
+from db import get_slack_thread as db_get_slack_thread, upsert_slack_thread as db_upsert_slack_thread
+
+def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
+    if not conv_id:
+        return None
+    rec = db_get_slack_thread(str(conv_id))
+    return rec["ts"] if rec else None
+
+def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
+    if not conv_id or not ts:
+        return
+    channel = os.getenv("SLACK_CHANNEL")
+    db_upsert_slack_thread(str(conv_id), channel or "", ts)
+
+def _bump_guest_seen(email: Optional[str]) -> int:
+    """Keep behavior; simple local counter using learning.db."""
+    if not email:
+        return 0
+    key = (email or "").strip().lower()
+    if not key:
+        return 0
+    import sqlite3, os
+    LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
     conn = sqlite3.connect(LEARNING_DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
-
-def _ensure_aux_tables() -> None:
-    conn = _conn()
     cur = conn.cursor()
-    # Stores Slack thread ts per Hostaway conversation
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS slack_threads (
-            conv_id TEXT PRIMARY KEY,
-            thread_ts TEXT NOT NULL
-        )
-    """)
-    # Tracks guest email seen count to detect returning guests
     cur.execute("""
         CREATE TABLE IF NOT EXISTS guest_contacts (
             email TEXT PRIMARY KEY,
             seen_count INTEGER NOT NULL DEFAULT 0
         )
     """)
-    conn.commit()
-    conn.close()
-
-_ensure_aux_tables()
-
-def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
-    if not conv_id: return None
-    conn = _conn()
-    row = conn.execute("SELECT thread_ts FROM slack_threads WHERE conv_id = ?", (str(conv_id),)).fetchone()
-    conn.close()
-    return row["thread_ts"] if row else None
-
-def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
-    if not conv_id or not ts: return
-    conn = _conn()
-    conn.execute(
-        "INSERT INTO slack_threads (conv_id, thread_ts) VALUES (?, ?) ON CONFLICT(conv_id) DO UPDATE SET thread_ts=excluded.thread_ts",
-        (str(conv_id), ts),
-    )
-    conn.commit()
-    conn.close()
-
-def _bump_guest_seen(email: Optional[str]) -> int:
-    """Increment and return new seen_count. Returns 1 for first time."""
-    if not email: return 0
-    key = email.strip().lower()
-    if not key: return 0
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("SELECT seen_count FROM guest_contacts WHERE email = ?", (key,))
-    row = cur.fetchone()
+    row = cur.execute("SELECT seen_count FROM guest_contacts WHERE email=?", (key,)).fetchone()
     if row:
         seen = int(row["seen_count"]) + 1
-        cur.execute("UPDATE guest_contacts SET seen_count = ? WHERE email = ?", (seen, key))
+        cur.execute("UPDATE guest_contacts SET seen_count=? WHERE email=?", (seen, key))
     else:
         seen = 1
-        cur.execute("INSERT INTO guest_contacts (email, seen_count) VALUES (?, ?)", (key, seen))
+        cur.execute("INSERT INTO guest_contacts(email, seen_count) VALUES(?, ?)", (key, seen))
     conn.commit()
     conn.close()
     return seen
