@@ -76,9 +76,8 @@ def _bump_guest_seen(email: Optional[str]) -> int:
     key = (email or "").strip().lower()
     if not key:
         return 0
-    import sqlite3, os
-    LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
-    conn = sqlite3.connect(LEARNING_DB_PATH)
+    LEARNING_DB_PATH_LOCAL = os.getenv("LEARNING_DB_PATH", "learning.db")
+    conn = sqlite3.connect(LEARNING_DB_PATH_LOCAL)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
@@ -344,6 +343,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Message transport status (from webhook payload)
     msg_status = pretty_status(payload.data.get("status") or "sent")
 
+    # Trip phase for context (upcoming / during / past / unknown)
     phase = trip_phase(check_in, check_out)
 
     if not listing_id:
@@ -447,7 +447,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "alt_text": guest_name or "Guest photo",
         }
 
-    # Build buttons
+    # Build buttons (Edit doubles as "write your own" if you clear the text)
     actions_elements = [
         {
             "type": "button",
@@ -485,35 +485,47 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
         {
             "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Msg:* {msg_status}"}],
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"
+                }
+            ],
         },
         {"type": "actions", "elements": actions_elements},
     ]
 
     # Post to Slack — thread-aware
     from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
     slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     slack_channel = os.getenv("SLACK_CHANNEL")
 
     try:
         existing_thread = _get_thread_ts(conv_id)
+
         if existing_thread:
-            resp = slack_client.chat_postMessage(
+            # Post as a reply in the existing Slack thread
+            slack_client.chat_postMessage(
                 channel=slack_channel,
                 thread_ts=existing_thread,
                 blocks=blocks,
                 text="New guest message",
             )
         else:
+            # Post the first (parent) message and capture its ts
             resp = slack_client.chat_postMessage(
                 channel=slack_channel,
                 blocks=blocks,
                 text="New guest message",
             )
-            # First post creates the thread
-            ts = resp.get("ts")
+            ts = (getattr(resp, "data", None) or {}).get("ts") or (resp.get("ts") if isinstance(resp, dict) else None)
             if ts:
                 _set_thread_ts(conv_id, ts)
+
+    except SlackApiError as e:
+        logging.error(f"❌ Slack send error: {getattr(e.response, 'data', e)}")
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
 
