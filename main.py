@@ -127,73 +127,46 @@ RES_STATUS_ALLOWED = {
     "inquirytimedout": "Inquiry (Timed Out)",
     "inquirynotpossible": "Inquiry (Not Possible)",
 }
+from utils import extract_access_details, extract_pet_policy
 
-# --- Access + policy extractors (utils.py) ---
+# ...
 
-def extract_access_details(listing_result: dict | None, reservation_result: dict | None) -> dict:
-    """
-    Tries common Hostaway fields for codes/instructions.
-    Prefers reservation-level fields over listing-level.
-    Returns: {door_code: str|None, arrival_instructions: str|None}
-    """
-    R = (reservation_result or {}).get("result", {}) or {}
-    L = (listing_result or {}).get("result", {}) or {}
+access = extract_access_details(listing_obj, reservation)
+pet_policy = extract_pet_policy(listing_obj)
 
-    # Try several likely keys (Reservation first, then Listing)
-    code = (
-        R.get("doorCode") or R.get("accessCode") or R.get("keypadCode") or
-        L.get("doorCode") or L.get("accessCode") or L.get("keypadCode") or
-        L.get("gateCode")
-    )
-    instructions = (
-        R.get("arrivalInstructions") or R.get("checkInInstructions") or
-        L.get("arrivalInstructions") or L.get("checkInInstructions") or
-        L.get("houseManual")
-    )
+# Minimal property profile, now with checkin/checkout and optional timezone
+property_profile = {
+    "checkin_time": "4:00 PM",
+    "checkout_time": "11:00 AM",
+    "timezone": os.getenv("PROPERTY_TZ", "America/Chicago"),
+}
+# If your listing exposes times, prefer those over defaults:
+try:
+    L = (listing_obj or {}).get("result", {}) or {}
+    property_profile["checkin_time"]  = L.get("checkInTime")  or property_profile["checkin_time"]
+    property_profile["checkout_time"] = L.get("checkOutTime") or property_profile["checkout_time"]
+except Exception:
+    pass
 
-    if isinstance(instructions, dict):
-        # Some tenants store a structured object; stringify simply
-        instructions = instructions.get("text") or instructions.get("url") or str(instructions)
-
-    return {"door_code": (str(code).strip() if code else None),
-            "arrival_instructions": (str(instructions).strip() if instructions else None)}
-
-
-def extract_pet_policy(listing_result: dict | None) -> dict:
-    """
-    Heuristically maps listing fields → a simple pet policy.
-    Returns: {pets_allowed: bool|None, pet_fee: float|None, pet_deposit_refundable: bool|None}
-    """
-    L = (listing_result or {}).get("result", {}) or {}
-
-    # Different accounts use different keys; try a few
-    pets_allowed = L.get("petsAllowed")
-    if pets_allowed is None:
-        # Fallback: if amenities list is present and has "Pets allowed"
-        ams = L.get("amenities") or []
-        # You already have get_listing_amenities(listing_id) elsewhere if you prefer names
-        # Here we only handle a boolean if the listing exposes it directly.
-        pass
-
-    pet_fee = L.get("petFee") or L.get("pet_fee")
-    refundable = L.get("petDepositRefundable")
-    # Normalize types
-    try:
-        pet_fee = float(pet_fee) if pet_fee is not None else None
-    except Exception:
-        pet_fee = None
-
-    if isinstance(pets_allowed, str):
-        pets_allowed = pets_allowed.lower() in {"true", "yes", "1"}
-
-    if isinstance(refundable, str):
-        refundable = refundable.lower() in {"true", "yes", "1"}
-
-    return {
-        "pets_allowed": pets_allowed if isinstance(pets_allowed, bool) else None,
-        "pet_fee": pet_fee,
-        "pet_deposit_refundable": refundable if isinstance(refundable, bool) else None,
-    }
+meta_for_ai = {
+    "listing_id": (str(listing_id) if listing_id is not None else ""),
+    "listing_map_id": listing_id,
+    "reservation_id": reservation_id,
+    "check_in": check_in if isinstance(check_in, str) else str(check_in),
+    "check_out": check_out if isinstance(check_out, str) else str(check_out),
+    "reservation_status": (res.get("status") or "").strip(),
+    "property_profile": property_profile,
+    "policies": {
+        "pets_allowed": pet_policy.get("pets_allowed"),
+        "pet_fee": pet_policy.get("pet_fee"),
+        "pet_deposit_refundable": pet_policy.get("pet_deposit_refundable"),
+    },
+    # New: access details for the AI
+    "access": {
+        "door_code": access.get("door_code"),
+        "arrival_instructions": access.get("arrival_instructions"),
+    },
+}
 
 
 def format_us_date(d: str | None) -> str:
