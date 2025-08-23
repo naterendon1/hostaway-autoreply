@@ -128,6 +128,74 @@ RES_STATUS_ALLOWED = {
     "inquirynotpossible": "Inquiry (Not Possible)",
 }
 
+# --- Access + policy extractors (utils.py) ---
+
+def extract_access_details(listing_result: dict | None, reservation_result: dict | None) -> dict:
+    """
+    Tries common Hostaway fields for codes/instructions.
+    Prefers reservation-level fields over listing-level.
+    Returns: {door_code: str|None, arrival_instructions: str|None}
+    """
+    R = (reservation_result or {}).get("result", {}) or {}
+    L = (listing_result or {}).get("result", {}) or {}
+
+    # Try several likely keys (Reservation first, then Listing)
+    code = (
+        R.get("doorCode") or R.get("accessCode") or R.get("keypadCode") or
+        L.get("doorCode") or L.get("accessCode") or L.get("keypadCode") or
+        L.get("gateCode")
+    )
+    instructions = (
+        R.get("arrivalInstructions") or R.get("checkInInstructions") or
+        L.get("arrivalInstructions") or L.get("checkInInstructions") or
+        L.get("houseManual")
+    )
+
+    if isinstance(instructions, dict):
+        # Some tenants store a structured object; stringify simply
+        instructions = instructions.get("text") or instructions.get("url") or str(instructions)
+
+    return {"door_code": (str(code).strip() if code else None),
+            "arrival_instructions": (str(instructions).strip() if instructions else None)}
+
+
+def extract_pet_policy(listing_result: dict | None) -> dict:
+    """
+    Heuristically maps listing fields → a simple pet policy.
+    Returns: {pets_allowed: bool|None, pet_fee: float|None, pet_deposit_refundable: bool|None}
+    """
+    L = (listing_result or {}).get("result", {}) or {}
+
+    # Different accounts use different keys; try a few
+    pets_allowed = L.get("petsAllowed")
+    if pets_allowed is None:
+        # Fallback: if amenities list is present and has "Pets allowed"
+        ams = L.get("amenities") or []
+        # You already have get_listing_amenities(listing_id) elsewhere if you prefer names
+        # Here we only handle a boolean if the listing exposes it directly.
+        pass
+
+    pet_fee = L.get("petFee") or L.get("pet_fee")
+    refundable = L.get("petDepositRefundable")
+    # Normalize types
+    try:
+        pet_fee = float(pet_fee) if pet_fee is not None else None
+    except Exception:
+        pet_fee = None
+
+    if isinstance(pets_allowed, str):
+        pets_allowed = pets_allowed.lower() in {"true", "yes", "1"}
+
+    if isinstance(refundable, str):
+        refundable = refundable.lower() in {"true", "yes", "1"}
+
+    return {
+        "pets_allowed": pets_allowed if isinstance(pets_allowed, bool) else None,
+        "pet_fee": pet_fee,
+        "pet_deposit_refundable": refundable if isinstance(refundable, bool) else None,
+    }
+
+
 def format_us_date(d: str | None) -> str:
     """YYYY-MM-DD / YYYY-MM-DDTHH:MM:SS -> MM/DD/YYYY"""
     if not d:
