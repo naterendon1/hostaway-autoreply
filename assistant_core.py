@@ -487,6 +487,7 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
             "fee": pet_fee,
             "deposit_refundable": pet_deposit_refundable,
         },
+    }
 
 
 # ---------- Coercion / normalization for LLM JSON ----------
