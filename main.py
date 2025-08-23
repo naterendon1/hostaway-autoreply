@@ -54,30 +54,15 @@ if missing:
 
 MAX_THREAD_MESSAGES = 10
 
-# ---------- Tiny helpers wired to db.py ----------
-from db import get_slack_thread as db_get_slack_thread, upsert_slack_thread as db_upsert_slack_thread
-
-def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
-    if not conv_id:
-        return None
-    rec = db_get_slack_thread(str(conv_id))
-    return rec["ts"] if rec else None
-
-def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
-    if not conv_id or not ts:
-        return
-    channel = os.getenv("SLACK_CHANNEL")
-    db_upsert_slack_thread(str(conv_id), channel or "", ts)
-
+# ---------- Tiny local "returning guest" counter in learning.db ----------
 def _bump_guest_seen(email: Optional[str]) -> int:
-    """Keep behavior; simple local counter using learning.db."""
+    """Increment and return new seen_count. Returns 1 for first time."""
     if not email:
         return 0
     key = (email or "").strip().lower()
     if not key:
         return 0
-    LEARNING_DB_PATH_LOCAL = os.getenv("LEARNING_DB_PATH", "learning.db")
-    conn = sqlite3.connect(LEARNING_DB_PATH_LOCAL)
+    conn = sqlite3.connect(LEARNING_DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("""
@@ -369,7 +354,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         property_address = str(addr_raw)
 
-    # Conversation context (last few)
+    # Conversation context (last few from Hostaway — still used for AI context)
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
@@ -486,16 +471,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         {
             "type": "context",
             "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"
-                }
+                {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"}
             ],
         },
         {"type": "actions", "elements": actions_elements},
     ]
 
-    # Post to Slack — thread-aware
+    # Post to Slack — ALWAYS as a new parent message (no threading)
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
 
@@ -503,27 +485,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     slack_channel = os.getenv("SLACK_CHANNEL")
 
     try:
-        existing_thread = _get_thread_ts(conv_id)
-
-        if existing_thread:
-            # Post as a reply in the existing Slack thread
-            slack_client.chat_postMessage(
-                channel=slack_channel,
-                thread_ts=existing_thread,
-                blocks=blocks,
-                text="New guest message",
-            )
-        else:
-            # Post the first (parent) message and capture its ts
-            resp = slack_client.chat_postMessage(
-                channel=slack_channel,
-                blocks=blocks,
-                text="New guest message",
-            )
-            ts = (getattr(resp, "data", None) or {}).get("ts") or (resp.get("ts") if isinstance(resp, dict) else None)
-            if ts:
-                _set_thread_ts(conv_id, ts)
-
+        # New parent message every time
+        slack_client.chat_postMessage(
+            channel=slack_channel,
+            blocks=blocks,
+            text="New guest message",
+        )
     except SlackApiError as e:
         logging.error(f"❌ Slack send error: {getattr(e.response, 'data', e)}")
     except Exception as e:
