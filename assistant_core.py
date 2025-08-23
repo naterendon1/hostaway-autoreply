@@ -411,7 +411,18 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
             latest_guest_msg = m["text"].strip()
             break
 
-    # Calendar facts (make sure variables are defined before use)
+    # ----- Arrival/access/pets (NEW) -----
+    today_str = datetime.utcnow().date().isoformat()
+    is_checkin_day = (str(meta.get("check_in") or "")[:10] == today_str)
+
+    ctx_access = meta.get("access") or {}
+    door_code_available = bool((ctx_access.get("door_code") or "").strip())
+
+    pet_allowed = pol.get("pets_allowed")
+    pet_fee = pol.get("pet_fee")
+    pet_deposit_refundable = pol.get("pet_deposit_refundable")
+
+    # ----- Calendar facts -----
     calendar: Dict[str, Any] = {"looked_up": False}
     listing_id = meta.get("listing_id")
     ci = meta.get("check_in")
@@ -436,7 +447,7 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
             if day_after:
                 calendar["day_after_available"] = _is_available(span_payload, day_after)
 
-    # Payments / deposit
+    # ----- Payments / deposit -----
     reservation_id = meta.get("reservation_id")
     listing_map_id = meta.get("listing_map_id") or listing_id
     charges_payload = _fetch_guest_charges(int(reservation_id) if reservation_id else None,
@@ -464,7 +475,19 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
             "summary": payments_summary,
         },
         "deposit_facts": deposit_facts,
-    }
+
+        # ----- NEW fields exposed to the model -----
+        "arrival_context": {
+            "is_checkin_day": is_checkin_day,
+            "door_code_available": door_code_available,
+        },
+        "access": ctx_access,  # e.g., {"door_code": "...", "arrival_instructions": "..."}
+        "pet_policy": {
+            "allowed": pet_allowed,
+            "fee": pet_fee,
+            "deposit_refundable": pet_deposit_refundable,
+        },
+
 
 # ---------- Coercion / normalization for LLM JSON ----------
 _INTENT_SYNONYMS = {
