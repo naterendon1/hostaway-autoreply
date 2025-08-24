@@ -56,7 +56,7 @@ MAX_THREAD_MESSAGES = 10
 
 # ---------- Tiny helpers wired to db.py ----------
 from db import (
-    get_slack_thread as db_get_slack_thread,  # kept for backwards compat (unused when always new thread)
+    get_slack_thread as db_get_slack_thread,  # kept for backwards compat (unused now)
     upsert_slack_thread as db_upsert_slack_thread,
 )
 
@@ -81,7 +81,6 @@ def _bump_guest_seen(email: Optional[str]) -> int:
     key = (email or "").strip().lower()
     if not key:
         return 0
-    LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
     conn = sqlite3.connect(LEARNING_DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -226,17 +225,14 @@ def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optiona
     listing = (listing_obj or {}).get("result") or {}
     reservation = (reservation_obj or {}).get("result") or {}
 
-    # common key candidates
     code = (
         _get(reservation, "doorCode", "door_code", "accessCode", "checkInCode", "entryCode")
         or _get(listing, "doorCode", "door_code", "accessCode", "checkInCode", "entryCode")
     )
-
     arrival_instructions = (
         _get(reservation, "arrivalInstructions", "checkInInstructions", "houseManual", "welcomeMessage")
         or _get(listing, "arrivalInstructions", "checkInInstructions", "houseManual", "welcomeMessage")
     )
-
     return {"door_code": code, "arrival_instructions": arrival_instructions}
 
 def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]:
@@ -244,9 +240,8 @@ def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]
     Try to infer the pet policy from structured fields or free text rules.
     """
     listing = (listing_obj or {}).get("result") or {}
-    # Structured flags if present
     pets_allowed = listing.get("petsAllowed") if "petsAllowed" in listing else None
-    # Fallback to rules text
+
     rules_blob = ""
     for k in ("rules", "houseRules", "description", "summary"):
         v = listing.get(k)
@@ -259,7 +254,6 @@ def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]
         elif "pets allowed" in rules_blob or "pet friendly" in rules_blob:
             pets_allowed = True
 
-    # Fees are property-specific; default to None unless you store them elsewhere
     return {"pets_allowed": pets_allowed, "pet_fee": None, "pet_deposit_refundable": None}
 
 # ---------- Admin endpoints ----------
@@ -418,6 +412,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         property_address = str(addr_raw)
 
+    # Lat/Lng for food/distance recs
+    loc_res = (listing_obj or {}).get("result", {}) or {}
+    lat = loc_res.get("latitude") or loc_res.get("lat")
+    lng = loc_res.get("longitude") or loc_res.get("lng")
+
     # Extract access details & pet policy for AI context
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
@@ -447,13 +446,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     meta_for_ai = {
         "listing_id": (str(listing_id) if listing_id is not None else ""),
         "listing_map_id": listing_id,
-        "reservation_id": reservation_id,
+        "reservation_id": reservation_id,  # FIX: no stray characters
         "check_in": check_in if isinstance(check_in, str) else str(check_in),
         "check_out": check_out if isinstance(check_out, str) else str(check_out),
         "reservation_status": (res.get("status") or "").strip(),  # raw status for guards
         "property_profile": property_profile,
         "policies": policies,
         "access": access,  # NEW: door_code & arrival_instructions if available
+        "location": {"lat": lat, "lng": lng},
     }
 
     ai_json, _unused_blocks = ac_compose(
@@ -492,8 +492,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # Slack blocks
     header_text = (
-        f"*{channel_pretty} message* from *{guest_name}*"
-        f"{' • Returning guest!' if returning_tag else ''}\n"
+        f"*{channel_pretty} message* from *{guest_name}*{returning_tag}\n"
         f"Property: *{property_address}*\n"
         f"Dates: *{us_check_in} → {us_check_out}*\n"
         f"Guests: *{guest_count}* | Res: *{res_status_pretty}* | Price: *{total_price_str}*"
@@ -548,7 +547,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         {"type": "actions", "elements": actions_elements},
     ]
 
-    # Post to Slack — ALWAYS create a new thread/message (no threading by conv_id)
+    # Post to Slack — ALWAYS create a new parent message (no threading by conv_id)
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
 
@@ -556,12 +555,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     slack_channel = os.getenv("SLACK_CHANNEL")
 
     try:
-        resp = slack_client.chat_postMessage(
+        slack_client.chat_postMessage(
             channel=slack_channel,
             blocks=blocks,
             text="New guest message",
         )
-        # We do not store ts anymore since each Hostaway message gets a new Slack parent post
+        # Intentionally not storing ts, since each post is a new top-level message
     except SlackApiError as e:
         logging.error(f"❌ Slack send error: {e.response.data if hasattr(e, 'response') else e}")
     except Exception as e:
