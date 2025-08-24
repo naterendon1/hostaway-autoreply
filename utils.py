@@ -866,17 +866,43 @@ def _apply_contractions(txt: str) -> str:
         s = re.sub(pattern, lambda m: _preserve_case(m.group(0), repl), s, flags=re.IGNORECASE)
     return s
 
-def clean_ai_reply(reply: str) -> str:
-    if not reply:
-        return reply
+def clean_ai_reply(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
 
-    # Trim obvious junk and strip emojis/symbols in U+1F300–U+1FAFF
-    reply = reply.rstrip(",. ").strip()
-    reply = ''.join(
-        c for c in reply
-        if c.isprintable() and not (0x1F300 <= ord(c) <= 0x1FAFF)
-    )
+    # Normalize common smart punctuation & odd spaces
+    trans = str.maketrans({
+        "—": " - ",
+        "–": " - ",
+        "-": "-",    # non-breaking hyphen
+        "‒": "-",
+        "“": '"',
+        "”": '"',
+        "„": '"',
+        "’": "'",
+        "‘": "'",
+        "‹": "'",
+        "›": "'",
+        "…": "...",
+        "\u00A0": " ",   # nbsp
+        "\u2009": " ",   # thin space
+        "\u200A": " ",   # hair space
+        "\u202F": " ",   # narrow no-break space
+        "\u200B": "",    # zero width space
+        "\u2060": "",    # word joiner
+        "\uFEFF": "",    # BOM/ZWNBSP
+    })
+    s = s.translate(trans)
 
+    # Ensure readable spacing around punctuation and hyphens
+    s = re.sub(r"\s*-\s*", " - ", s)                 # normalize hyphen spacing
+    s = re.sub(r"\s*([,.!?;:])\s*", r"\1 ", s)       # one space after punctuation
+    s = re.sub(r"\s{2,}", " ", s)                    # collapse multiple spaces
+
+    # Tidy stray spaces before line breaks
+    s = re.sub(r" \n", "\n", s)
+
+    return s.strip()
     # Seasonal line nuke if not December
     lower_reply = reply.lower()
     holiday_terms = ["enjoy your holidays", "merry christmas", "happy holidays", "happy new year"]
