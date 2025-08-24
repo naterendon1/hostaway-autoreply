@@ -61,6 +61,7 @@ HARD RULES:
 8) Tone: friendly, human, no corporate filler. Avoid repeating info they already know unless it answers their question.
 9) Local food/drink requests: if context includes curated nearby places, recommend 3–6 specific spots with a one-line why each (rating or vibe) and rough travel time. Don’t ask for preferences first.
 10) Keep replies typo-free and natural. Avoid odd hyphenation or missing spaces.
+11) If an estimated subtotal for an extension is provided in context, include it succinctly (e.g., “Rough subtotal for +N nights: USD 540 before taxes/fees.”).
 
 Return only JSON with: intent, confidence, needs_clarification, clarifying_question, reply, citations[], actions{}.
 """
@@ -193,20 +194,37 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
         conn.close()
     return examples
 
-# ---------- Calendar helpers ----------
-def _day_before(date_iso: str) -> Optional[str]:
+# ---------- Date helpers ----------
+def _us_date(iso: Optional[str]) -> str:
     try:
-        d = datetime.fromisoformat(date_iso[:10])
-        return (d - timedelta(days=1)).strftime("%Y-%m-%d")
+        return datetime.fromisoformat((iso or "")[:10]).strftime("%m/%d/%Y")
+    except Exception:
+        return iso or "N/A"
+
+_EXTRA_NIGHTS_RE = re.compile(r'(?:add|extend|extra)\s+(\d+)\s*(?:more\s*)?(?:day|days|night|nights)', re.I)
+
+def _parse_extra_nights(text: str) -> Optional[int]:
+    m = _EXTRA_NIGHTS_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
     except Exception:
         return None
 
-def _day_after(date_iso: str) -> Optional[str]:
+def _daterange(start_iso: str, end_iso: str) -> List[str]:
+    """[start, end) iso dates per night."""
     try:
-        d = datetime.fromisoformat(date_iso[:10])
-        return (d + timedelta(days=1)).strftime("%Y-%m-%d")
+        start = datetime.fromisoformat(start_iso[:10])
+        end = datetime.fromisoformat(end_iso[:10])
     except Exception:
-        return None
+        return []
+    days = []
+    d = start
+    while d < end:
+        days.append(d.strftime("%Y-%m-%d"))
+        d += timedelta(days=1)
+    return days
 
 # ---------- Hostaway helpers ----------
 def _token() -> Optional[str]:
@@ -248,15 +266,37 @@ def _fetch_calendar(listing_id: str, start: str, end: str) -> Dict[str, Any]:
     data = _api_get(f"/listings/{listing_id}/calendar", {"startDate": start, "endDate": end})
     return {"ok": bool(data), "data": data or {}}
 
-def _is_available(payload: Dict[str, Any], day: str) -> bool:
+def _calendar_days(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract list of day dicts from varied Hostaway calendar response shapes."""
     try:
         data = payload.get("data") or {}
         result = data.get("result")
         if isinstance(result, dict):
-            days = result.get("calendar", [])
-        else:
-            days = result or data if isinstance(result, list) else []
-        for d in days:
+            return result.get("calendar", []) or []
+        if isinstance(result, list):
+            return result
+        # some responses might place list directly under data
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
+
+def _extract_rate_from_day(day: Dict[str, Any]) -> Optional[float]:
+    """Best-effort: look for any nightly rate-looking field on a calendar day."""
+    for k in ("price", "dailyRate", "rate", "priceNative", "nightly", "baseDailyRate"):
+        v = day.get(k)
+        try:
+            f = float(v)
+            if f >= 0:
+                return f
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def _is_available(payload: Dict[str, Any], day: str) -> bool:
+    try:
+        for d in _calendar_days(payload):
             if str(d.get("date")) == day:
                 if "isAvailable" in d:
                     return bool(d["isAvailable"])
@@ -266,6 +306,30 @@ def _is_available(payload: Dict[str, Any], day: str) -> bool:
         return False
     except Exception:
         return False
+
+def _estimate_extension_from_calendar(listing_id: str, start: str, end: str) -> Dict[str, Any]:
+    """
+    Try to price nights [start, end) from calendar daily rates.
+    Returns {"ok": bool, "nights": [...], "subtotal": float | None, "breakdown": [{"date":, "rate":}]}
+    """
+    payload = _fetch_calendar(listing_id, start, end)
+    nights = _daterange(start, end)
+    if not payload.get("ok") or not nights:
+        return {"ok": False, "nights": nights, "subtotal": None, "breakdown": []}
+
+    day_list = _calendar_days(payload)
+    day_map = {str(d.get("date")): _extract_rate_from_day(d) for d in day_list}
+    breakdown = []
+    subtotal = 0.0
+    complete = True
+    for n in nights:
+        rate = day_map.get(n)
+        if rate is None:
+            complete = False
+        else:
+            subtotal += float(rate)
+        breakdown.append({"date": n, "rate": rate})
+    return {"ok": True, "nights": nights, "subtotal": subtotal if complete else None, "breakdown": breakdown}
 
 # ---------- Guest charges integration ----------
 CHARGE_DEPOSIT_HINTS = ("deposit", "hold")
@@ -336,6 +400,10 @@ _FOOD = [
     "dinner","lunch","breakfast","brunch","coffee","restaurant","eat","food",
     "bbq","barbecue","italian","pizza","sandwich","deli","tacos","seafood","burger"
 ]
+_CODE_PHRASES = [
+    "door code","keypad","lock code","entry code","code to the door","code for the door",
+    "front door code","gate code","smart lock"
+]
 
 def _detect_intent(msg: str) -> Intent:
     m = (msg or "").lower()
@@ -343,7 +411,7 @@ def _detect_intent(msg: str) -> Intent:
         return Intent.early_check_in
     if any(w in m for w in _LCO):
         return Intent.late_checkout
-    if "extend" in m or "extra night" in m or "stay longer" in m:
+    if "extend" in m or "extra night" in m or "stay longer" in m or re.search(_EXTRA_NIGHTS_RE, m or ""):
         return Intent.extend_stay
     if any(w in m for w in _FOOD):
         return Intent.food_recs
@@ -452,7 +520,6 @@ def _build_food_recs(lat: Optional[float], lng: Optional[float]) -> List[Dict[st
         picks = _places_nearby(lat, lng, kw, max_results=4)
         if not picks:
             continue
-        # choose the top one for variety
         top = picks[0]
         all_picks.append({"label": label, **top})
 
@@ -552,6 +619,40 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
     if intent_guess == Intent.food_recs and lat and lng and GOOGLE_PLACES_API_KEY:
         food_recs = _build_food_recs(float(lat), float(lng))
 
+    # --- Dates & extension context ---
+    ci_iso = (str(ci)[:10] if isinstance(ci, str) else (str(ci)[:10] if ci else ""))
+    co_iso = (str(co)[:10] if isinstance(co, str) else (str(co)[:10] if co else ""))
+    nights = None
+    try:
+        if ci_iso and co_iso:
+            nights = (datetime.fromisoformat(co_iso) - datetime.fromisoformat(ci_iso)).days
+    except Exception:
+        nights = None
+
+    extra_nights = _parse_extra_nights(latest_guest_msg or guest_message)
+    new_co_iso = None
+    new_co_us = None
+    if extra_nights and co_iso:
+        try:
+            new_co_iso = (datetime.fromisoformat(co_iso) + timedelta(days=extra_nights)).strftime("%Y-%m-%d")
+            new_co_us = _us_date(new_co_iso)
+        except Exception:
+            pass
+
+    # --- Extension pricing (best-effort nightly-rate lookup) ---
+    currency_guess = (deposit_facts.get("currency") if isinstance(deposit_facts, dict) else None) or "USD"
+    ext_quote: Dict[str, Any] = {"subtotal": None, "nightly_breakdown": [], "currency": currency_guess}
+
+    if extra_nights and co_iso and new_co_iso and listing_id:
+        cal_quote = _estimate_extension_from_calendar(str(listing_id), co_iso, new_co_iso)
+        if cal_quote.get("ok") and cal_quote.get("subtotal") is not None:
+            ext_quote["subtotal"] = float(cal_quote["subtotal"])
+            ext_quote["nightly_breakdown"] = cal_quote["breakdown"]
+        else:
+            # Fallback: rough average nightly rate if we know existing trip total & nights (not passed here),
+            # so we keep this minimal to avoid extra API calls; leave subtotal None if unknown.
+            pass
+
     return {
         "profile": prof,
         "policies": pol,
@@ -582,6 +683,21 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
         },
         "location": {"lat": lat, "lng": lng},
         "food_recs": food_recs,  # structured picks for direct formatting
+
+        # Dates block for smarter replies
+        "dates": {
+            "check_in": ci_iso,
+            "check_out": co_iso,
+            "check_in_us": _us_date(ci_iso),
+            "check_out_us": _us_date(co_iso),
+            "nights": nights,
+        },
+        "extension": {
+            "extra_nights_requested": extra_nights,
+            "new_check_out": new_co_iso,
+            "new_check_out_us": new_co_us,
+            "quote": ext_quote,
+        },
     }
 
 # ---------- Coercion / normalization for LLM JSON ----------
@@ -665,15 +781,16 @@ def _llm(system_prompt: str, ctx: Dict[str, Any]) -> AIResponse:
 def _polish(text: str) -> str:
     if not text:
         return text
-    # Fix common missing-space glitches you observed
     fixes = {
-        "openwould": "open — would",
+        "openwould": "open would",
+        "open—would": "open — would",
         "AMif": "AM — if",
         "PMif": "PM — if",
         "knowcongratulations": "know — congratulations",
     }
     for k, v in fixes.items():
         text = text.replace(k, v)
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
     text = re.sub(r"\s{2,}", " ", text).strip()
     return text
 
@@ -684,7 +801,7 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
     latest = (ctx.get("latest_guest_message") or "").lower()
     text = ai.reply or ""
 
-    # If we have curated food recs, prefer deterministic formatting over the model's generic response
+    # If we have curated food recs, prefer deterministic formatting
     curated = ctx.get("food_recs") or []
     if curated:
         formatted = _format_food_recs(curated)
@@ -693,7 +810,21 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
             ai.needs_clarification = False
             ai.clarifying_question = ""
             ai.reply = _polish(formatted)
-            return ai  # short-circuit: we’re done
+            return ai  # done
+
+    # Door code hard-guard
+    if any(phrase in latest for phrase in _CODE_PHRASES):
+        arr = (ctx.get("arrival_context") or {})
+        acc = (ctx.get("access") or {})
+        code = (acc.get("door_code") or "").strip()
+        if arr.get("is_checkin_day") and code:
+            text = f"Your door code is {code}. After entering, press # to confirm."
+            ai.needs_clarification = False
+            ai.clarifying_question = ""
+        else:
+            text = "I’ll send the full arrival instructions (including the code) closer to your check-in."
+            ai.needs_clarification = False
+            ai.clarifying_question = ""
 
     if status in {"cancelled", "expired", "declined"}:
         text = "This reservation isn’t active. I can share available dates or set you up with a new booking."
@@ -712,30 +843,46 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
             text = "I can hold this while payment is completed. Once that’s done, I’ll confirm right away."
 
     if ai.intent in (Intent.early_check_in, Intent.late_checkout, Intent.extend_stay):
-        ci, co = prof.get("checkin_time", DEFAULT_CHECKIN), prof.get("checkout_time", DEFAULT_CHECKOUT)
+        ci_time, co_time = prof.get("checkin_time", DEFAULT_CHECKIN), prof.get("checkout_time", DEFAULT_CHECKOUT)
         cal = ctx.get("calendar") or {}
         checkin_avail = cal.get("checkin_available")
         checkout_avail = cal.get("checkout_available")
         day_after_open = cal.get("day_after_available")
 
         if ai.intent == Intent.early_check_in:
-            text = f"Standard check-in is {ci}."
+            text = f"Standard check-in is {ci_time}."
             if checkin_avail:
                 text += f" I can request early check-in if the schedule allows (typically ${pol.get('early_checkin_fee', EARLY_FEE)})."
             else:
                 text += " The night before is booked, so early check-in may not be possible."
         elif ai.intent == Intent.late_checkout:
-            text = f"Check-out is {co}."
+            text = f"Check-out is {co_time}."
             if checkout_avail:
                 text += f" I can request late checkout if possible (typically ${pol.get('late_checkout_fee', LATE_FEE)})."
             else:
                 text += " The next guest arrives the same day, so late checkout may not be possible."
-        else:
-            text = "I can check an extension for you and confirm if the dates are open."
-
-        ai.needs_clarification = True
-        ai.clarifying_question = ai.clarifying_question or "What time are you hoping for?"
-        ai.actions.check_calendar = True
+        else:  # extend_stay
+            d = ctx.get("dates") or {}
+            ext = ctx.get("extension") or {}
+            ci_us = d.get("check_in_us") or "your current check-in date"
+            co_us = d.get("check_out_us") or "your current check-out date"
+            extra = ext.get("extra_nights_requested")
+            new_co_us = ext.get("new_check_out_us")
+            base = f"You're booked {ci_us}–{co_us}. "
+            if extra and new_co_us:
+                base += f"Adding {extra} more night(s) would take you to {new_co_us}. "
+            # If we have an estimated subtotal, include it
+            quote = (ext.get("quote") or {})
+            subtotal = quote.get("subtotal")
+            currency = (quote.get("currency") or "USD").upper()
+            if subtotal is not None:
+                # Format money as whole number; adjust if you prefer cents
+                base += f"Rough subtotal for {extra} night(s): {currency} {subtotal:,.0f} before taxes/fees. "
+            base += "I can check availability and send the exact quote."
+            text = base
+            ai.needs_clarification = True
+            ai.clarifying_question = "Want me to proceed and send the quote?"
+            ai.actions.check_calendar = True
 
         if (ai.intent in (Intent.early_check_in, Intent.late_checkout)) and day_after_open:
             text += " By the way, the night after is open—would you like me to check if extending your stay works?"
@@ -762,7 +909,7 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
 
     if mentions_deposit:
         amount = dep.get("amount")
-        currency = dep.get("currency") or "USD"
+        currency = (dep.get("currency") or "USD").upper()
         status_dep = (dep.get("status") or "").lower()
         release = dep.get("holdReleaseDate")
         active_hold = bool(dep.get("active_hold"))
@@ -783,6 +930,14 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
                 text = "It’s a refundable hold processed before arrival."
         if not wants_link:
             text = re.sub(r"https?://\S+", "", text).strip()
+
+    # If we already have dates, never ask the guest to repeat them
+    have_dates = bool((ctx.get("dates") or {}).get("check_in")) and bool((ctx.get("dates") or {}).get("check_out"))
+    if have_dates:
+        if re.search(r'\b(what|which|share|send|provide).{0,30}\bdate', (ai.reply or ""), re.I):
+            text = re.sub(r'(?is)\b(what|which|share|send|provide).{0,80}\bdate(s)?\??\.?', '', text).strip()
+        if re.search(r'\b(what|which|share|send|provide).{0,30}\bdate', (ai.clarifying_question or ""), re.I):
+            ai.clarifying_question = "Want me to proceed and send the quote?"
 
     ai.reply = _polish(text.strip())
     return ai
