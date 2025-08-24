@@ -365,6 +365,34 @@ async def slack_actions(
             background_tasks.add_task(_background_send_and_update, meta, reply_text)
             return JSONResponse({"response_action": "clear"})
 
+        # inside your block_actions handler
+        if action_id == "edit":
+            meta = json.loads(action["value"])
+            initial = meta.get("ai_suggestion", "")
+            client.views_open(
+                trigger_id=payload["trigger_id"],
+                view={
+                    "type": "modal",
+                    "callback_id": "edit_ai_reply",
+                    "title": {"type": "plain_text", "text": "Edit reply"},
+                    "submit": {"type": "plain_text", "text": "Send"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "private_metadata": json.dumps(meta),
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "msg",
+                            "label": {"type": "plain_text", "text": "Message to guest"},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "text",
+                                "multiline": True,
+                                "initial_value": initial[:3000],
+                            },
+                        }
+                    ],
+                },
+            )
         # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
