@@ -517,9 +517,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         },
         {
             "type": "button",
-            "text": {"type": "plain_text", "text": "🙈 Ignore"},
-            "value": json.dumps({**button_meta, "action": "ignore"}),
-            "action_id": "ignore",
+            "text": {"type": "plain_text", "text": "✏️ Edit"},
+            "value": json.dumps({**button_meta, "action": "edit"}),
+            "action_id": "edit",
         },
     ]
     if show_payment_button:
