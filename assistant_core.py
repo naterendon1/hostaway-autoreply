@@ -9,9 +9,10 @@ import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
-from pydantic import BaseModel, Field, ValidationError, conlist
+from pydantic import BaseModel, Field, ValidationError
 from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +32,7 @@ DEFAULT_CHECKIN = os.getenv("DEFAULT_CHECKIN_TIME", "4:00 PM")
 DEFAULT_CHECKOUT = os.getenv("DEFAULT_CHECKOUT_TIME", "11:00 AM")
 EARLY_FEE = int(os.getenv("EARLY_CHECKIN_FEE", "50"))
 LATE_FEE = int(os.getenv("LATE_CHECKOUT_FEE", "50"))
+PROPERTY_TZ = os.getenv("PROPERTY_TZ", "")  # optional IANA time zone, e.g., "America/Chicago"
 
 RES_STATUS_ALLOWED = [
     "new", "modified", "cancelled", "ownerStay", "pending", "awaitingPayment",
@@ -89,8 +91,24 @@ class AIResponse(BaseModel):
     needs_clarification: bool
     clarifying_question: str
     reply: str
-    citations: conlist(str, max_length=10) = []
+    citations: List[str] = Field(default_factory=list)  # safe default
     actions: Actions
+
+# ---------- Small utils ----------
+def _to_int(val) -> Optional[int]:
+    try:
+        return int(val) if val is not None and str(val).strip() != "" else None
+    except Exception:
+        return None
+
+def _today_iso_local(tz_name: Optional[str]) -> str:
+    """Return today's date in ISO (YYYY-MM-DD) in the given IANA time zone, fallback to UTC."""
+    try:
+        if tz_name:
+            return datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    except Exception:
+        pass
+    return datetime.utcnow().date().isoformat()
 
 # ---------- Learning store ----------
 def _init_db(path: str = LEARNING_DB_PATH) -> None:
@@ -412,7 +430,8 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
             break
 
     # ----- Arrival/access/pets (NEW) -----
-    today_str = datetime.utcnow().date().isoformat()
+    tz_hint = meta.get("tz") or PROPERTY_TZ or None
+    today_str = _today_iso_local(tz_hint)
     is_checkin_day = (str(meta.get("check_in") or "")[:10] == today_str)
 
     ctx_access = meta.get("access") or {}
@@ -448,10 +467,10 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
                 calendar["day_after_available"] = _is_available(span_payload, day_after)
 
     # ----- Payments / deposit -----
-    reservation_id = meta.get("reservation_id")
-    listing_map_id = meta.get("listing_map_id") or listing_id
-    charges_payload = _fetch_guest_charges(int(reservation_id) if reservation_id else None,
-                                           int(listing_map_id) if listing_map_id else None)
+    reservation_id = _to_int(meta.get("reservation_id"))
+    listing_map_id = _to_int(meta.get("listing_map_id")) or _to_int(listing_id)
+
+    charges_payload = _fetch_guest_charges(reservation_id, listing_map_id)
     charges = charges_payload.get("result", [])
     deposit_facts = _extract_deposit_facts(charges)
     payments_summary = _summarize_charges(charges)
@@ -488,7 +507,6 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
             "deposit_refundable": pet_deposit_refundable,
         },
     }
-
 
 # ---------- Coercion / normalization for LLM JSON ----------
 _INTENT_SYNONYMS = {
@@ -691,7 +709,7 @@ def compose_reply(
     """
     meta expects (as available):
       listing_id, listing_map_id, reservation_id, reservation_status, check_in, check_out,
-      property_profile, policies
+      property_profile, policies, tz (optional IANA time zone)
     """
     _init_db()
     ctx = _context(guest_message, conversation_history, meta)
