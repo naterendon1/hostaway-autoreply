@@ -9,10 +9,9 @@ import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import requests
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, conlist
 from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +31,9 @@ DEFAULT_CHECKIN = os.getenv("DEFAULT_CHECKIN_TIME", "4:00 PM")
 DEFAULT_CHECKOUT = os.getenv("DEFAULT_CHECKOUT_TIME", "11:00 AM")
 EARLY_FEE = int(os.getenv("EARLY_CHECKIN_FEE", "50"))
 LATE_FEE = int(os.getenv("LATE_CHECKOUT_FEE", "50"))
-PROPERTY_TZ = os.getenv("PROPERTY_TZ", "")  # optional IANA time zone, e.g., "America/Chicago"
+
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+GOOGLE_DISTANCE_MATRIX_API_KEY = os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY")
 
 RES_STATUS_ALLOWED = [
     "new", "modified", "cancelled", "ownerStay", "pending", "awaitingPayment",
@@ -58,6 +59,8 @@ HARD RULES:
    - If they ask “is it $X?”, answer the exact amount from context and note if it’s a refundable hold.
 7) Events: acknowledge and offer help only if it adds value (parking, local tips).
 8) Tone: friendly, human, no corporate filler. Avoid repeating info they already know unless it answers their question.
+9) Local food/drink requests: if context includes curated nearby places, recommend 3–6 specific spots with a one-line why each (rating or vibe) and rough travel time. Don’t ask for preferences first.
+10) Keep replies typo-free and natural. Avoid odd hyphenation or missing spaces.
 
 Return only JSON with: intent, confidence, needs_clarification, clarifying_question, reply, citations[], actions{}.
 """
@@ -76,6 +79,7 @@ class Intent(str, Enum):
     rules = "rules"
     checkin_help = "checkin_help"
     checkout_help = "checkout_help"
+    food_recs = "food_recs"     # NEW
     other = "other"
 
 class Actions(BaseModel):
@@ -91,58 +95,22 @@ class AIResponse(BaseModel):
     needs_clarification: bool
     clarifying_question: str
     reply: str
-    citations: List[str] = Field(default_factory=list)  # safe default
+    citations: conlist(str, max_length=10) = []
     actions: Actions
-
-# ---------- Small utils ----------
-def _to_int(val) -> Optional[int]:
-    try:
-        return int(val) if val is not None and str(val).strip() != "" else None
-    except Exception:
-        return None
-
-def _today_iso_local(tz_name: Optional[str]) -> str:
-    """Return today's date in ISO (YYYY-MM-DD) in the given IANA time zone, fallback to UTC."""
-    try:
-        if tz_name:
-            return datetime.now(ZoneInfo(tz_name)).date().isoformat()
-    except Exception:
-        pass
-    return datetime.utcnow().date().isoformat()
 
 # ---------- Learning store ----------
 def _init_db(path: str = LEARNING_DB_PATH) -> None:
-    """
-    Create/upgrade the learning_examples table safely across old/new schemas.
-    NOTE: SQLite does not allow parameter placeholders in DDL; build statements directly.
-    """
     conn = sqlite3.connect(path)
     cur = conn.cursor()
-
-    # Ensure table exists (minimal form)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS learning_examples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT
-        )
-    """)
+    cur.execute("""CREATE TABLE IF NOT EXISTS learning_examples (id INTEGER PRIMARY KEY AUTOINCREMENT)""")
     conn.commit()
-
-    # Inspect current columns
     cur.execute("PRAGMA table_info(learning_examples)")
     cols = {row[1] for row in cur.fetchall()}
-
-    # Add missing columns for new schema
-    if "intent" not in cols:
-        cur.execute("ALTER TABLE learning_examples ADD COLUMN intent TEXT")
-    if "question" not in cols:
-        cur.execute("ALTER TABLE learning_examples ADD COLUMN question TEXT")
-    if "answer" not in cols:
-        cur.execute("ALTER TABLE learning_examples ADD COLUMN answer TEXT")
-    if "created_at" not in cols:
-        cur.execute("ALTER TABLE learning_examples ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP")
+    if "intent" not in cols:     cur.execute("ALTER TABLE learning_examples ADD COLUMN intent TEXT")
+    if "question" not in cols:   cur.execute("ALTER TABLE learning_examples ADD COLUMN question TEXT")
+    if "answer" not in cols:     cur.execute("ALTER TABLE learning_examples ADD COLUMN answer TEXT")
+    if "created_at" not in cols: cur.execute("ALTER TABLE learning_examples ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP")
     conn.commit()
-
-    # If old columns exist, backfill once
     if {"guest_message", "ai_suggestion"}.issubset(cols):
         cur.execute("""
             UPDATE learning_examples
@@ -152,12 +120,10 @@ def _init_db(path: str = LEARNING_DB_PATH) -> None:
                OR (answer   IS NULL OR answer   = '')
         """)
         conn.commit()
-
     conn.close()
 
 def _ensure_learning_schema(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
-    # Create if missing (new schema)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS learning_examples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,11 +133,8 @@ def _ensure_learning_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Check existing columns
     cur.execute("PRAGMA table_info(learning_examples)")
     cols = {row[1] for row in cur.fetchall()}
-
-    # Add missing columns if running against an old table
     if "question" not in cols:
         try: cur.execute("ALTER TABLE learning_examples ADD COLUMN question TEXT")
         except Exception: pass
@@ -181,7 +144,6 @@ def _ensure_learning_schema(conn: sqlite3.Connection) -> None:
     if "intent" not in cols:
         try: cur.execute("ALTER TABLE learning_examples ADD COLUMN intent TEXT")
         except Exception: pass
-
     conn.commit()
 
 def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
@@ -189,16 +151,11 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
     conn.row_factory = sqlite3.Row
     _ensure_learning_schema(conn)
     cur = conn.cursor()
-
-    # Inspect columns to choose the right query
     cur.execute("PRAGMA table_info(learning_examples)")
     cols = {row[1] for row in cur.fetchall()}
-
     examples: List[Dict[str, str]] = []
-
     try:
         if {"question", "answer"}.issubset(cols):
-            # New schema
             cur.execute(
                 """
                 SELECT COALESCE(intent,'') AS intent,
@@ -213,9 +170,7 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
             )
             rows = cur.fetchall()
             examples = [{"intent": r["intent"], "question": r["question"], "answer": r["answer"]} for r in rows]
-
         elif {"guest_message", "ai_suggestion", "user_reply"}.issubset(cols):
-            # Old schema → map to new field names
             cur.execute(
                 """
                 SELECT COALESCE(guest_message,'') AS guest_message,
@@ -234,13 +189,8 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
                 "question": r["guest_message"],
                 "answer": r["user_reply"] or r["ai_suggestion"]
             } for r in rows]
-        else:
-            # Unknown/mixed schema → return empty gracefully
-            examples = []
-
     finally:
         conn.close()
-
     return examples
 
 # ---------- Calendar helpers ----------
@@ -340,15 +290,12 @@ def _extract_deposit_facts(charges: List[Dict[str, Any]]) -> Dict[str, Any]:
         desc = (ch.get("description") or "").lower()
         if typ == "preauth" or any(k in title or k in desc for k in CHARGE_DEPOSIT_HINTS):
             candidates.append(ch)
-
     def _key(ch):
         return (ch.get("scheduledDate") or "", ch.get("chargeDate") or "", ch.get("id") or 0)
-
     candidates.sort(key=_key, reverse=True)
     dep = candidates[0] if candidates else None
     if not dep:
         return {"present": False}
-
     status = (dep.get("status") or "").lower()
     facts = {
         "present": True,
@@ -385,6 +332,10 @@ _EVENTS = ["lone star rally", "lone star bike rally", "mardi gras", "spring brea
 _REST = ["restaurant", "stingaree", "stingray", "marina"]
 _DEP_LINK = ["link", "portal", "send link", "pay now", "payment link"]
 _DEP_AMT = ["how much", "amount", "$", "is the security deposit", "is deposit", "deposit $"]
+_FOOD = [
+    "dinner","lunch","breakfast","brunch","coffee","restaurant","eat","food",
+    "bbq","barbecue","italian","pizza","sandwich","deli","tacos","seafood","burger"
+]
 
 def _detect_intent(msg: str) -> Intent:
     m = (msg or "").lower()
@@ -394,6 +345,8 @@ def _detect_intent(msg: str) -> Intent:
         return Intent.late_checkout
     if "extend" in m or "extra night" in m or "stay longer" in m:
         return Intent.extend_stay
+    if any(w in m for w in _FOOD):
+        return Intent.food_recs
     if "how far" in m or "distance" in m or "drive time" in m:
         return Intent.directions
     if "deposit" in m or "security deposit" in m:
@@ -404,7 +357,7 @@ def _detect_intent(msg: str) -> Intent:
         return Intent.directions
     return Intent.other
 
-# ---------- Context ----------
+# ---------- Context scaffolding ----------
 def _profile(meta: Dict[str, Any]) -> Dict[str, Any]:
     p = (meta.get("property_profile") or {}).copy()
     p.setdefault("checkin_time", DEFAULT_CHECKIN)
@@ -417,21 +370,133 @@ def _policies(meta: Dict[str, Any]) -> Dict[str, Any]:
     pol.setdefault("late_checkout_fee", LATE_FEE)
     return pol
 
+# ---------- Google Places helpers ----------
+def _places_nearby(lat: float, lng: float, keyword: str, max_results: int = 4) -> List[Dict[str, Any]]:
+    if not GOOGLE_PLACES_API_KEY:
+        return []
+    url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    params = {
+        "location": f"{lat},{lng}",
+        "radius": 8000,  # ~5 miles
+        "type": "restaurant",
+        "keyword": keyword,
+        "key": GOOGLE_PLACES_API_KEY,
+        "opennow": False,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        data = r.json()
+        results = data.get("results", [])
+        # Filter for "highly rated"
+        filtered = []
+        for p in results:
+            rating = float(p.get("rating") or 0)
+            reviews = int(p.get("user_ratings_total") or 0)
+            if rating >= 4.3 and reviews >= 150:
+                filtered.append({
+                    "name": p.get("name"),
+                    "rating": rating,
+                    "reviews": reviews,
+                    "price_level": p.get("price_level"),
+                    "lat": p.get("geometry", {}).get("location", {}).get("lat"),
+                    "lng": p.get("geometry", {}).get("location", {}).get("lng"),
+                })
+        # Sort by rating then reviews
+        filtered.sort(key=lambda x: (x["rating"], x["reviews"]), reverse=True)
+        return filtered[:max_results]
+    except Exception as e:
+        logging.error(f"Places nearby error for {keyword}: {e}")
+        return []
+
+def _distance_matrix(lat: float, lng: float, dests: List[Tuple[float, float]]) -> List[Dict[str, str]]:
+    if not dests or not GOOGLE_DISTANCE_MATRIX_API_KEY:
+        return []
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {
+        "origins": f"{lat},{lng}",
+        "destinations": "|".join([f"{d[0]},{d[1]}" for d in dests]),
+        "mode": "driving",
+        "units": "imperial",
+        "key": GOOGLE_DISTANCE_MATRIX_API_KEY,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        data = r.json()
+        rows = data.get("rows", [])
+        if not rows:
+            return []
+        els = rows[0].get("elements", [])
+        out = []
+        for el in els:
+            dist = (el.get("distance") or {}).get("text")
+            dur = (el.get("duration") or {}).get("text")
+            out.append({"distance": dist, "duration": dur})
+        return out
+    except Exception as e:
+        logging.error(f"Distance matrix error: {e}")
+        return []
+
+def _build_food_recs(lat: Optional[float], lng: Optional[float]) -> List[Dict[str, Any]]:
+    """Return a list of {label, name, rating, reviews, distance, duration} buckets."""
+    if not (lat and lng):
+        return []
+
+    categories = [
+        ("BBQ", "bbq barbecue"),
+        ("Italian", "italian pizza"),
+        ("Sandwich", "sandwich deli"),
+        ("Breakfast/Coffee", "breakfast brunch coffee"),
+    ]
+    all_picks: List[Dict[str, Any]] = []
+    for label, kw in categories:
+        picks = _places_nearby(lat, lng, kw, max_results=4)
+        if not picks:
+            continue
+        # choose the top one for variety
+        top = picks[0]
+        all_picks.append({"label": label, **top})
+
+    # Add distances in a single batch call
+    dests = [(p["lat"], p["lng"]) for p in all_picks if p.get("lat") and p.get("lng")]
+    dists = _distance_matrix(lat, lng, dests) if dests else []
+    for i, p in enumerate(all_picks):
+        if i < len(dists):
+            p["distance"] = dists[i].get("distance")
+            p["duration"] = dists[i].get("duration")
+    return all_picks
+
+def _format_food_recs(recs: List[Dict[str, Any]]) -> str:
+    if not recs:
+        return ""
+    lines = []
+    for r in recs:
+        parts = []
+        if r.get("label"):
+            parts.append(f"{r['label']}:")
+        line = f"{' '.join(parts)} {r['name']} — {r['rating']:.1f}★"
+        if r.get("reviews"):
+            line += f" ({int(r['reviews']):,})"
+        if r.get("duration"):
+            line += f", ~{r['duration']}"
+        elif r.get("distance"):
+            line += f", {r['distance']}"
+        lines.append(line)
+    return "Here are a few solid nearby picks:\n" + "\n".join(f"- {ln}" for ln in lines)
+
+# ---------- Context ----------
 def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, Any]) -> Dict[str, Any]:
     prof = _profile(meta)
     pol = _policies(meta)
     learned = _similar_examples(guest_message, 3)
 
-    # Latest guest message in history
     latest_guest_msg = None
     for m in reversed(history or []):
         if (m.get("role") or "").lower() == "guest" and (m.get("text") or "").strip():
             latest_guest_msg = m["text"].strip()
             break
 
-    # ----- Arrival/access/pets (NEW) -----
-    tz_hint = meta.get("tz") or PROPERTY_TZ or None
-    today_str = _today_iso_local(tz_hint)
+    # Arrival/access/pets
+    today_str = datetime.utcnow().date().isoformat()
     is_checkin_day = (str(meta.get("check_in") or "")[:10] == today_str)
 
     ctx_access = meta.get("access") or {}
@@ -441,7 +506,7 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
     pet_fee = pol.get("pet_fee")
     pet_deposit_refundable = pol.get("pet_deposit_refundable")
 
-    # ----- Calendar facts -----
+    # Calendar facts
     calendar: Dict[str, Any] = {"looked_up": False}
     listing_id = meta.get("listing_id")
     ci = meta.get("check_in")
@@ -453,7 +518,6 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
         calendar["checkin_available"] = _is_available(cal_payload, ci) if calendar["looked_up"] else None
         calendar["checkout_available"] = _is_available(cal_payload, co) if calendar["looked_up"] else None
 
-        # Also peek at the day before/after to enable upsell logic
         day_before = _day_before(ci)
         day_after = _day_after(co)
         if day_before or day_after:
@@ -466,17 +530,27 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
             if day_after:
                 calendar["day_after_available"] = _is_available(span_payload, day_after)
 
-    # ----- Payments / deposit -----
-    reservation_id = _to_int(meta.get("reservation_id"))
-    listing_map_id = _to_int(meta.get("listing_map_id")) or _to_int(listing_id)
-
-    charges_payload = _fetch_guest_charges(reservation_id, listing_map_id)
+    # Payments / deposit
+    reservation_id = meta.get("reservation_id")
+    listing_map_id = meta.get("listing_map_id") or listing_id
+    charges_payload = _fetch_guest_charges(int(reservation_id) if reservation_id else None,
+                                           int(listing_map_id) if listing_map_id else None)
     charges = charges_payload.get("result", [])
     deposit_facts = _extract_deposit_facts(charges)
     payments_summary = _summarize_charges(charges)
 
     status = (meta.get("reservation_status") or "").strip()
     intent_guess = _detect_intent(latest_guest_msg or guest_message)
+
+    # Location for Places
+    loc = meta.get("location") or {}
+    lat = loc.get("lat")
+    lng = loc.get("lng")
+
+    # Build food recs if asked and we have location + keys
+    food_recs: List[Dict[str, Any]] = []
+    if intent_guess == Intent.food_recs and lat and lng and GOOGLE_PLACES_API_KEY:
+        food_recs = _build_food_recs(float(lat), float(lng))
 
     return {
         "profile": prof,
@@ -495,17 +569,19 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
         },
         "deposit_facts": deposit_facts,
 
-        # ----- NEW fields exposed to the model -----
+        # Exposed to the model
         "arrival_context": {
             "is_checkin_day": is_checkin_day,
             "door_code_available": door_code_available,
         },
-        "access": ctx_access,  # e.g., {"door_code": "...", "arrival_instructions": "..."}
+        "access": ctx_access,
         "pet_policy": {
             "allowed": pet_allowed,
             "fee": pet_fee,
             "deposit_refundable": pet_deposit_refundable,
         },
+        "location": {"lat": lat, "lng": lng},
+        "food_recs": food_recs,  # structured picks for direct formatting
     }
 
 # ---------- Coercion / normalization for LLM JSON ----------
@@ -516,40 +592,31 @@ _INTENT_SYNONYMS = {
     "question_general": "question",
     "checkin": "checkin_help",
     "checkout": "checkout_help",
+    "restaurants": "food_recs",
+    "food": "food_recs",
 }
 
 def _coerce_ai_json(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize LLM JSON so Pydantic validation won't fail on minor variations."""
     out = dict(d or {})
-
-    # intent mapping
     intent = str(out.get("intent", "other") or "other").lower()
     intent = _INTENT_SYNONYMS.get(intent, intent)
     if intent not in {i.value for i in Intent}:
         intent = "other"
     out["intent"] = intent
-
-    # booleans / numbers
     out["needs_clarification"] = bool(out.get("needs_clarification", False))
     try:
         out["confidence"] = float(out.get("confidence", 0.6))
     except Exception:
         out["confidence"] = 0.6
-
-    # strings
     cq = out.get("clarifying_question")
     out["clarifying_question"] = "" if cq is None else str(cq)
     rep = out.get("reply")
     out["reply"] = "" if rep is None else str(rep)
-
-    # citations: list of strings, ≤10
     cits = out.get("citations")
     if not isinstance(cits, list):
         cits = []
     cits = [str(x) for x in cits][:10]
     out["citations"] = cits
-
-    # actions object
     actions = out.get("actions")
     if not isinstance(actions, dict):
         actions = {}
@@ -560,7 +627,6 @@ def _coerce_ai_json(d: Dict[str, Any]) -> Dict[str, Any]:
         "log_issue": bool(actions.get("log_issue", False)),
         "tag_learning_example": bool(actions.get("tag_learning_example", False)),
     }
-
     return out
 
 # ---------- LLM call + validation ----------
@@ -595,12 +661,39 @@ def _llm(system_prompt: str, ctx: Dict[str, Any]) -> AIResponse:
         actions=Actions(),
     )
 
+# ---------- Text polish ----------
+def _polish(text: str) -> str:
+    if not text:
+        return text
+    # Fix common missing-space glitches you observed
+    fixes = {
+        "openwould": "open — would",
+        "AMif": "AM — if",
+        "PMif": "PM — if",
+        "knowcongratulations": "know — congratulations",
+    }
+    for k, v in fixes.items():
+        text = text.replace(k, v)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
+
 # ---------- Guardrails ----------
 def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
     prof, pol = ctx.get("profile", {}), ctx.get("policies", {})
     status = (ctx.get("reservation_status") or "").lower()
     latest = (ctx.get("latest_guest_message") or "").lower()
     text = ai.reply or ""
+
+    # If we have curated food recs, prefer deterministic formatting over the model's generic response
+    curated = ctx.get("food_recs") or []
+    if curated:
+        formatted = _format_food_recs(curated)
+        if formatted:
+            ai.intent = Intent.food_recs
+            ai.needs_clarification = False
+            ai.clarifying_question = ""
+            ai.reply = _polish(formatted)
+            return ai  # short-circuit: we’re done
 
     if status in {"cancelled", "expired", "declined"}:
         text = "This reservation isn’t active. I can share available dates or set you up with a new booking."
@@ -620,7 +713,6 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
 
     if ai.intent in (Intent.early_check_in, Intent.late_checkout, Intent.extend_stay):
         ci, co = prof.get("checkin_time", DEFAULT_CHECKIN), prof.get("checkout_time", DEFAULT_CHECKOUT)
-
         cal = ctx.get("calendar") or {}
         checkin_avail = cal.get("checkin_available")
         checkout_avail = cal.get("checkout_available")
@@ -632,31 +724,27 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
                 text += f" I can request early check-in if the schedule allows (typically ${pol.get('early_checkin_fee', EARLY_FEE)})."
             else:
                 text += " The night before is booked, so early check-in may not be possible."
-
         elif ai.intent == Intent.late_checkout:
             text = f"Check-out is {co}."
             if checkout_avail:
                 text += f" I can request late checkout if possible (typically ${pol.get('late_checkout_fee', LATE_FEE)})."
             else:
                 text += " The next guest arrives the same day, so late checkout may not be possible."
-
-        else:  # extend_stay
+        else:
             text = "I can check an extension for you and confirm if the dates are open."
 
         ai.needs_clarification = True
         ai.clarifying_question = ai.clarifying_question or "What time are you hoping for?"
         ai.actions.check_calendar = True
 
-        # Gentle upsell if the night after is open
         if (ai.intent in (Intent.early_check_in, Intent.late_checkout)) and day_after_open:
-            text += " By the way, the night after is open. Would you like me to check if extending your stay works?"
+            text += " By the way, the night after is open—would you like me to check if extending your stay works?"
 
     if any(w in latest for w in _CLEAN) or ai.intent == Intent.issue_report:
         if "sorry" not in text.lower() and "apolog" not in text.lower():
             text = "I’m sorry about that. " + text
         if "cleaner" not in text.lower():
             text += (" " if text else "") + "I can send our cleaners back—what time works for you?"
-        # Remove any suggestion to guest-clean
         text = re.sub(r"(we can leave|i can leave|there are) (a )?(vacuum|broom|cleaning supplies).*", "", text, flags=re.IGNORECASE).strip()
 
     if any(ev in latest for ev in _EVENTS) and "tip" not in text.lower():
@@ -693,11 +781,10 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
         else:
             if not text:
                 text = "It’s a refundable hold processed before arrival."
-
         if not wants_link:
             text = re.sub(r"https?://\S+", "", text).strip()
 
-    ai.reply = text.strip()
+    ai.reply = _polish(text.strip())
     return ai
 
 # ---------- Public API ----------
@@ -709,7 +796,7 @@ def compose_reply(
     """
     meta expects (as available):
       listing_id, listing_map_id, reservation_id, reservation_status, check_in, check_out,
-      property_profile, policies, tz (optional IANA time zone)
+      property_profile, policies, access, location {lat,lng}
     """
     _init_db()
     ctx = _context(guest_message, conversation_history, meta)
