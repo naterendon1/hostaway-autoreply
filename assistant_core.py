@@ -80,7 +80,7 @@ class Intent(str, Enum):
     rules = "rules"
     checkin_help = "checkin_help"
     checkout_help = "checkout_help"
-    food_recs = "food_recs"     # NEW
+    food_recs = "food_recs"
     other = "other"
 
 class Actions(BaseModel):
@@ -194,7 +194,39 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
         conn.close()
     return examples
 
-# ---------- Date helpers ----------
+# ---------- Date & parse helpers (single source of truth) ----------
+def _coerce_iso_day(s: str) -> Optional[datetime]:
+    """Return a datetime for the YYYY-MM-DD part of s, or None."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s)[:10])
+    except Exception:
+        return None
+
+def _day_before(date_iso: str) -> Optional[str]:
+    d = _coerce_iso_day(date_iso)
+    return (d - timedelta(days=1)).strftime("%Y-%m-%d") if d else None
+
+def _day_after(date_iso: str) -> Optional[str]:
+    d = _coerce_iso_day(date_iso)
+    return (d + timedelta(days=1)).strftime("%Y-%m-%d") if d else None
+
+def _daterange(start_iso: str, end_iso: str) -> List[str]:
+    """
+    Half-open range of ISO dates: [start, end). Useful for nightly pricing or extension quotes.
+    """
+    s = _coerce_iso_day(start_iso)
+    e = _coerce_iso_day(end_iso)
+    if not s or not e or e <= s:
+        return []
+    days: List[str] = []
+    cur = s
+    while cur < e:
+        days.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return days
+
 def _us_date(iso: Optional[str]) -> str:
     try:
         return datetime.fromisoformat((iso or "")[:10]).strftime("%m/%d/%Y")
@@ -211,20 +243,6 @@ def _parse_extra_nights(text: str) -> Optional[int]:
         return int(m.group(1))
     except Exception:
         return None
-
-def _daterange(start_iso: str, end_iso: str) -> List[str]:
-    """[start, end) iso dates per night."""
-    try:
-        start = datetime.fromisoformat(start_iso[:10])
-        end = datetime.fromisoformat(end_iso[:10])
-    except Exception:
-        return []
-    days = []
-    d = start
-    while d < end:
-        days.append(d.strftime("%Y-%m-%d"))
-        d += timedelta(days=1)
-    return days
 
 # ---------- Hostaway helpers ----------
 def _token() -> Optional[str]:
@@ -275,7 +293,6 @@ def _calendar_days(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             return result.get("calendar", []) or []
         if isinstance(result, list):
             return result
-        # some responses might place list directly under data
         if isinstance(data, list):
             return data
         return []
@@ -455,7 +472,6 @@ def _places_nearby(lat: float, lng: float, keyword: str, max_results: int = 4) -
         r = requests.get(url, params=params, timeout=12)
         data = r.json()
         results = data.get("results", [])
-        # Filter for "highly rated"
         filtered = []
         for p in results:
             rating = float(p.get("rating") or 0)
@@ -469,7 +485,6 @@ def _places_nearby(lat: float, lng: float, keyword: str, max_results: int = 4) -
                     "lat": p.get("geometry", {}).get("location", {}).get("lat"),
                     "lng": p.get("geometry", {}).get("location", {}).get("lng"),
                 })
-        # Sort by rating then reviews
         filtered.sort(key=lambda x: (x["rating"], x["reviews"]), reverse=True)
         return filtered[:max_results]
     except Exception as e:
@@ -508,7 +523,6 @@ def _build_food_recs(lat: Optional[float], lng: Optional[float]) -> List[Dict[st
     """Return a list of {label, name, rating, reviews, distance, duration} buckets."""
     if not (lat and lng):
         return []
-
     categories = [
         ("BBQ", "bbq barbecue"),
         ("Italian", "italian pizza"),
@@ -522,8 +536,6 @@ def _build_food_recs(lat: Optional[float], lng: Optional[float]) -> List[Dict[st
             continue
         top = picks[0]
         all_picks.append({"label": label, **top})
-
-    # Add distances in a single batch call
     dests = [(p["lat"], p["lng"]) for p in all_picks if p.get("lat") and p.get("lng")]
     dists = _distance_matrix(lat, lng, dests) if dests else []
     for i, p in enumerate(all_picks):
@@ -648,10 +660,6 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
         if cal_quote.get("ok") and cal_quote.get("subtotal") is not None:
             ext_quote["subtotal"] = float(cal_quote["subtotal"])
             ext_quote["nightly_breakdown"] = cal_quote["breakdown"]
-        else:
-            # Fallback: rough average nightly rate if we know existing trip total & nights (not passed here),
-            # so we keep this minimal to avoid extra API calls; leave subtotal None if unknown.
-            pass
 
     return {
         "profile": prof,
@@ -790,7 +798,7 @@ def _polish(text: str) -> str:
     }
     for k, v in fixes.items():
         text = text.replace(k, v)
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)  # split missing space before capital
     text = re.sub(r"\s{2,}", " ", text).strip()
     return text
 
@@ -871,12 +879,10 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
             base = f"You're booked {ci_us}–{co_us}. "
             if extra and new_co_us:
                 base += f"Adding {extra} more night(s) would take you to {new_co_us}. "
-            # If we have an estimated subtotal, include it
             quote = (ext.get("quote") or {})
             subtotal = quote.get("subtotal")
             currency = (quote.get("currency") or "USD").upper()
             if subtotal is not None:
-                # Format money as whole number; adjust if you prefer cents
                 base += f"Rough subtotal for {extra} night(s): {currency} {subtotal:,.0f} before taxes/fees. "
             base += "I can check availability and send the exact quote."
             text = base
