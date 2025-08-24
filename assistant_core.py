@@ -649,7 +649,7 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
 
         # Gentle upsell if the night after is open
         if (ai.intent in (Intent.early_check_in, Intent.late_checkout)) and day_after_open:
-            text += " By the way, the night after is open—would you like me to check if extending your stay works?"
+            text += " By the way, the night after is open. Would you like me to check if extending your stay works?"
 
     if any(w in latest for w in _CLEAN) or ai.intent == Intent.issue_report:
         if "sorry" not in text.lower() and "apolog" not in text.lower():
