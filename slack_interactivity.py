@@ -601,6 +601,16 @@ async def slack_actions(
             return JSONResponse({})
 
     # -------------------- view_submission handler --------------------
+    if view["callback_id"] == "edit_ai_reply":
+    meta = json.loads(view.get("private_metadata") or "{}")
+    edited = view["state"]["values"]["msg"]["text"]["value"]
+    # reuse your existing "send" logic, just pass `edited` instead of ai_suggestion
+    send_to_guest(
+        conversation_id=meta["conv_id"],
+        listing_id=meta["listing_id"],
+        reservation_id=meta.get("reservation_id"),
+        text=edited,
+    )
     if payload.get("type") == "view_submission":
         try:
             view = payload.get("view", {})
