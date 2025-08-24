@@ -56,6 +56,21 @@ def verify_slack_signature(request_body: str, slack_signature: str | None, slack
 
 
 # -------------------- Small helpers --------------------
+CONFIRMED_STATUSES = {"new", "modified"}  # Hostaway confirmed booking statuses
+
+def is_booking_confirmed(status: str | None) -> bool:
+    return (status or "").strip().lower() in CONFIRMED_STATUSES
+
+def should_show_guest_portal_button(meta: dict) -> bool:
+    """
+    Helper you can reuse when composing the original Slack message.
+    Show button only when:
+      - We have a guest portal URL, AND
+      - Reservation is confirmed
+    """
+    url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
+    return bool(url) and is_booking_confirmed(meta.get("status"))
+
 def _post_thread_note(channel: str | None, ts: str | None, text: str) -> None:
     """Post a small note into the message thread (best-effort)."""
     if not slack_client or not channel or not ts:
@@ -583,7 +598,42 @@ async def slack_actions(
                     logging.error(f"Slack views push/open error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
             return JSONResponse({})
 
-        # --- SEND PAYMENT LINK ---
+        # --- SEND GUEST PORTAL (confirmed bookings only) ---
+        if action_id == "send_guest_portal":
+            meta = get_meta_from_action(action)
+            # Ensure channel/ts available for thread note feedback
+            if channel_id and not meta.get("channel"):
+                meta["channel"] = channel_id
+            if message_ts and not meta.get("ts"):
+                meta["ts"] = message_ts
+            channel = meta.get("channel")
+            ts = meta.get("ts")
+
+            conv_id = meta.get("conv_id")
+            communication_type = meta.get("type", "email")
+            status = (meta.get("status") or "").lower()
+            url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
+
+            if not url:
+                _post_thread_note(channel, ts, "⚠️ No guest portal URL available on this reservation.")
+                return JSONResponse({})
+
+            if not is_booking_confirmed(status):
+                _post_thread_note(channel, ts, "⚠️ Guest portal link is only available after the booking is confirmed.")
+                return JSONResponse({})
+
+            try:
+                ok = send_reply_to_hostaway(conv_id, f"Here’s your guest portal link: {url}", communication_type)
+                if ok:
+                    _post_thread_note(channel, ts, "🔗 Guest portal link sent to guest.")
+                else:
+                    _post_thread_note(channel, ts, "⚠️ Failed to send guest portal link.")
+            except Exception as e:
+                logging.error(f"Guest portal send error: {e}")
+                _post_thread_note(channel, ts, "⚠️ Failed to send guest portal link.")
+            return JSONResponse({})
+
+        # (Legacy) SEND PAYMENT LINK — keep as alias to portal if you still use it anywhere
         if action_id == "send_payment_link":
             meta = get_meta_from_action(action)
             if channel_id and not meta.get("channel"):
@@ -593,14 +643,15 @@ async def slack_actions(
 
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
-            url = meta.get("guest_portal_url")
+            url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
             channel = meta.get("channel")
             ts = meta.get("ts")
 
             if not url:
-                _post_thread_note(channel, ts, "⚠️ No payment link available for this reservation.")
+                _post_thread_note(channel, ts, "⚠️ No payment/portal link available for this reservation.")
                 return JSONResponse({})
 
+            # For payment_link we do not block by status (kept behavior), but you can also gate here if you want.
             try:
                 ok = send_reply_to_hostaway(conv_id, f"Here’s your secure payment link: {url}", communication_type)
                 if ok:
@@ -632,7 +683,7 @@ async def slack_actions(
                 reply_text = block["reply_ai"]["value"]
                 break
             if "reply" in block and isinstance(block["reply"], dict) and block["reply"].get("value"):
-                reply_text = block["reply"]["value"]
+                reply_text = block["reply"].get("value")
                 break
 
         if not reply_text or not meta.get("conv_id"):
