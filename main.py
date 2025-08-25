@@ -313,7 +313,7 @@ def list_feedback(limit: int = 100) -> List[Dict]:
         (limit,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r]  # <-- keep legacy admin endpoints unchanged
+    return [dict(r) for r in rows]  # <-- keep legacy admin endpoints unchanged
 
 # ---------- Webhook ----------
 class HostawayUnifiedWebhook(BaseModel):
