@@ -313,7 +313,7 @@ def list_feedback(limit: int = 100) -> List[Dict]:
         (limit,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]  # <-- keep legacy admin endpoints unchanged
+    return [dict(r) for r]  # <-- keep legacy admin endpoints unchanged
 
 # ---------- Webhook ----------
 class HostawayUnifiedWebhook(BaseModel):
@@ -384,12 +384,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     res_status_pretty = pretty_res_status(res.get("status"))
     total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
 
-    # Payment link eligibility (pending/awaitingPayment + guestPortalUrl)
+    # Raw status for gating buttons
     raw_status = (res.get("status") or "").strip().lower()
+
+    # URLs/eligibility
     guest_portal_url = (res.get("guestPortalUrl") or "").strip() or None
-    show_payment_button = bool(
-        guest_portal_url and raw_status in {"pending", "awaitingpayment"}
-    )
+    show_payment_button = bool(guest_portal_url and raw_status in {"pending", "awaitingpayment"})
+    # NEW: Guest Portal button shows only for booked stays (new/modified)
+    show_guest_portal_button = bool(guest_portal_url and raw_status in {"new", "modified"})
 
     # Message transport status (from webhook payload)
     msg_status = pretty_status(payload.data.get("status") or "sent")
@@ -469,7 +471,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
 
-    # Slack button meta (Edit removed; Payment optional)
+    # Slack button meta (Edit present; Payment/Portal optional)
     button_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -481,7 +483,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "check_in": check_in,
         "check_out": check_out,
         "guest_count": guest_count,
-        "status": res_status_pretty,  # reservation status
+        "status": res_status_pretty,  # pretty label ("New"/"Modified") is fine; handler lowercases
         "detected_intent": detected_intent,
         "channel_pretty": channel_pretty,
         "property_address": property_address,
@@ -522,6 +524,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "action_id": "edit",
         },
     ]
+    # Payment link (for pending/awaitingPayment)
     if show_payment_button:
         actions_elements.append(
             {
@@ -530,6 +533,16 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 "text": {"type": "plain_text", "text": "💳 Send payment link"},
                 "value": json.dumps({**button_meta, "action": "send_payment_link"}),
                 "action_id": "send_payment_link",
+            }
+        )
+    # NEW: Guest Portal (for booked stays — new/modified)
+    if show_guest_portal_button:
+        actions_elements.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "🔑 Send Guest Portal"},
+                "value": json.dumps({**button_meta, "action": "send_guest_portal"}),
+                "action_id": "send_guest_portal",
             }
         )
 
