@@ -52,8 +52,6 @@ missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
     raise RuntimeError(f"Missing required environment variables: {missing}")
 
-MAX_THREAD_MESSAGES = 10
-
 # ---------- Tiny helpers wired to db.py ----------
 from db import (
     get_slack_thread as db_get_slack_thread,  # kept for backwards compat (unused now)
@@ -209,6 +207,13 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
         return "past"
     return "unknown"
 
+def is_booked_status(raw_status: Optional[str]) -> bool:
+    """Booked = confirmed reservation (not inquiry/pending/awaiting/declined/etc.)."""
+    if not raw_status:
+        return False
+    s = raw_status.strip().lower()
+    return s in {"new", "modified"}  # adjust if you treat others as 'booked'
+
 # ---------- Extractors for AI context (door code, pets, etc.) ----------
 def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optional[Dict]) -> Dict[str, Optional[str]]:
     """
@@ -255,6 +260,61 @@ def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]
             pets_allowed = True
 
     return {"pets_allowed": pets_allowed, "pet_fee": None, "pet_deposit_refundable": None}
+
+# -------- Conversation history builder for AI --------
+def _strip_quotes(s: str) -> str:
+    """Remove quoted lines (start with '>') & excess whitespace to keep tokens low."""
+    if not s:
+        return s
+    lines = []
+    for ln in str(s).splitlines():
+        # drop quoted blocks and mail-style headers
+        if ln.strip().startswith(">"):
+            continue
+        if ln.strip().lower().startswith("on ") and " wrote:" in ln.lower():
+            continue
+        lines.append(ln)
+    return "\n".join(lines).strip()
+
+def build_ai_history(conversation_messages: List[Dict], max_items: int = 60, char_budget: int = 12000) -> List[Dict[str, str]]:
+    """
+    Convert Hostaway conversation messages into a compact role/text list for the model.
+    - Merges consecutive messages by the same role.
+    - Strips quoted reply lines to save tokens.
+    - Keeps the *most recent* messages within a character budget.
+    """
+    # Ensure chronological order by message id if present
+    msgs_sorted = sorted(conversation_messages or [], key=lambda x: x.get("id", 0))
+
+    merged: List[Dict[str, str]] = []
+    last_role = None
+    for m in msgs_sorted:
+        text = (m.get("body") or "").strip()
+        if not text:
+            continue
+        role = "guest" if m.get("isIncoming") else "host"
+
+        text = _strip_quotes(text)
+        if not text:
+            continue
+
+        if merged and last_role == role:
+            merged[-1]["text"] = (merged[-1]["text"] + "\n" + text).strip()
+        else:
+            merged.append({"role": role, "text": text})
+            last_role = role
+
+    # Trim from the end (most recent first) to stay under budgets
+    kept: List[Dict[str, str]] = []
+    total_chars = 0
+    for item in reversed(merged):
+        t = item["text"]
+        total_chars += len(t)
+        kept.append(item)
+        if total_chars >= char_budget or len(kept) >= max_items:
+            break
+
+    return list(reversed(kept))
 
 # ---------- Admin endpoints ----------
 def require_admin(
@@ -313,7 +373,7 @@ def list_feedback(limit: int = 100) -> List[Dict]:
         (limit,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]  # <-- keep legacy admin endpoints unchanged
+    return [dict(r) for r in rows]  # keep legacy admin endpoints unchanged
 
 # ---------- Webhook ----------
 class HostawayUnifiedWebhook(BaseModel):
@@ -384,14 +444,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     res_status_pretty = pretty_res_status(res.get("status"))
     total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
 
-    # Raw status for gating buttons
+    # Payment link eligibility (pending/awaitingPayment + guestPortalUrl)
     raw_status = (res.get("status") or "").strip().lower()
-
-    # URLs/eligibility
     guest_portal_url = (res.get("guestPortalUrl") or "").strip() or None
-    show_payment_button = bool(guest_portal_url and raw_status in {"pending", "awaitingpayment"})
-    # NEW: Guest Portal button shows only for booked stays (new/modified)
-    show_guest_portal_button = bool(guest_portal_url and raw_status in {"new", "modified"})
+
+    show_payment_button = bool(
+        guest_portal_url and raw_status in {"pending", "awaitingpayment"}
+    )
+    # Guest portal button only for *booked* reservations
+    show_guest_portal_button = bool(
+        guest_portal_url and is_booked_status(raw_status)
+    )
 
     # Message transport status (from webhook payload)
     msg_status = pretty_status(payload.data.get("status") or "sent")
@@ -414,7 +477,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         property_address = str(addr_raw)
 
-    # Lat/Lng for food/distance recs
+    # Lat/Lng for food/distance recs (forwarded to assistant_core)
     loc_res = (listing_obj or {}).get("result", {}) or {}
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
@@ -423,17 +486,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
 
-    # Conversation context (last few)
+    # Conversation context (fuller slice, merged & de-quoted)
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
-
-    # ---- Guarded AI (assistant_core) ----
-    conversation_history = [
-        {"role": "guest" if m.get("isIncoming") else "host", "text": m.get("body", "")}
-        for m in msgs[-MAX_THREAD_MESSAGES:]
-        if m.get("body")
-    ]
+    conversation_history = build_ai_history(msgs, max_items=60, char_budget=12000)
 
     # Minimal property profile (sane defaults; assistant_core also has defaults)
     property_profile = {"checkin_time": "4:00 PM", "checkout_time": "11:00 AM"}
@@ -448,13 +505,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     meta_for_ai = {
         "listing_id": (str(listing_id) if listing_id is not None else ""),
         "listing_map_id": listing_id,
-        "reservation_id": reservation_id,  # FIX: no stray characters
+        "reservation_id": reservation_id,
         "check_in": check_in if isinstance(check_in, str) else str(check_in),
         "check_out": check_out if isinstance(check_out, str) else str(check_out),
         "reservation_status": (res.get("status") or "").strip(),  # raw status for guards
         "property_profile": property_profile,
         "policies": policies,
-        "access": access,  # NEW: door_code & arrival_instructions if available
+        "access": access,  # door_code & arrival_instructions if available
         "location": {"lat": lat, "lng": lng},
     }
 
@@ -471,7 +528,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
 
-    # Slack button meta (Edit present; Payment/Portal optional)
+    # Slack button meta (Edit present; Payment & Guest Portal optional)
     button_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -483,7 +540,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "check_in": check_in,
         "check_out": check_out,
         "guest_count": guest_count,
-        "status": res_status_pretty,  # pretty label ("New"/"Modified") is fine; handler lowercases
+        "status": res_status_pretty,  # reservation status (pretty)
         "detected_intent": detected_intent,
         "channel_pretty": channel_pretty,
         "property_address": property_address,
@@ -524,7 +581,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "action_id": "edit",
         },
     ]
-    # Payment link (for pending/awaitingPayment)
     if show_payment_button:
         actions_elements.append(
             {
@@ -535,14 +591,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 "action_id": "send_payment_link",
             }
         )
-    # NEW: Guest Portal (for booked stays — new/modified)
     if show_guest_portal_button:
         actions_elements.append(
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "🔑 Send Guest Portal"},
-                "value": json.dumps({**button_meta, "action": "send_guest_portal"}),
-                "action_id": "send_guest_portal",
+                "text": {"type": "plain_text", "text": "🔗 Send guest portal"},
+                "value": json.dumps({**button_meta, "action": "send_guest_portal_url"}),
+                "action_id": "send_guest_portal_url",
             }
         )
 
