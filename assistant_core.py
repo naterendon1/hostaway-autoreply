@@ -62,6 +62,8 @@ HARD RULES:
 9) Local food/drink requests: if context includes curated nearby places, recommend 3–6 specific spots with a one-line why each (rating or vibe) and rough travel time. Don’t ask for preferences first.
 10) Keep replies typo-free and natural. Avoid odd hyphenation or missing spaces.
 11) If an estimated subtotal for an extension is provided in context, include it succinctly (e.g., “Rough subtotal for +N nights: USD 540 before taxes/fees.”).
+12) If the guest’s message is brief or vague (e.g., “yes”, “that works”, “please authorize”), infer intent from the latest prior host message(s) in conversation_history (questions, proposals, or pending actions) and respond accordingly—do not ask for clarification if the context clearly disambiguates it.
+
 
 Return only JSON with: intent, confidence, needs_clarification, clarifying_question, reply, citations[], actions{}.
 """
@@ -665,7 +667,7 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
         "profile": prof,
         "policies": pol,
         "learned": learned,
-        "conversation_history": (history or [])[-8:],
+        "conversation_history": history,  # use full prepared history from main.py
         "latest_guest_message": latest_guest_msg or guest_message,
         "calendar": calendar,
         "reservation_status": status,
