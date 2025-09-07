@@ -5,7 +5,7 @@ import json
 import hmac
 import hashlib
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, Header, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -35,12 +35,12 @@ if not SLACK_BOT_TOKEN:
 
 
 # -------------------- Security: Slack Signature Verify --------------------
-def verify_slack_signature(request_body: str, slack_signature: str | None, slack_request_timestamp: str | None) -> bool:
+def verify_slack_signature(request_body: str, slack_signature: Optional[str], slack_request_timestamp: Optional[str]) -> bool:
     """
     Verify Slack request signature. If no signing secret is configured, allow (dev mode).
     """
     if not SLACK_SIGNING_SECRET:
-        return True  # dev-friendly: don't block local/dev
+        return True  # dev-friendly for local/dev
     if not slack_request_timestamp or abs(time.time() - int(slack_request_timestamp)) > 60 * 5:
         return False
     if not slack_signature:
@@ -56,22 +56,18 @@ def verify_slack_signature(request_body: str, slack_signature: str | None, slack
 
 
 # -------------------- Small helpers --------------------
-CONFIRMED_STATUSES = {"new", "modified"}  # Hostaway confirmed booking statuses
+# Hostaway "booked/confirmed" statuses
+CONFIRMED_STATUSES = {"new", "modified"}
 
-def is_booking_confirmed(status: str | None) -> bool:
+def is_booking_confirmed(status: Optional[str]) -> bool:
+    """
+    Accepts either raw Hostaway status ('new', 'modified', ...) or your pretty
+    versions ('New', 'Modified', ...). We lower/trim before comparing.
+    """
     return (status or "").strip().lower() in CONFIRMED_STATUSES
 
-def should_show_guest_portal_button(meta: dict) -> bool:
-    """
-    Helper you can reuse when composing the original Slack message.
-    Show button only when:
-      - We have a guest portal URL, AND
-      - Reservation is confirmed
-    """
-    url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
-    return bool(url) and is_booking_confirmed(meta.get("status"))
 
-def _post_thread_note(channel: str | None, ts: str | None, text: str) -> None:
+def _post_thread_note(channel: Optional[str], ts: Optional[str], text: str) -> None:
     """Post a small note into the message thread (best-effort)."""
     if not slack_client or not channel or not ts:
         return
@@ -82,21 +78,21 @@ def _post_thread_note(channel: str | None, ts: str | None, text: str) -> None:
 
 
 def update_slack_message_with_sent_reply(
-    slack_bot_token: str | None,
-    channel: str | None,
-    ts: str | None,
+    slack_bot_token: Optional[str],
+    channel: Optional[str],
+    ts: Optional[str],
     guest_name: str,
     guest_msg: str,
     sent_reply: str,
-    communication_type: str | None,
+    communication_type: Optional[str],
     check_in: str,
     check_out: str,
     guest_count: str | int,
     status: str,
     detected_intent: str,
     sent_label: str = "message sent",
-    channel_pretty: str | None = None,
-    property_address: str | None = None,
+    channel_pretty: Optional[str] = None,
+    property_address: Optional[str] = None,
     saved_for_learning: bool = False,
 ) -> None:
     """Replace the original Slack message blocks with a 'Sent' confirmation layout."""
@@ -139,8 +135,8 @@ def get_modal_blocks(
     checkbox_checked: bool = False,
     input_block_id: str = "reply_input",
     input_action_id: str = "reply",
-) -> list[dict]:
-    reply_block = {
+) -> List[Dict[str, Any]]:
+    reply_block: Dict[str, Any] = {
         "type": "input",
         "block_id": input_block_id,
         "label": {"type": "plain_text", "text": "Your reply:" if action_id == "write_own" else "Edit below:", "emoji": True},
@@ -157,7 +153,7 @@ def get_modal_blocks(
         "text": {"type": "plain_text", "text": "Save this answer for next time", "emoji": True},
         "value": "save"
     }
-    learning_checkbox = {
+    learning_checkbox: Dict[str, Any] = {
         "type": "input",
         "block_id": "save_answer_block",
         "element": {
@@ -181,7 +177,7 @@ def get_modal_blocks(
     ]
 
 
-def add_undo_button(blocks: list[dict], meta: dict) -> list[dict]:
+def add_undo_button(blocks: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     if meta.get("previous_draft"):
         blocks.append({
             "type": "actions",
@@ -194,7 +190,7 @@ def add_undo_button(blocks: list[dict], meta: dict) -> list[dict]:
 
 
 # ---------------- Background: improve + final views.update (with hash) ----------------
-def _background_improve_and_update(view_id: str, hash_value: str | None, meta: dict, edited_text: str, guest_name: str, guest_msg: str):
+def _background_improve_and_update(view_id: str, hash_value: Optional[str], meta: dict, edited_text: str, guest_name: str, guest_msg: str):
     improved = edited_text
     error_message = None
 
@@ -318,8 +314,8 @@ def _background_send_and_update(meta: dict, reply_text: str):
 @router.post("/events")
 async def slack_events(
     request: Request,
-    x_slack_signature: str | None = Header(None, alias="X-Slack-Signature"),
-    x_slack_request_timestamp: str | None = Header(None, alias="X-Slack-Request-Timestamp"),
+    x_slack_signature: Optional[str] = Header(None, alias="X-Slack-Signature"),
+    x_slack_request_timestamp: Optional[str] = Header(None, alias="X-Slack-Request-Timestamp"),
 ):
     raw_body_bytes = await request.body()
     raw_body = raw_body_bytes.decode("utf-8") if raw_body_bytes else ""
@@ -336,10 +332,10 @@ async def slack_events(
 async def slack_actions(
     request: Request,
     background_tasks: BackgroundTasks,
-    x_slack_signature: str | None = Header(None, alias="X-Slack-Signature"),
-    x_slack_request_timestamp: str | None = Header(None, alias="X-Slack-Request-Timestamp"),
-    x_slack_retry_num: str | None = Header(None, alias="X-Slack-Retry-Num"),
-    x_slack_retry_reason: str | None = Header(None, alias="X-Slack-Retry-Reason"),
+    x_slack_signature: Optional[str] = Header(None, alias="X-Slack-Signature"),
+    x_slack_request_timestamp: Optional[str] = Header(None, alias="X-Slack-Request-Timestamp"),
+    x_slack_retry_num: Optional[str] = Header(None, alias="X-Slack-Retry-Num"),
+    x_slack_retry_reason: Optional[str] = Header(None, alias="X-Slack-Retry-Reason"),
 ):
     # Ignore Slack retries (we already processed the action)
     if x_slack_retry_num is not None:
@@ -611,7 +607,7 @@ async def slack_actions(
 
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
-            status = (meta.get("status") or "").lower()
+            status = (meta.get("status") or "").lower()  # pretty 'New' -> 'new' is OK
             url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
 
             if not url:
@@ -633,36 +629,6 @@ async def slack_actions(
                 _post_thread_note(channel, ts, "⚠️ Failed to send guest portal link.")
             return JSONResponse({})
 
-        # (Legacy) SEND PAYMENT LINK — keep as alias to portal if you still use it anywhere
-        if action_id == "send_payment_link":
-            meta = get_meta_from_action(action)
-            if channel_id and not meta.get("channel"):
-                meta["channel"] = channel_id
-            if message_ts and not meta.get("ts"):
-                meta["ts"] = message_ts
-
-            conv_id = meta.get("conv_id")
-            communication_type = meta.get("type", "email")
-            url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
-            channel = meta.get("channel")
-            ts = meta.get("ts")
-
-            if not url:
-                _post_thread_note(channel, ts, "⚠️ No payment/portal link available for this reservation.")
-                return JSONResponse({})
-
-            # For payment_link we do not block by status (kept behavior), but you can also gate here if you want.
-            try:
-                ok = send_reply_to_hostaway(conv_id, f"Here’s your secure payment link: {url}", communication_type)
-                if ok:
-                    _post_thread_note(channel, ts, "💳 Payment link sent to guest.")
-                else:
-                    _post_thread_note(channel, ts, "⚠️ Failed to send payment link.")
-            except Exception as e:
-                logging.error(f"Payment link send error: {e}")
-                _post_thread_note(channel, ts, "⚠️ Failed to send payment link.")
-            return JSONResponse({})
-
         # Unhandled action ids are no-ops
         return JSONResponse({})
 
@@ -677,7 +643,7 @@ async def slack_actions(
             meta = {}
 
         # Prefer improved field if present
-        reply_text: str | None = None
+        reply_text: Optional[str] = None
         for block_id, block in state.items():
             if "reply_ai" in block and isinstance(block["reply_ai"], dict) and block["reply_ai"].get("value"):
                 reply_text = block["reply_ai"]["value"]
