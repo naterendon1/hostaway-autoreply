@@ -5,6 +5,7 @@ import json
 import hmac
 import hashlib
 import time
+import sqlite3
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, Header, HTTPException, BackgroundTasks
@@ -15,7 +16,7 @@ from openai import OpenAI
 
 from utils import (
     send_reply_to_hostaway,
-    store_learning_example,
+    store_learning_example,  # legacy helper kept for backwards compatibility
     clean_ai_reply,
 )
 
@@ -30,16 +31,14 @@ slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
+
 if not SLACK_BOT_TOKEN:
     logging.warning("SLACK_BOT_TOKEN is not set; Slack operations will fail in production.")
 
 
 # -------------------- Security: Slack Signature Verify --------------------
-def verify_slack_signature(
-    request_body: str,
-    slack_signature: Optional[str],
-    slack_request_timestamp: Optional[str]
-) -> bool:
+def verify_slack_signature(request_body: str, slack_signature: Optional[str], slack_request_timestamp: Optional[str]) -> bool:
     """
     Verify Slack request signature. If no signing secret is configured, allow (dev mode).
     """
@@ -60,12 +59,12 @@ def verify_slack_signature(
 
 
 # -------------------- Small helpers --------------------
-# Hostaway "booked/confirmed" statuses (raw)
+# Hostaway "booked/confirmed" statuses
 CONFIRMED_STATUSES = {"new", "modified"}
 
 def is_booking_confirmed(status: Optional[str]) -> bool:
     """
-    Accepts either raw Hostaway status ('new', 'modified', ...) or pretty
+    Accepts either raw Hostaway status ('new', 'modified', ...) or your pretty
     versions ('New', 'Modified', ...). We lower/trim before comparing.
     """
     return (status or "").strip().lower() in CONFIRMED_STATUSES
@@ -139,29 +138,15 @@ def get_modal_blocks(
     checkbox_checked: bool = False,
     input_block_id: str = "reply_input",
     input_action_id: str = "reply",
+    coach_prompt_initial: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    # 1) Guest message context (read-only)
-    header_section: Dict[str, Any] = {
-        "type": "section",
-        "block_id": "guest_message_section",
-        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"},
-    }
-
-    # 2) Optional instruction for AI (host prompt to steer the rewrite)
-    ai_prompt_block: Dict[str, Any] = {
-        "type": "input",
-        "block_id": "ai_prompt_block",
-        "optional": True,
-        "label": {"type": "plain_text", "text": "Instruction for AI (optional)", "emoji": True},
-        "element": {
-            "type": "plain_text_input",
-            "action_id": "ai_prompt",
-            "multiline": True,
-            "placeholder": {"type": "plain_text", "text": "e.g., don’t offer a cleaning crew—propose pest control and next steps"},
-        },
-    }
-
-    # 3) The editable reply box
+    """
+    Builds a modal that contains:
+      - The guest message (read-only)
+      - A multiline text box with your current draft (or empty)
+      - A "coach the AI" prompt box (optional, used by 'Improve with AI')
+      - A checkbox to save for learning
+    """
     reply_block: Dict[str, Any] = {
         "type": "input",
         "block_id": input_block_id,
@@ -175,16 +160,24 @@ def get_modal_blocks(
     if draft_text:
         reply_block["element"]["initial_value"] = draft_text
 
-    # 4) Improve with AI button row
-    improve_row: Dict[str, Any] = {
-        "type": "actions",
-        "block_id": "improve_ai_block",
-        "elements": [
-            {"type": "button", "action_id": "improve_with_ai", "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}}
-        ],
+    coach_block: Dict[str, Any] = {
+        "type": "input",
+        "block_id": "coach_prompt_block",
+        "optional": True,
+        "label": {"type": "plain_text", "text": "Coach the AI (optional)", "emoji": True},
+        "element": {
+            "type": "plain_text_input",
+            "action_id": "coach_prompt",
+            "multiline": True,
+            "placeholder": {
+                "type": "plain_text",
+                "text": "Tell the AI how to tweak this reply (e.g., 'offer pest control, not cleaners')."
+            }
+        }
     }
+    if coach_prompt_initial:
+        coach_block["element"]["initial_value"] = coach_prompt_initial[:3000]
 
-    # 5) Optional learning checkbox
     learning_checkbox_option = {
         "text": {"type": "plain_text", "text": "Save this answer for next time", "emoji": True},
         "value": "save"
@@ -203,7 +196,15 @@ def get_modal_blocks(
     if checkbox_checked:
         learning_checkbox["element"]["initial_options"] = [learning_checkbox_option]
 
-    return [header_section, ai_prompt_block, reply_block, improve_row, learning_checkbox]
+    return [
+        {"type": "section", "block_id": "guest_message_section", "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}},
+        reply_block,
+        coach_block,
+        {"type": "actions", "block_id": "improve_ai_block", "elements": [
+            {"type": "button", "action_id": "improve_with_ai", "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}}
+        ]},
+        learning_checkbox,
+    ]
 
 
 def add_undo_button(blocks: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -218,44 +219,47 @@ def add_undo_button(blocks: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[
     return blocks
 
 
-# ---------------- Background: improve + final views.update (with host instruction) ----------------
+# ---------------- Background: improve + final views.update (with hash) ----------------
 def _background_improve_and_update(
     view_id: str,
     hash_value: Optional[str],
     meta: dict,
     edited_text: str,
+    coach_prompt_text: Optional[str],
     guest_name: str,
-    guest_msg: str,
-    custom_prompt: Optional[str] = None,  # <-- NEW
+    guest_msg: str
 ):
+    """
+    Uses OpenAI to improve the draft, guided by an optional coach prompt.
+    """
     improved = edited_text
     error_message = None
-
-    # Build prompt
-    host_instruction = (custom_prompt or "").strip()
-    base_instructions = (
-        "Rewrite the reply WITHOUT changing the core facts.\n"
-        "Voice: concise, casual, informal, easy to understand. Use contractions.\n"
-        "No greeting, no sign-off, no emojis, no corporate filler.\n"
-        "Keep or tighten length. Avoid repeating what the guest said.\n\n"
-    )
-    user_payload = (
-        f"Guest message:\n{guest_msg}\n\n"
-        f"Current draft reply:\n{edited_text}\n\n"
-    )
-    if host_instruction:
-        user_payload += f"Host instruction (override/steer the reply):\n{host_instruction}\n\n"
-    user_payload += "Return ONLY the final message to the guest."
 
     if not openai_client:
         error_message = "OpenAI key not configured; showing your original text."
     else:
+        # Build a precise instruction that references both the guest message and the coach prompt.
+        sys = (
+            "You edit messages for a vacation-rental host. "
+            "Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis. "
+            "Style: concise, casual, informal, easy to understand."
+        )
+        user = (
+            "Guest message:\n"
+            f"{guest_msg}\n\n"
+            "Current draft reply (to improve, not to lengthen):\n"
+            f"{edited_text}\n\n"
+            "Coach prompt (host's instruction to adjust the reply):\n"
+            f"{(coach_prompt_text or '').strip() or '(none)'}\n\n"
+            "Rewrite the reply to satisfy the coach prompt if present, keep the same intent, and stay concise. "
+            "Return ONLY the rewritten reply."
+        )
         try:
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You write messages for a vacation-rental host. Follow style and safety. Never include greetings/sign-offs."},
-                    {"role": "user", "content": base_instructions + user_payload}
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": user}
                 ]
             )
             improved = clean_ai_reply((response.choices[0].message.content or "").strip())
@@ -263,15 +267,17 @@ def _background_improve_and_update(
             logging.error(f"OpenAI error in background 'improve_with_ai': {e}")
             error_message = f"Error improving with AI: {str(e)}"
 
-    new_meta = {**meta, "previous_draft": edited_text, "improving": False}
+    # Keep the previous draft so "Undo AI" works
+    new_meta = {**meta, "previous_draft": edited_text, "improving": False, "coach_prompt": coach_prompt_text or ""}
     blocks = get_modal_blocks(
         guest_name,
         guest_msg,
         action_id="edit",
         draft_text=improved,
         checkbox_checked=new_meta.get("checkbox_checked", False),
-        input_block_id="reply_input_ai",   # Force Slack to re-fill initial_value
+        input_block_id="reply_input_ai",   # Force Slack to refill initial_value
         input_action_id="reply_ai",
+        coach_prompt_initial=coach_prompt_text or "",
     )
     blocks = add_undo_button(blocks, new_meta)
     if error_message:
@@ -464,6 +470,8 @@ async def slack_actions(
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "(Message unavailable)")
             checkbox_checked = meta.get("checkbox_checked", False)
+            coach_prompt_initial = meta.get("coach_prompt", "")
+
             modal = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Write Your Reply", "emoji": True},
@@ -474,6 +482,7 @@ async def slack_actions(
                     guest_name, guest_msg, action_id="write_own",
                     draft_text="", checkbox_checked=checkbox_checked,
                     input_block_id="reply_input", input_action_id="reply",
+                    coach_prompt_initial=coach_prompt_initial,
                 ),
             }
             if slack_client:
@@ -493,11 +502,13 @@ async def slack_actions(
             guest_msg = meta.get("guest_message", "(Message unavailable)")
             ai_suggestion = meta.get("draft", meta.get("ai_suggestion", ""))
             checkbox_checked = meta.get("checkbox_checked", False)
+            coach_prompt_initial = meta.get("coach_prompt", "")
 
             modal_blocks = get_modal_blocks(
                 guest_name, guest_msg, action_id="edit",
                 draft_text=ai_suggestion, checkbox_checked=checkbox_checked,
                 input_block_id="reply_input", input_action_id="reply",
+                coach_prompt_initial=coach_prompt_initial,
             )
             modal_blocks = add_undo_button(modal_blocks, meta)
             modal = {
@@ -519,7 +530,7 @@ async def slack_actions(
                     logging.error(f"Slack modal error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
             return JSONResponse({})
 
-        # --- IMPROVE WITH AI (reads optional "Instruction for AI") ---
+        # --- IMPROVE WITH AI ---
         if action_id == "improve_with_ai":
             view = payload.get("view", {}) or {}
             view_id = view.get("id")
@@ -540,13 +551,13 @@ async def slack_actions(
                 if edited_text:
                     break
 
-            # NEW: read the optional "Instruction for AI"
-            custom_prompt = ""
-            ai_prompt_block = state.get("ai_prompt_block", {})
-            if "ai_prompt" in ai_prompt_block and isinstance(ai_prompt_block["ai_prompt"], dict):
-                custom_prompt = (ai_prompt_block["ai_prompt"].get("value") or "").strip()
+            # Read the coach prompt (optional)
+            coach_prompt_value = ""
+            cp_block = state.get("coach_prompt_block", {})
+            if "coach_prompt" in cp_block and isinstance(cp_block["coach_prompt"], dict):
+                coach_prompt_value = (cp_block["coach_prompt"].get("value") or "").strip()
 
-            # Checkbox state (learning)
+            # Checkbox state
             state_save = state.get("save_answer_block", {})
             checkbox_checked = False
             if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
@@ -565,13 +576,14 @@ async def slack_actions(
             guest_msg = meta.get("guest_message", "")
 
             # Show loading view (and set improving flag)
-            loading_meta = {**meta, "improving": True, "checkbox_checked": checkbox_checked}
+            loading_meta = {**meta, "improving": True, "checkbox_checked": checkbox_checked, "coach_prompt": coach_prompt_value}
             loading_blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply…"}}
             ] + get_modal_blocks(
                 guest_name, guest_msg, action_id="edit",
                 draft_text=edited_text, checkbox_checked=checkbox_checked,
                 input_block_id="reply_input", input_action_id="reply",
+                coach_prompt_initial=coach_prompt_value,
             )
             loading_view = {
                 "type": "modal",
@@ -610,7 +622,7 @@ async def slack_actions(
 
             background_tasks.add_task(
                 _background_improve_and_update,
-                view_id, new_hash, loading_meta, edited_text, guest_name, guest_msg, custom_prompt  # pass the prompt
+                view_id, new_hash, loading_meta, edited_text, coach_prompt_value, guest_name, guest_msg,
             )
             return JSONResponse({})
 
@@ -621,10 +633,13 @@ async def slack_actions(
             guest_msg = meta.get("guest_message", "")
             previous_draft = meta.get("previous_draft", "")
             checkbox_checked = meta.get("checkbox_checked", False)
+            coach_prompt_initial = meta.get("coach_prompt", "")
+
             blocks = get_modal_blocks(
                 guest_name, guest_msg, action_id="edit",
                 draft_text=previous_draft, checkbox_checked=checkbox_checked,
                 input_block_id="reply_input", input_action_id="reply",
+                coach_prompt_initial=coach_prompt_initial,
             )
             blocks = add_undo_button(blocks, meta)
             modal = {
@@ -658,7 +673,7 @@ async def slack_actions(
 
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
-            status = (meta.get("status") or "").lower()  # pretty 'New' -> 'new' ok
+            status = (meta.get("status") or "").lower()  # pretty 'New' -> 'new' is OK
             url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
 
             if not url:
@@ -703,6 +718,12 @@ async def slack_actions(
                 reply_text = block["reply"].get("value")
                 break
 
+        # Optional coach prompt (to save with learning)
+        coach_prompt_value: Optional[str] = None
+        cp_block = state.get("coach_prompt_block", {})
+        if "coach_prompt" in cp_block and isinstance(cp_block["coach_prompt"], dict):
+            coach_prompt_value = (cp_block["coach_prompt"].get("value") or "").strip() or None
+
         if not reply_text or not meta.get("conv_id"):
             return JSONResponse({
                 "response_action": "errors",
@@ -717,6 +738,7 @@ async def slack_actions(
         meta["saved_for_learning"] = bool(save_for_next_time)
 
         if save_for_next_time:
+            # 1) Keep your legacy store (optional, unchanged)
             try:
                 store_learning_example(
                     meta.get("guest_message", ""),
@@ -728,31 +750,77 @@ async def slack_actions(
             except Exception as e:
                 logging.error(f"store_learning_example failed: {e}")
 
-            # Also write into the simplified learning_examples table
+            # 2) New richer table: learning_examples_v2 (with coach_prompt)
             try:
-                import sqlite3
-                DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
-                conn = sqlite3.connect(DB_PATH)
+                conn = sqlite3.connect(LEARNING_DB_PATH)
                 cur = conn.cursor()
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS learning_examples (
+                    CREATE TABLE IF NOT EXISTS learning_examples_v2 (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        intent TEXT,
-                        question TEXT,
-                        answer TEXT,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                        listing_id        TEXT,
+                        intent            TEXT,
+                        tags              TEXT,
+                        guest_message     TEXT,
+                        conversation_ctx  TEXT,
+                        ai_suggestion     TEXT,
+                        coach_prompt      TEXT,
+                        final_reply       TEXT,
+                        channel           TEXT,
+                        reservation_status TEXT,
+                        trip_phase        TEXT,
+                        approved          INTEGER DEFAULT 1,
+                        created_at        TEXT DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
-                guest_msg = (meta.get("guest_message") or "")[:2000]
-                final_text = reply_text[:4000]
+                # Insert
+                listing_id_val = str(meta.get("listing_id") or "") or None
+                intent_val = meta.get("detected_intent") or "other"
+                tags_val = intent_val  # simple seed; you can enrich later
+                guest_msg_val = (meta.get("guest_message") or "")[:4000]
+                convo_ctx_val = None  # not available here; could be added later from webhook
+                ai_suggestion_val = (meta.get("ai_suggestion") or "")[:4000]
+                coach_prompt_val = (coach_prompt_value or None)
+                final_reply_val = reply_text[:8000]
+                channel_val = meta.get("type") or None
+                reservation_status_val = (meta.get("status") or None)
+                # rough phase if check_in/out provided
+                trip_phase_val = None
+                try:
+                    from datetime import date
+                    def _phase(ci: Optional[str], co: Optional[str]) -> Optional[str]:
+                        try:
+                            ci_d = date.fromisoformat(ci) if ci else None
+                            co_d = date.fromisoformat(co) if co else None
+                        except Exception:
+                            return None
+                        today = date.today()
+                        if ci_d and today < ci_d:
+                            return "upcoming"
+                        if ci_d and co_d and ci_d <= today <= co_d:
+                            return "during"
+                        if co_d and today > co_d:
+                            return "past"
+                        return None
+                    trip_phase_val = _phase(meta.get("check_in"), meta.get("check_out"))
+                except Exception:
+                    trip_phase_val = None
+
                 cur.execute(
-                    "INSERT INTO learning_examples (intent, question, answer) VALUES (?, ?, ?)",
-                    ("other", guest_msg, final_text)
+                    """
+                    INSERT INTO learning_examples_v2
+                    (listing_id, intent, tags, guest_message, conversation_ctx, ai_suggestion, coach_prompt,
+                     final_reply, channel, reservation_status, trip_phase, approved)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        listing_id_val, intent_val, tags_val, guest_msg_val, convo_ctx_val, ai_suggestion_val,
+                        coach_prompt_val, final_reply_val, channel_val, reservation_status_val, trip_phase_val, 1
+                    )
                 )
                 conn.commit()
                 conn.close()
             except Exception as e:
-                logging.error(f"learning_examples insert failed: {e}")
+                logging.error(f"learning_examples_v2 insert failed: {e}")
 
         # Ensure Slack update can happen
         container = payload.get("container", {}) or {}
