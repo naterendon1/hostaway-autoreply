@@ -12,6 +12,30 @@ from difflib import get_close_matches
 import re
 from openai import OpenAI
 
+# Guard for sharing access codes
+from datetime import date as _date
+
+def can_share_access(meta: dict, today: _date | None = None) -> bool:
+    """
+    Only allow sharing access codes for confirmed bookings (new/modified)
+    and within a short window before check-in (<= 2 days by default).
+    """
+    today = today or _date.today()
+    status = (meta.get("reservation_status") or "").strip().lower()
+    if status not in {"new", "modified"}:
+        return False
+
+    ci_raw = meta.get("check_in")
+    if not ci_raw:
+        return False
+    try:
+        ci = _date.fromisoformat(str(ci_raw)[:10])
+    except Exception:
+        return False
+
+    return (ci - today).days <= 2
+
+
 # --- Intent Labels ---
 INTENT_LABELS = [
     "booking inquiry",
