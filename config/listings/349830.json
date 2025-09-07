@@ -1,0 +1,61 @@
+{
+  "core_identity": {
+    "voice": "concise, casual, informal, easy to understand"
+  },
+  "access_arrival": {
+    "door_code": "0927",
+    "lockbox_location": "Upstairs, facing the front door on stair railing",
+    "backup_lockbox": { "location": "Outdoor shower", "code": "9954" },
+    "golf_cart": {
+      "upsell_name": "golf_cart",
+      "garage_door_code": "11041104",
+      "garage_lockbox_code": "0984",
+      "require_upsell": true
+    },
+    "cargo_lift": {
+      "price": 50,
+      "panel_code": "1764",
+      "require_upsell": true,
+      "note": "For luggage/groceries to top level (stilt house)"
+    },
+    "parking": "Driveway only"
+  },
+  "wifi": {
+    "ssid": "Shell Yeah! Wifi",
+    "password": "palmridge927",
+    "router_location": "Attic by access door"
+  },
+  "tech": {
+    "tvs": "All smart TVs; guest logs into own streaming apps"
+  },
+  "rules": {
+    "no_parties": true,
+    "no_smoking_anywhere": true,
+    "no_vaping_anywhere": true,
+    "pets_allowed": false,
+    "max_guests": 12,
+    "all_visitors_disclose": true,
+    "driveway_camera": true,
+    "eci_lco_policy": "Check calendar; availability can change until day-of"
+  },
+  "amenities_quirks": {
+    "thermostat": "Ecobee",
+    "kitchen_faucet_tip": "Open tap and touch the black sensor at base to turn on",
+    "storm_door_video": "https://youtube.com/shorts/J9m10InEyC0",
+    "grills": ["propane", "pellet"],
+    "laundry": "Washer/dryer available; detergent not guaranteed",
+    "beach_gear": "Some toys/chairs available; recommend bringing your own",
+    "baby_gear": "None",
+    "play_scape": true,
+    "golf_cart_rental": true,
+    "local_note": "Mosquitos get bad in Crystal Beach, TX — bring bug spray"
+  },
+  "safety": {
+    "breaker": "Laundry room",
+    "water_shutoff": "Near driveway"
+  },
+  "pricing_policy": {
+    "dynamic_pricing": true,
+    "discount_message": "Pricing is dynamic; you’re already getting the best rate."
+  }
+}
