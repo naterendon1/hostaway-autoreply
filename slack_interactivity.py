@@ -35,7 +35,11 @@ if not SLACK_BOT_TOKEN:
 
 
 # -------------------- Security: Slack Signature Verify --------------------
-def verify_slack_signature(request_body: str, slack_signature: Optional[str], slack_request_timestamp: Optional[str]) -> bool:
+def verify_slack_signature(
+    request_body: str,
+    slack_signature: Optional[str],
+    slack_request_timestamp: Optional[str]
+) -> bool:
     """
     Verify Slack request signature. If no signing secret is configured, allow (dev mode).
     """
@@ -56,12 +60,12 @@ def verify_slack_signature(request_body: str, slack_signature: Optional[str], sl
 
 
 # -------------------- Small helpers --------------------
-# Hostaway "booked/confirmed" statuses
+# Hostaway "booked/confirmed" statuses (raw)
 CONFIRMED_STATUSES = {"new", "modified"}
 
 def is_booking_confirmed(status: Optional[str]) -> bool:
     """
-    Accepts either raw Hostaway status ('new', 'modified', ...) or your pretty
+    Accepts either raw Hostaway status ('new', 'modified', ...) or pretty
     versions ('New', 'Modified', ...). We lower/trim before comparing.
     """
     return (status or "").strip().lower() in CONFIRMED_STATUSES
@@ -136,6 +140,28 @@ def get_modal_blocks(
     input_block_id: str = "reply_input",
     input_action_id: str = "reply",
 ) -> List[Dict[str, Any]]:
+    # 1) Guest message context (read-only)
+    header_section: Dict[str, Any] = {
+        "type": "section",
+        "block_id": "guest_message_section",
+        "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"},
+    }
+
+    # 2) Optional instruction for AI (host prompt to steer the rewrite)
+    ai_prompt_block: Dict[str, Any] = {
+        "type": "input",
+        "block_id": "ai_prompt_block",
+        "optional": True,
+        "label": {"type": "plain_text", "text": "Instruction for AI (optional)", "emoji": True},
+        "element": {
+            "type": "plain_text_input",
+            "action_id": "ai_prompt",
+            "multiline": True,
+            "placeholder": {"type": "plain_text", "text": "e.g., don’t offer a cleaning crew—propose pest control and next steps"},
+        },
+    }
+
+    # 3) The editable reply box
     reply_block: Dict[str, Any] = {
         "type": "input",
         "block_id": input_block_id,
@@ -149,6 +175,16 @@ def get_modal_blocks(
     if draft_text:
         reply_block["element"]["initial_value"] = draft_text
 
+    # 4) Improve with AI button row
+    improve_row: Dict[str, Any] = {
+        "type": "actions",
+        "block_id": "improve_ai_block",
+        "elements": [
+            {"type": "button", "action_id": "improve_with_ai", "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}}
+        ],
+    }
+
+    # 5) Optional learning checkbox
     learning_checkbox_option = {
         "text": {"type": "plain_text", "text": "Save this answer for next time", "emoji": True},
         "value": "save"
@@ -167,14 +203,7 @@ def get_modal_blocks(
     if checkbox_checked:
         learning_checkbox["element"]["initial_options"] = [learning_checkbox_option]
 
-    return [
-        {"type": "section", "block_id": "guest_message_section", "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"}},
-        reply_block,
-        {"type": "actions", "block_id": "improve_ai_block", "elements": [
-            {"type": "button", "action_id": "improve_with_ai", "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}}
-        ]},
-        learning_checkbox,
-    ]
+    return [header_section, ai_prompt_block, reply_block, improve_row, learning_checkbox]
 
 
 def add_undo_button(blocks: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -189,28 +218,44 @@ def add_undo_button(blocks: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[
     return blocks
 
 
-# ---------------- Background: improve + final views.update (with hash) ----------------
-def _background_improve_and_update(view_id: str, hash_value: Optional[str], meta: dict, edited_text: str, guest_name: str, guest_msg: str):
+# ---------------- Background: improve + final views.update (with host instruction) ----------------
+def _background_improve_and_update(
+    view_id: str,
+    hash_value: Optional[str],
+    meta: dict,
+    edited_text: str,
+    guest_name: str,
+    guest_msg: str,
+    custom_prompt: Optional[str] = None,  # <-- NEW
+):
     improved = edited_text
     error_message = None
+
+    # Build prompt
+    host_instruction = (custom_prompt or "").strip()
+    base_instructions = (
+        "Rewrite the reply WITHOUT changing the core facts.\n"
+        "Voice: concise, casual, informal, easy to understand. Use contractions.\n"
+        "No greeting, no sign-off, no emojis, no corporate filler.\n"
+        "Keep or tighten length. Avoid repeating what the guest said.\n\n"
+    )
+    user_payload = (
+        f"Guest message:\n{guest_msg}\n\n"
+        f"Current draft reply:\n{edited_text}\n\n"
+    )
+    if host_instruction:
+        user_payload += f"Host instruction (override/steer the reply):\n{host_instruction}\n\n"
+    user_payload += "Return ONLY the final message to the guest."
 
     if not openai_client:
         error_message = "OpenAI key not configured; showing your original text."
     else:
-        prompt = (
-            "Rewrite the reply WITHOUT changing meaning. "
-            "Goals: human host, modern, concise, casual-professional, with contractions. "
-            "No greeting, no sign-off, no emojis, no corporate filler. "
-            "Keep or tighten length. Avoid repeating what the guest said. "
-            "Return ONLY the rewritten reply.\n\n"
-            f"{edited_text}"
-        )
         try:
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You edit messages for a vacation-rental host. Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis."},
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": "You write messages for a vacation-rental host. Follow style and safety. Never include greetings/sign-offs."},
+                    {"role": "user", "content": base_instructions + user_payload}
                 ]
             )
             improved = clean_ai_reply((response.choices[0].message.content or "").strip())
@@ -225,7 +270,7 @@ def _background_improve_and_update(view_id: str, hash_value: Optional[str], meta
         action_id="edit",
         draft_text=improved,
         checkbox_checked=new_meta.get("checkbox_checked", False),
-        input_block_id="reply_input_ai",   # Force Slack to fill initial_value
+        input_block_id="reply_input_ai",   # Force Slack to re-fill initial_value
         input_action_id="reply_ai",
     )
     blocks = add_undo_button(blocks, new_meta)
@@ -474,7 +519,7 @@ async def slack_actions(
                     logging.error(f"Slack modal error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
             return JSONResponse({})
 
-        # --- IMPROVE WITH AI ---
+        # --- IMPROVE WITH AI (reads optional "Instruction for AI") ---
         if action_id == "improve_with_ai":
             view = payload.get("view", {}) or {}
             view_id = view.get("id")
@@ -495,13 +540,19 @@ async def slack_actions(
                 if edited_text:
                     break
 
-            # Checkbox state
+            # NEW: read the optional "Instruction for AI"
+            custom_prompt = ""
+            ai_prompt_block = state.get("ai_prompt_block", {})
+            if "ai_prompt" in ai_prompt_block and isinstance(ai_prompt_block["ai_prompt"], dict):
+                custom_prompt = (ai_prompt_block["ai_prompt"].get("value") or "").strip()
+
+            # Checkbox state (learning)
             state_save = state.get("save_answer_block", {})
             checkbox_checked = False
             if "save_answer" in state_save and state_save["save_answer"].get("selected_options"):
                 checkbox_checked = True
 
-            meta = {}
+            # Parse meta
             try:
                 meta = json.loads(view.get("private_metadata", "{}") or "{}")
             except Exception:
@@ -559,7 +610,7 @@ async def slack_actions(
 
             background_tasks.add_task(
                 _background_improve_and_update,
-                view_id, new_hash, loading_meta, edited_text, guest_name, guest_msg,
+                view_id, new_hash, loading_meta, edited_text, guest_name, guest_msg, custom_prompt  # pass the prompt
             )
             return JSONResponse({})
 
@@ -607,7 +658,7 @@ async def slack_actions(
 
             conv_id = meta.get("conv_id")
             communication_type = meta.get("type", "email")
-            status = (meta.get("status") or "").lower()  # pretty 'New' -> 'new' is OK
+            status = (meta.get("status") or "").lower()  # pretty 'New' -> 'new' ok
             url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
 
             if not url:
