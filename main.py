@@ -5,7 +5,7 @@ import os
 import logging
 import json
 import sqlite3
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
@@ -41,11 +41,11 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
-    "OPENAI_API_KEY",           # assistant_core needs this
+    "OPENAI_API_KEY",  # assistant_core needs this
     "SLACK_CHANNEL",
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
-    # optional: only needed if you want Places/Distances in assistant_core
+    # Optional Google keys (only if you use Places/Distances inside assistant_core)
     # "GOOGLE_PLACES_API_KEY",
     # "GOOGLE_DISTANCE_MATRIX_API_KEY",
 ]
@@ -107,7 +107,6 @@ CHANNEL_ID_MAP = {
     2005: "Booking.com",
     2007: "Expedia",
     2009: "HomeAway (iCal)",
-    2010: "Vrbo (iCal)",
     2010: "Vrbo",
     2000: "Direct",
     2013: "Booking Engine",
@@ -148,7 +147,6 @@ RES_STATUS_ALLOWED = {
 }
 
 BOOKED_STATUSES = {"new", "modified"}  # treat these as confirmed/active
-PENDING_STATUSES = {"pending", "awaitingpayment"}
 
 def format_us_date(d: str | None) -> str:
     """YYYY-MM-DD / YYYY-MM-DDTHH:MM:SS -> MM/DD/YYYY"""
@@ -259,7 +257,7 @@ def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]
 
     return {"pets_allowed": pets_allowed, "pet_fee": None, "pet_deposit_refundable": None}
 
-# ---------- Per-listing config loader ----------
+# ---------- Per-listing config loader (local JSON files) ----------
 def _safe_read_json(path: str) -> Dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -298,7 +296,6 @@ def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
     pol = dict(out.get("policies") or {})
     if isinstance(cfg.get("policies"), dict):
         pol.update({k: v for k, v in cfg["policies"].items() if v is not None})
-    # Pets policy could be under house_rules in your config; keep existing if not provided
     if "pets_allowed" in cfg:
         pol["pets_allowed"] = cfg.get("pets_allowed")
     out["policies"] = pol
@@ -306,13 +303,12 @@ def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
     # Access / arrival details
     acc = dict(out.get("access") or {})
     if isinstance(cfg.get("access_and_arrival"), dict):
-        # we’ll tuck raw fields under access; assistant_core’s guards already know to only share codes at the right time
         for k, v in cfg["access_and_arrival"].items():
             if v is not None:
                 acc[k] = v
     out["access"] = acc
 
-    # House rules & fees (kept as free-form for model context)
+    # House rules & fees (free-form context)
     if isinstance(cfg.get("house_rules"), dict):
         out["house_rules"] = cfg["house_rules"]
 
@@ -324,7 +320,7 @@ def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
     if isinstance(cfg.get("safety_and_emergencies"), dict):
         out["safety_and_emergencies"] = cfg["safety_and_emergencies"]
 
-    # Core identity (style hints for the model, if you want to use later)
+    # Core identity (optional style hints)
     if isinstance(cfg.get("core_identity"), dict):
         out["core_identity"] = cfg["core_identity"]
 
@@ -462,9 +458,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     res_status_pretty = pretty_res_status(raw_status)
     total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
 
-    # Payment & portal buttons eligibility
+    # Portal button eligibility (only for confirmed bookings)
     guest_portal_url = (res.get("guestPortalUrl") or "").strip() or None
-    show_payment_button = bool(guest_portal_url and raw_status in PENDING_STATUSES)
     show_portal_button = bool(guest_portal_url and raw_status in BOOKED_STATUSES)
 
     # Message transport status (from webhook payload)
@@ -518,7 +513,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "pet_deposit_refundable": pet_policy.get("pet_deposit_refundable"),
     }
 
-    # ---------- 5b) Load & apply per-listing config ----------
+    # ---------- Load & apply per-listing config ----------
     listing_cfg = load_listing_config(listing_id)  # reads config/listings/{id}.json or default.json
 
     meta_for_ai = {
@@ -533,8 +528,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "access": access,  # door_code & arrival_instructions if available
         "location": {"lat": lat, "lng": lng},
     }
-
-    # Merge the per-listing config into the AI metadata
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
     # ---- Guarded AI (assistant_core) ----
@@ -563,7 +556,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "check_in": check_in,
         "check_out": check_out,
         "guest_count": guest_count,
-        "status": res_status_pretty,  # reservation status (pretty)
+        "status": res_status_pretty,  # pretty status for display / interactivity
         "detected_intent": detected_intent,
         "channel_pretty": channel_pretty,
         "property_address": property_address,
@@ -605,38 +598,25 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         },
     ]
 
-    if show_payment_button:
-        actions_elements.append(
-            {
-                "type": "button",
-                "style": "primary",
-                "text": {"type": "plain_text", "text": "💳 Send payment link"},
-                "value": json.dumps({**button_meta, "action": "send_payment_link"}),
-                "action_id": "send_payment_link",
-            }
-        )
-
+    # Guest portal button (confirmed bookings only)
     if show_portal_button:
         actions_elements.append(
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "🔗 Send guest portal URL"},
-                "value": json.dumps({**button_meta, "action": "send_portal_url"}),
-                "action_id": "send_portal_url",  # slack_interactivity must handle this
+                "style": "primary",
+                "text": {"type": "plain_text", "text": "🔗 Send guest portal"},
+                "value": json.dumps({**button_meta, "action": "send_guest_portal"}),
+                "action_id": "send_guest_portal",
             }
         )
 
     blocks = [
         header_block,
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"},
-        },
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"}],
-        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
+        {"type": "context", "elements": [
+            {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"}
+        ]},
         {"type": "actions", "elements": actions_elements},
     ]
 
@@ -653,7 +633,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             blocks=blocks,
             text="New guest message",
         )
-        # Intentionally not storing ts, since each post is a new top-level message
     except SlackApiError as e:
         logging.error(f"❌ Slack send error: {e.response.data if hasattr(e, 'response') else e}")
     except Exception as e:
