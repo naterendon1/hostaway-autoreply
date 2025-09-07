@@ -54,6 +54,7 @@ if missing:
     raise RuntimeError(f"Missing required environment variables: {missing}")
 
 MAX_THREAD_MESSAGES = 10
+BOOKED_STATUSES = {"new", "modified"}  # treat these as confirmed/active
 
 # ---------- Tiny helpers wired to db.py ----------
 from db import (
@@ -73,25 +74,88 @@ def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
     channel = os.getenv("SLACK_CHANNEL")
     db_upsert_slack_thread(str(conv_id), channel or "", ts)
 
-def _bump_guest_seen(email: Optional[str]) -> int:
-    """Keep behavior; simple local counter using learning.db."""
-    if not email:
-        return 0
-    key = (email or "").strip().lower()
-    if not key:
-        return 0
-    conn = sqlite3.connect(LEARNING_DB_PATH)
-    conn.row_factory = sqlite3.Row
+# ---------- Guest history (stays) ----------
+def _ensure_guest_tables(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
+    # Tracks completed past stays (by email + reservation)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guest_stays (
+            email TEXT NOT NULL,
+            reservation_id TEXT NOT NULL,
+            checkout_date TEXT,
+            recorded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (email, reservation_id)
+        )
+    """)
+    # (Kept from earlier behavior; not used for “returning” logic now)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS guest_contacts (
             email TEXT PRIMARY KEY,
             seen_count INTEGER NOT NULL DEFAULT 0
         )
     """)
+    conn.commit()
+
+def _record_past_stay(email: Optional[str], reservation_id: Optional[str], check_out: Optional[str], raw_status: Optional[str]) -> None:
+    """Record a completed stay (checkout in the past AND status is booked)."""
+    if not email or not reservation_id or not check_out:
+        return
+    try:
+        co = date.fromisoformat(str(check_out))
+    except Exception:
+        return
+    today = date.today()
+    status_key = (raw_status or "").strip().lower()
+    if status_key in BOOKED_STATUSES and co < today:
+        conn = sqlite3.connect(LEARNING_DB_PATH)
+        _ensure_guest_tables(conn)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT OR IGNORE INTO guest_stays (email, reservation_id, checkout_date) VALUES (?, ?, ?)",
+                (email.strip().lower(), str(reservation_id), co.isoformat()),
+            )
+            conn.commit()
+        except Exception as e:
+            logging.error(f"guest_stays insert failed: {e}")
+        finally:
+            conn.close()
+
+def _is_returning_guest(email: Optional[str], current_reservation_id: Optional[str]) -> bool:
+    """True if this guest email has any *other* completed stay on record."""
+    if not email:
+        return False
+    conn = sqlite3.connect(LEARNING_DB_PATH)
+    _ensure_guest_tables(conn)
+    cur = conn.cursor()
+    try:
+        params = [email.strip().lower()]
+        sql = "SELECT COUNT(1) FROM guest_stays WHERE email=?"
+        if current_reservation_id:
+            sql += " AND reservation_id <> ?"
+            params.append(str(current_reservation_id))
+        row = cur.execute(sql, params).fetchone()
+        count = int(row[0]) if row else 0
+        return count > 0
+    except Exception as e:
+        logging.error(f"_is_returning_guest query failed: {e}")
+        return False
+    finally:
+        conn.close()
+
+def _bump_guest_seen(email: Optional[str]) -> int:
+    """Legacy counter (kept); NOT used for 'returning' badge anymore."""
+    if not email:
+        return 0
+    key = (email or "").strip().lower()
+    if not key:
+        return 0
+    conn = sqlite3.connect(LEARNING_DB_PATH)
+    _ensure_guest_tables(conn)
+    cur = conn.cursor()
     row = cur.execute("SELECT seen_count FROM guest_contacts WHERE email=?", (key,)).fetchone()
     if row:
-        seen = int(row["seen_count"]) + 1
+        seen = int(row["seen_count"] if isinstance(row, sqlite3.Row) else row[0]) + 1
         cur.execute("UPDATE guest_contacts SET seen_count=? WHERE email=?", (seen, key))
     else:
         seen = 1
@@ -145,8 +209,6 @@ RES_STATUS_ALLOWED = {
     "inquirytimedout": "Inquiry (Timed Out)",
     "inquirynotpossible": "Inquiry (Not Possible)",
 }
-
-BOOKED_STATUSES = {"new", "modified"}  # treat these as confirmed/active
 
 def format_us_date(d: str | None) -> str:
     """YYYY-MM-DD / YYYY-MM-DDTHH:MM:SS -> MM/DD/YYYY"""
@@ -212,10 +274,7 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
 
 # ---------- Extractors for AI context (door code, pets, etc.) ----------
 def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optional[Dict]) -> Dict[str, Optional[str]]:
-    """
-    Best-effort extraction of door/arrival info from Hostaway responses.
-    Looks through common fields on both reservation and listing payloads.
-    """
+    """Best-effort extraction of door/arrival info from listing & reservation payloads."""
     def _get(d: Dict, *keys: str) -> Optional[str]:
         for k in keys:
             v = d.get(k)
@@ -237,9 +296,7 @@ def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optiona
     return {"door_code": code, "arrival_instructions": arrival_instructions}
 
 def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]:
-    """
-    Try to infer the pet policy from structured fields or free text rules.
-    """
+    """Try to infer the pet policy from structured fields or free text rules."""
     listing = (listing_obj or {}).get("result") or {}
     pets_allowed = listing.get("petsAllowed") if "petsAllowed" in listing else None
 
@@ -269,9 +326,7 @@ def _safe_read_json(path: str) -> Dict:
         return {}
 
 def load_listing_config(listing_id: Optional[int | str]) -> Dict:
-    """
-    Load config/listings/{listing_id}.json, fallback to config/listings/default.json.
-    """
+    """Load config/listings/{listing_id}.json, fallback to config/listings/default.json."""
     if not listing_id:
         return _safe_read_json("config/listings/default.json")
     by_id = _safe_read_json(f"config/listings/{listing_id}.json")
@@ -280,10 +335,7 @@ def load_listing_config(listing_id: Optional[int | str]) -> Dict:
     return _safe_read_json("config/listings/default.json")
 
 def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
-    """
-    Merge selected fields from per-listing config into the AI meta dict.
-    Nonexistent sections are ignored.
-    """
+    """Merge selected fields from per-listing config into the AI meta dict."""
     out = dict(meta)
 
     # Property profile (check-in/out times, etc.)
@@ -442,12 +494,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_email:
         guest_email = convo_res.get("guestEmail") or convo_res.get("recipientEmail")
 
-    # Returning guest tag
-    returning_tag = ""
+    # Track contact count (legacy; not used for returning badge anymore)
     if guest_email:
-        seen_count = _bump_guest_seen(guest_email)
-        if seen_count > 1:
-            returning_tag = " • Returning guest!"
+        _bump_guest_seen(guest_email)
 
     check_in = res.get("arrivalDate", "N/A")
     check_out = res.get("departureDate", "N/A")
@@ -458,7 +507,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     res_status_pretty = pretty_res_status(raw_status)
     total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
 
-    # Portal button eligibility (only for confirmed bookings)
+    # Guest portal button eligibility (confirmed bookings only)
     guest_portal_url = (res.get("guestPortalUrl") or "").strip() or None
     show_portal_button = bool(guest_portal_url and raw_status in BOOKED_STATUSES)
 
@@ -544,7 +593,16 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
 
-    # Slack button meta (Edit kept; Ignore removed)
+    # ----- Record past stay & compute guest badge -----
+    _record_past_stay(guest_email, reservation_id, check_out, raw_status)
+    if guest_email and _is_returning_guest(guest_email, reservation_id):
+        guest_badge = " • Returning guest!"
+    elif guest_email:
+        guest_badge = " • New guest"
+    else:
+        guest_badge = ""
+
+    # Slack button meta
     button_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -567,7 +625,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # Slack blocks
     header_text = (
-        f"*{channel_pretty} message* from *{guest_name}*{returning_tag}\n"
+        f"*{channel_pretty} message* from *{guest_name}*{guest_badge}\n"
         f"Property: *{property_address}*\n"
         f"Dates: *{us_check_in} → {us_check_out}*\n"
         f"Guests: *{guest_count}* | Res: *{res_status_pretty}* | Price: *{total_price_str}*"
