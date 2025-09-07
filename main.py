@@ -5,7 +5,8 @@ import os
 import logging
 import json
 import sqlite3
-from typing import List, Dict, Optional
+import hashlib
+from typing import List, Dict, Optional, Any
 from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
@@ -14,25 +15,27 @@ from pydantic import BaseModel
 # Slack interactivity router (separate file)
 from slack_interactivity import router as slack_router
 
-# DB bootstrap (legacy custom_responses)
-from db import init_db
+# DB bootstrap + idempotency helpers
+from db import init_db, get_slack_thread as db_get_slack_thread, upsert_slack_thread as db_upsert_slack_thread
+from db import already_processed, mark_processed
 
 # Guarded AI composer
 from assistant_core import compose_reply as ac_compose
 
-# Utils you already have
+# Utils you already have (+ new helper can_share_access)
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
     clean_ai_reply,
+    can_share_access,  # <-- NEW
 )
 
 # ---- App & logging ----
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 app.include_router(slack_router, prefix="/slack")
-init_db()  # keeps your legacy table alive
+init_db()  # keeps your legacy table(s) alive + idempotency table
 
 # ---- Env checks ----
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
@@ -54,14 +57,8 @@ if missing:
     raise RuntimeError(f"Missing required environment variables: {missing}")
 
 MAX_THREAD_MESSAGES = 10
-BOOKED_STATUSES = {"new", "modified"}  # treat these as confirmed/active
 
-# ---------- Tiny helpers wired to db.py ----------
-from db import (
-    get_slack_thread as db_get_slack_thread,  # kept for backwards compat (unused now)
-    upsert_slack_thread as db_upsert_slack_thread,
-)
-
+# ---------- Tiny helpers wired to db.py (kept for compatibility) ----------
 def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
     if not conv_id:
         return None
@@ -74,88 +71,25 @@ def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
     channel = os.getenv("SLACK_CHANNEL")
     db_upsert_slack_thread(str(conv_id), channel or "", ts)
 
-# ---------- Guest history (stays) ----------
-def _ensure_guest_tables(conn: sqlite3.Connection) -> None:
-    cur = conn.cursor()
-    # Tracks completed past stays (by email + reservation)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS guest_stays (
-            email TEXT NOT NULL,
-            reservation_id TEXT NOT NULL,
-            checkout_date TEXT,
-            recorded_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (email, reservation_id)
-        )
-    """)
-    # (Kept from earlier behavior; not used for “returning” logic now)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS guest_contacts (
-            email TEXT PRIMARY KEY,
-            seen_count INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-    conn.commit()
-
-def _record_past_stay(email: Optional[str], reservation_id: Optional[str], check_out: Optional[str], raw_status: Optional[str]) -> None:
-    """Record a completed stay (checkout in the past AND status is booked)."""
-    if not email or not reservation_id or not check_out:
-        return
-    try:
-        co = date.fromisoformat(str(check_out))
-    except Exception:
-        return
-    today = date.today()
-    status_key = (raw_status or "").strip().lower()
-    if status_key in BOOKED_STATUSES and co < today:
-        conn = sqlite3.connect(LEARNING_DB_PATH)
-        _ensure_guest_tables(conn)
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "INSERT OR IGNORE INTO guest_stays (email, reservation_id, checkout_date) VALUES (?, ?, ?)",
-                (email.strip().lower(), str(reservation_id), co.isoformat()),
-            )
-            conn.commit()
-        except Exception as e:
-            logging.error(f"guest_stays insert failed: {e}")
-        finally:
-            conn.close()
-
-def _is_returning_guest(email: Optional[str], current_reservation_id: Optional[str]) -> bool:
-    """True if this guest email has any *other* completed stay on record."""
-    if not email:
-        return False
-    conn = sqlite3.connect(LEARNING_DB_PATH)
-    _ensure_guest_tables(conn)
-    cur = conn.cursor()
-    try:
-        params = [email.strip().lower()]
-        sql = "SELECT COUNT(1) FROM guest_stays WHERE email=?"
-        if current_reservation_id:
-            sql += " AND reservation_id <> ?"
-            params.append(str(current_reservation_id))
-        row = cur.execute(sql, params).fetchone()
-        count = int(row[0]) if row else 0
-        return count > 0
-    except Exception as e:
-        logging.error(f"_is_returning_guest query failed: {e}")
-        return False
-    finally:
-        conn.close()
-
 def _bump_guest_seen(email: Optional[str]) -> int:
-    """Legacy counter (kept); NOT used for 'returning' badge anymore."""
+    """Simple local counter using learning.db to tag returning guests."""
     if not email:
         return 0
     key = (email or "").strip().lower()
     if not key:
         return 0
     conn = sqlite3.connect(LEARNING_DB_PATH)
-    _ensure_guest_tables(conn)
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guest_contacts (
+            email TEXT PRIMARY KEY,
+            seen_count INTEGER NOT NULL DEFAULT 0
+        )
+    """)
     row = cur.execute("SELECT seen_count FROM guest_contacts WHERE email=?", (key,)).fetchone()
     if row:
-        seen = int(row["seen_count"] if isinstance(row, sqlite3.Row) else row[0]) + 1
+        seen = int(row["seen_count"]) + 1
         cur.execute("UPDATE guest_contacts SET seen_count=? WHERE email=?", (seen, key))
     else:
         seen = 1
@@ -209,6 +143,8 @@ RES_STATUS_ALLOWED = {
     "inquirytimedout": "Inquiry (Timed Out)",
     "inquirynotpossible": "Inquiry (Not Possible)",
 }
+
+BOOKED_STATUSES = {"new", "modified"}  # treat these as confirmed/active
 
 def format_us_date(d: str | None) -> str:
     """YYYY-MM-DD / YYYY-MM-DDTHH:MM:SS -> MM/DD/YYYY"""
@@ -274,7 +210,10 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
 
 # ---------- Extractors for AI context (door code, pets, etc.) ----------
 def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optional[Dict]) -> Dict[str, Optional[str]]:
-    """Best-effort extraction of door/arrival info from listing & reservation payloads."""
+    """
+    Best-effort extraction of door/arrival info from Hostaway responses.
+    Looks through common fields on both reservation and listing payloads.
+    """
     def _get(d: Dict, *keys: str) -> Optional[str]:
         for k in keys:
             v = d.get(k)
@@ -296,7 +235,9 @@ def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optiona
     return {"door_code": code, "arrival_instructions": arrival_instructions}
 
 def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]:
-    """Try to infer the pet policy from structured fields or free text rules."""
+    """
+    Try to infer the pet policy from structured fields or free text rules.
+    """
     listing = (listing_obj or {}).get("result") or {}
     pets_allowed = listing.get("petsAllowed") if "petsAllowed" in listing else None
 
@@ -326,7 +267,9 @@ def _safe_read_json(path: str) -> Dict:
         return {}
 
 def load_listing_config(listing_id: Optional[int | str]) -> Dict:
-    """Load config/listings/{listing_id}.json, fallback to config/listings/default.json."""
+    """
+    Load config/listings/{listing_id}.json, fallback to config/listings/default.json.
+    """
     if not listing_id:
         return _safe_read_json("config/listings/default.json")
     by_id = _safe_read_json(f"config/listings/{listing_id}.json")
@@ -335,7 +278,10 @@ def load_listing_config(listing_id: Optional[int | str]) -> Dict:
     return _safe_read_json("config/listings/default.json")
 
 def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
-    """Merge selected fields from per-listing config into the AI meta dict."""
+    """
+    Merge selected fields from per-listing config into the AI meta dict.
+    Nonexistent sections are ignored.
+    """
     out = dict(meta)
 
     # Property profile (check-in/out times, etc.)
@@ -451,9 +397,25 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str | None = None
     date: str | None = None
 
+def _derive_event_id(payload: HostawayUnifiedWebhook) -> str:
+    """
+    Stable id for idempotency. Prefer explicit message ids; else hash core fields.
+    """
+    d = payload.data or {}
+    for k in ("id", "messageId", "conversationMessageId"):
+        if d.get(k):
+            return str(d[k])
+    base = f"{d.get('conversationId','')}-{d.get('created','')}-{d.get('body','')}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
+
+    # ---- Idempotency: drop duplicates early
+    ev_id = _derive_event_id(payload)
+    if already_processed("hostaway", ev_id):
+        return {"status": "duplicate_ignored"}
 
     # Only handle inbound guest messages
     if payload.event != "message.received" or payload.object != "conversationMessage":
@@ -494,9 +456,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_email:
         guest_email = convo_res.get("guestEmail") or convo_res.get("recipientEmail")
 
-    # Track contact count (legacy; not used for returning badge anymore)
+    # Returning guest tag — ONLY if we've seen their email before
+    returning_tag = ""
     if guest_email:
-        _bump_guest_seen(guest_email)
+        seen_count = _bump_guest_seen(guest_email)
+        if seen_count > 1:
+            returning_tag = " • Returning guest!"
+        # else: keep it empty (no "new guest" label unless you explicitly want it)
 
     check_in = res.get("arrivalDate", "N/A")
     check_out = res.get("departureDate", "N/A")
@@ -507,7 +473,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     res_status_pretty = pretty_res_status(raw_status)
     total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
 
-    # Guest portal button eligibility (confirmed bookings only)
+    # Guest portal button eligibility (only for confirmed bookings)
     guest_portal_url = (res.get("guestPortalUrl") or "").strip() or None
     show_portal_button = bool(guest_portal_url and raw_status in BOOKED_STATUSES)
 
@@ -532,7 +498,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         property_address = str(addr_raw)
 
-    # Lat/Lng for food/distance recs
+    # Lat/Lng (optional downstream use)
     loc_res = (listing_obj or {}).get("result", {}) or {}
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
@@ -579,6 +545,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
+    # ---------- Guard access-code sharing (mask codes unless allowed) ----------
+    share_ok = can_share_access(meta_for_ai)
+    meta_for_ai["access_share_allowed"] = share_ok
+    if not share_ok:
+        acc = dict(meta_for_ai.get("access") or {})
+        # wipe out any fields that look code-ish so the model never sees them
+        for k in list(acc.keys()):
+            if any(token in k.lower() for token in ("code", "pin", "lockbox", "garage", "panel", "entry")):
+                acc[k] = None
+        meta_for_ai["access"] = acc
+
     # ---- Guarded AI (assistant_core) ----
     ai_json, _unused_blocks = ac_compose(
         guest_message=guest_msg,
@@ -593,16 +570,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
 
-    # ----- Record past stay & compute guest badge -----
-    _record_past_stay(guest_email, reservation_id, check_out, raw_status)
-    if guest_email and _is_returning_guest(guest_email, reservation_id):
-        guest_badge = " • Returning guest!"
-    elif guest_email:
-        guest_badge = " • New guest"
-    else:
-        guest_badge = ""
-
-    # Slack button meta
+    # Slack button meta (Edit kept; Ignore removed)
     button_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -625,12 +593,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     # Slack blocks
     header_text = (
-        f"*{channel_pretty} message* from *{guest_name}*{guest_badge}\n"
+        f"*{channel_pretty} message* from *{guest_name}*{returning_tag}\n"
         f"Property: *{property_address}*\n"
         f"Dates: *{us_check_in} → {us_check_out}*\n"
         f"Guests: *{guest_count}* | Res: *{res_status_pretty}* | Price: *{total_price_str}*"
     )
-    header_block: Dict = {
+    header_block: Dict[str, Any] = {
         "type": "section",
         "text": {"type": "mrkdwn", "text": header_text},
     }
@@ -641,7 +609,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "alt_text": guest_name or "Guest photo",
         }
 
-    actions_elements = [
+    actions_elements: List[Dict[str, Any]] = [
         {
             "type": "button",
             "text": {"type": "plain_text", "text": "✅ Send"},
@@ -691,6 +659,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             blocks=blocks,
             text="New guest message",
         )
+        # Mark processed only after we successfully handled it
+        try:
+            mark_processed("hostaway", ev_id)
+        except Exception as e:
+            logging.error(f"mark_processed failed: {e}")
     except SlackApiError as e:
         logging.error(f"❌ Slack send error: {e.response.data if hasattr(e, 'response') else e}")
     except Exception as e:
