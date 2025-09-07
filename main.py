@@ -5,13 +5,13 @@ import os
 import logging
 import json
 import sqlite3
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
 
-# Slack interactivity router
+# Slack interactivity router (separate file)
 from slack_interactivity import router as slack_router
 
 # DB bootstrap (legacy custom_responses)
@@ -45,12 +45,15 @@ REQUIRED_ENV_VARS = [
     "SLACK_CHANNEL",
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
-    "GOOGLE_PLACES_API_KEY",
-    "GOOGLE_DISTANCE_MATRIX_API_KEY",
+    # optional: only needed if you want Places/Distances in assistant_core
+    # "GOOGLE_PLACES_API_KEY",
+    # "GOOGLE_DISTANCE_MATRIX_API_KEY",
 ]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
     raise RuntimeError(f"Missing required environment variables: {missing}")
+
+MAX_THREAD_MESSAGES = 10
 
 # ---------- Tiny helpers wired to db.py ----------
 from db import (
@@ -59,14 +62,12 @@ from db import (
 )
 
 def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
-    # No longer used when always posting new messages, but kept for safety.
     if not conv_id:
         return None
     rec = db_get_slack_thread(str(conv_id))
     return rec["ts"] if rec else None
 
 def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
-    # No longer used when always posting new messages, but kept for safety.
     if not conv_id or not ts:
         return
     channel = os.getenv("SLACK_CHANNEL")
@@ -107,6 +108,7 @@ CHANNEL_ID_MAP = {
     2007: "Expedia",
     2009: "HomeAway (iCal)",
     2010: "Vrbo (iCal)",
+    2010: "Vrbo",
     2000: "Direct",
     2013: "Booking Engine",
     2015: "Custom iCal",
@@ -144,6 +146,9 @@ RES_STATUS_ALLOWED = {
     "inquirytimedout": "Inquiry (Timed Out)",
     "inquirynotpossible": "Inquiry (Not Possible)",
 }
+
+BOOKED_STATUSES = {"new", "modified"}  # treat these as confirmed/active
+PENDING_STATUSES = {"pending", "awaitingpayment"}
 
 def format_us_date(d: str | None) -> str:
     """YYYY-MM-DD / YYYY-MM-DDTHH:MM:SS -> MM/DD/YYYY"""
@@ -207,13 +212,6 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
         return "past"
     return "unknown"
 
-def is_booked_status(raw_status: Optional[str]) -> bool:
-    """Booked = confirmed reservation (not inquiry/pending/awaiting/declined/etc.)."""
-    if not raw_status:
-        return False
-    s = raw_status.strip().lower()
-    return s in {"new", "modified"}  # adjust if you treat others as 'booked'
-
 # ---------- Extractors for AI context (door code, pets, etc.) ----------
 def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optional[Dict]) -> Dict[str, Optional[str]]:
     """
@@ -261,60 +259,80 @@ def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]
 
     return {"pets_allowed": pets_allowed, "pet_fee": None, "pet_deposit_refundable": None}
 
-# -------- Conversation history builder for AI --------
-def _strip_quotes(s: str) -> str:
-    """Remove quoted lines (start with '>') & excess whitespace to keep tokens low."""
-    if not s:
-        return s
-    lines = []
-    for ln in str(s).splitlines():
-        # drop quoted blocks and mail-style headers
-        if ln.strip().startswith(">"):
-            continue
-        if ln.strip().lower().startswith("on ") and " wrote:" in ln.lower():
-            continue
-        lines.append(ln)
-    return "\n".join(lines).strip()
+# ---------- Per-listing config loader ----------
+def _safe_read_json(path: str) -> Dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logging.error(f"Failed to read JSON at {path}: {e}")
+        return {}
 
-def build_ai_history(conversation_messages: List[Dict], max_items: int = 60, char_budget: int = 12000) -> List[Dict[str, str]]:
+def load_listing_config(listing_id: Optional[int | str]) -> Dict:
     """
-    Convert Hostaway conversation messages into a compact role/text list for the model.
-    - Merges consecutive messages by the same role.
-    - Strips quoted reply lines to save tokens.
-    - Keeps the *most recent* messages within a character budget.
+    Load config/listings/{listing_id}.json, fallback to config/listings/default.json.
     """
-    # Ensure chronological order by message id if present
-    msgs_sorted = sorted(conversation_messages or [], key=lambda x: x.get("id", 0))
+    if not listing_id:
+        return _safe_read_json("config/listings/default.json")
+    by_id = _safe_read_json(f"config/listings/{listing_id}.json")
+    if by_id:
+        return by_id
+    return _safe_read_json("config/listings/default.json")
 
-    merged: List[Dict[str, str]] = []
-    last_role = None
-    for m in msgs_sorted:
-        text = (m.get("body") or "").strip()
-        if not text:
-            continue
-        role = "guest" if m.get("isIncoming") else "host"
+def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
+    """
+    Merge selected fields from per-listing config into the AI meta dict.
+    Nonexistent sections are ignored.
+    """
+    out = dict(meta)
 
-        text = _strip_quotes(text)
-        if not text:
-            continue
+    # Property profile (check-in/out times, etc.)
+    prof = dict(out.get("property_profile") or {})
+    if isinstance(cfg.get("property_profile"), dict):
+        prof.update({k: v for k, v in cfg["property_profile"].items() if v is not None})
+    out["property_profile"] = prof
 
-        if merged and last_role == role:
-            merged[-1]["text"] = (merged[-1]["text"] + "\n" + text).strip()
-        else:
-            merged.append({"role": role, "text": text})
-            last_role = role
+    # Policies
+    pol = dict(out.get("policies") or {})
+    if isinstance(cfg.get("policies"), dict):
+        pol.update({k: v for k, v in cfg["policies"].items() if v is not None})
+    # Pets policy could be under house_rules in your config; keep existing if not provided
+    if "pets_allowed" in cfg:
+        pol["pets_allowed"] = cfg.get("pets_allowed")
+    out["policies"] = pol
 
-    # Trim from the end (most recent first) to stay under budgets
-    kept: List[Dict[str, str]] = []
-    total_chars = 0
-    for item in reversed(merged):
-        t = item["text"]
-        total_chars += len(t)
-        kept.append(item)
-        if total_chars >= char_budget or len(kept) >= max_items:
-            break
+    # Access / arrival details
+    acc = dict(out.get("access") or {})
+    if isinstance(cfg.get("access_and_arrival"), dict):
+        # we’ll tuck raw fields under access; assistant_core’s guards already know to only share codes at the right time
+        for k, v in cfg["access_and_arrival"].items():
+            if v is not None:
+                acc[k] = v
+    out["access"] = acc
 
-    return list(reversed(kept))
+    # House rules & fees (kept as free-form for model context)
+    if isinstance(cfg.get("house_rules"), dict):
+        out["house_rules"] = cfg["house_rules"]
+
+    # Amenities & quirks (free-form context)
+    if isinstance(cfg.get("amenities_and_quirks"), dict):
+        out["amenities_and_quirks"] = cfg["amenities_and_quirks"]
+
+    # Safety & emergencies
+    if isinstance(cfg.get("safety_and_emergencies"), dict):
+        out["safety_and_emergencies"] = cfg["safety_and_emergencies"]
+
+    # Core identity (style hints for the model, if you want to use later)
+    if isinstance(cfg.get("core_identity"), dict):
+        out["core_identity"] = cfg["core_identity"]
+
+    # Upsells / add-ons if present
+    if isinstance(cfg.get("upsells"), dict):
+        out["upsells"] = cfg["upsells"]
+
+    return out
 
 # ---------- Admin endpoints ----------
 def require_admin(
@@ -373,7 +391,7 @@ def list_feedback(limit: int = 100) -> List[Dict]:
         (limit,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]  # keep legacy admin endpoints unchanged
+    return [dict(r) for r in rows]  # <-- keep legacy admin endpoints unchanged
 
 # ---------- Webhook ----------
 class HostawayUnifiedWebhook(BaseModel):
@@ -414,7 +432,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     res = reservation.get("result", {}) or {}
 
     guest_name = res.get("guestFirstName", "Guest")
-    # Try to capture guest email and picture
     guest_email = res.get("guestEmail") or None
 
     # Conversation (for picture/email fallback and history)
@@ -441,20 +458,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     guest_count = res.get("numberOfGuests", "N/A")
 
     # Reservation status & total price
-    res_status_pretty = pretty_res_status(res.get("status"))
+    raw_status = (res.get("status") or "").strip().lower()
+    res_status_pretty = pretty_res_status(raw_status)
     total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
 
-    # Payment link eligibility (pending/awaitingPayment + guestPortalUrl)
-    raw_status = (res.get("status") or "").strip().lower()
+    # Payment & portal buttons eligibility
     guest_portal_url = (res.get("guestPortalUrl") or "").strip() or None
-
-    show_payment_button = bool(
-        guest_portal_url and raw_status in {"pending", "awaitingpayment"}
-    )
-    # Guest portal button only for *booked* reservations
-    show_guest_portal_button = bool(
-        guest_portal_url and is_booked_status(raw_status)
-    )
+    show_payment_button = bool(guest_portal_url and raw_status in PENDING_STATUSES)
+    show_portal_button = bool(guest_portal_url and raw_status in BOOKED_STATUSES)
 
     # Message transport status (from webhook payload)
     msg_status = pretty_status(payload.data.get("status") or "sent")
@@ -477,7 +488,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         property_address = str(addr_raw)
 
-    # Lat/Lng for food/distance recs (forwarded to assistant_core)
+    # Lat/Lng for food/distance recs
     loc_res = (listing_obj or {}).get("result", {}) or {}
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
@@ -486,11 +497,16 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
 
-    # Conversation context (fuller slice, merged & de-quoted)
+    # Conversation context (last few)
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
-    conversation_history = build_ai_history(msgs, max_items=60, char_budget=12000)
+
+    conversation_history = [
+        {"role": "guest" if m.get("isIncoming") else "host", "text": m.get("body", "")}
+        for m in msgs[-MAX_THREAD_MESSAGES:]
+        if m.get("body")
+    ]
 
     # Minimal property profile (sane defaults; assistant_core also has defaults)
     property_profile = {"checkin_time": "4:00 PM", "checkout_time": "11:00 AM"}
@@ -501,6 +517,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "pet_fee": pet_policy.get("pet_fee"),
         "pet_deposit_refundable": pet_policy.get("pet_deposit_refundable"),
     }
+
+    # ---------- 5b) Load & apply per-listing config ----------
+    listing_cfg = load_listing_config(listing_id)  # reads config/listings/{id}.json or default.json
 
     meta_for_ai = {
         "listing_id": (str(listing_id) if listing_id is not None else ""),
@@ -515,6 +534,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "location": {"lat": lat, "lng": lng},
     }
 
+    # Merge the per-listing config into the AI metadata
+    meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
+
+    # ---- Guarded AI (assistant_core) ----
     ai_json, _unused_blocks = ac_compose(
         guest_message=guest_msg,
         conversation_history=conversation_history,
@@ -528,7 +551,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
 
-    # Slack button meta (Edit present; Payment & Guest Portal optional)
+    # Slack button meta (Edit kept; Ignore removed)
     button_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -581,6 +604,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "action_id": "edit",
         },
     ]
+
     if show_payment_button:
         actions_elements.append(
             {
@@ -591,13 +615,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 "action_id": "send_payment_link",
             }
         )
-    if show_guest_portal_button:
+
+    if show_portal_button:
         actions_elements.append(
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "🔗 Send guest portal"},
-                "value": json.dumps({**button_meta, "action": "send_guest_portal_url"}),
-                "action_id": "send_guest_portal_url",
+                "text": {"type": "plain_text", "text": "🔗 Send guest portal URL"},
+                "value": json.dumps({**button_meta, "action": "send_portal_url"}),
+                "action_id": "send_portal_url",  # slack_interactivity must handle this
             }
         )
 
