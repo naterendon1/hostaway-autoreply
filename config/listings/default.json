@@ -1,0 +1,13 @@
+{
+  "core_identity": {
+    "voice": "concise, casual, informal, easy to understand"
+  },
+  "policies": {
+    "dynamic_pricing": true,
+    "discount_message": "Pricing is dynamic; you’re already getting the best rate."
+  },
+  "checkin": {
+    "is_self_checkin": true,
+    "allow_early_if_no_turnover": true
+  }
+}
