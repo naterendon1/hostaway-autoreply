@@ -1,3 +1,6 @@
+Here’s the full, fixed `main.py` with the local recs block placed correctly and included in `meta_for_ai`, plus the single-argument idempotency call:
+
+```python
 # =========================
 # File: main.py
 # =========================
@@ -10,6 +13,8 @@ from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
+
+from places import should_fetch_local_recs, build_local_recs
 
 # Slack interactivity router (separate file you already have)
 from slack_interactivity import router as slack_router
@@ -60,17 +65,20 @@ from db import (
 )
 db_init()
 
+
 def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
     if not conv_id:
         return None
     rec = db_get_slack_thread(str(conv_id))
     return rec["ts"] if rec else None
 
+
 def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
     if not conv_id or not ts:
         return
     channel = os.getenv("SLACK_CHANNEL")
     db_upsert_slack_thread(str(conv_id), channel or "", ts)
+
 
 # ---------- Legacy tiny local helper (kept for backwards safety, unused now) ----------
 def _bump_guest_seen_local(email: Optional[str]) -> int:
@@ -102,6 +110,7 @@ def _bump_guest_seen_local(email: Optional[str]) -> int:
     conn.commit()
     conn.close()
     return seen
+
 
 # ---------- Helpers for Slack header formatting ----------
 CHANNEL_ID_MAP = {
@@ -150,6 +159,7 @@ RES_STATUS_ALLOWED = {
 }
 BOOKED_STATUSES = {"new", "modified"}  # treat these as confirmed/active
 
+
 def format_us_date(d: str | None) -> str:
     """YYYY-MM-DD / YYYY-MM-DDTHH:MM:SS -> MM/DD/YYYY"""
     if not d:
@@ -163,6 +173,7 @@ def format_us_date(d: str | None) -> str:
             continue
     return s
 
+
 def format_price(amount, currency: str | None = "USD") -> str:
     try:
         val = float(amount)
@@ -172,17 +183,20 @@ def format_price(amount, currency: str | None = "USD") -> str:
     symbol = "$" if cur == "USD" else f"{cur} "
     return f"{symbol}{val:,.2f}"
 
+
 def pretty_res_status(s: str | None) -> str:
     if not s:
         return "Unknown"
     key = str(s).strip().lower().replace("_", "").replace("-", "")
     return RES_STATUS_ALLOWED.get(key, s.capitalize())
 
+
 def pretty_status(s: str | None) -> str:
     if not isinstance(s, str):
         return "Unknown"
     m = s.strip().replace("_", " ").replace("-", " ")
     return m[:1].upper() + m[1:] if m else "Unknown"
+
 
 def channel_label_from(channel_id: Optional[int], communication_type: Optional[str]) -> str:
     if isinstance(channel_id, int) and channel_id in CHANNEL_ID_MAP:
@@ -196,6 +210,7 @@ def channel_label_from(channel_id: Optional[int], communication_type: Optional[s
         key = str(communication_type).lower().strip()
         return COMM_TYPE_MAP.get(key, key.capitalize())
     return "Channel"
+
 
 def trip_phase(check_in: str | None, check_out: str | None) -> str:
     try:
@@ -211,6 +226,7 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
     if co and today > co:
         return "past"
     return "unknown"
+
 
 # ---------- Extractors for AI context (door code, pets, etc.) ----------
 def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optional[Dict]) -> Dict[str, Optional[str]]:
@@ -238,6 +254,7 @@ def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optiona
     )
     return {"door_code": code, "arrival_instructions": arrival_instructions}
 
+
 def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]:
     """
     Try to infer the pet policy from structured fields or free text rules.
@@ -259,6 +276,7 @@ def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]
 
     return {"pets_allowed": pets_allowed, "pet_fee": None, "pet_deposit_refundable": None}
 
+
 # ---------- Per-listing config loader (local JSON files) ----------
 def _safe_read_json(path: str) -> Dict:
     try:
@@ -270,6 +288,7 @@ def _safe_read_json(path: str) -> Dict:
         logging.error(f"Failed to read JSON at {path}: {e}")
         return {}
 
+
 def load_listing_config(listing_id: Optional[int | str]) -> Dict:
     """
     Load config/listings/{listing_id}.json, fallback to config/listings/default.json.
@@ -280,6 +299,7 @@ def load_listing_config(listing_id: Optional[int | str]) -> Dict:
     if by_id:
         return by_id
     return _safe_read_json("config/listings/default.json")
+
 
 def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
     """
@@ -332,6 +352,7 @@ def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
 
     return out
 
+
 # ---------- Admin endpoints ----------
 def require_admin(
     x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
@@ -340,6 +361,7 @@ def require_admin(
     supplied = x_admin_token or token
     if supplied != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
 
 @app.get("/learning", dependencies=[Depends(require_admin)])
 def list_learning(limit: int = 100) -> List[Dict]:
@@ -364,6 +386,7 @@ def list_learning(limit: int = 100) -> List[Dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
 
 @app.get("/feedback", dependencies=[Depends(require_admin)])
 def list_feedback(limit: int = 100) -> List[Dict]:
@@ -390,6 +413,7 @@ def list_feedback(limit: int = 100) -> List[Dict]:
     conn.close()
     return [dict(r) for r in rows]
 
+
 # ---------- Webhook ----------
 class HostawayUnifiedWebhook(BaseModel):
     object: str
@@ -399,6 +423,7 @@ class HostawayUnifiedWebhook(BaseModel):
     body: str | None = None
     listingName: str | None = None
     date: str | None = None
+
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
@@ -525,6 +550,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if m.get("body")
     ]
 
+    # --- Local Places (live POIs) ---
+    local_recs_api = []
+    try:
+        if lat is not None and lng is not None and should_fetch_local_recs(guest_msg):
+            local_recs_api = build_local_recs(lat, lng, guest_msg)
+    except Exception as e:
+        logging.warning(f"Local recs fetch failed: {e}")
+        local_recs_api = []
+
     # Minimal property profile (sane defaults; assistant_core may override)
     property_profile = {"checkin_time": "4:00 PM", "checkout_time": "11:00 AM"}
 
@@ -549,6 +583,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "policies": policies,
         "access": access,  # door_code & arrival_instructions if available
         "location": {"lat": lat, "lng": lng},
+        "local_recs_api": local_recs_api,  # <= include POIs here (AFTER we fetched them)
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
@@ -667,7 +702,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     return {"status": "ok"}
 
+
 # ---------- Health ----------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+```
