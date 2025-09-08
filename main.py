@@ -1,6 +1,3 @@
-Here’s the full, fixed `main.py` with the local recs block placed correctly and included in `meta_for_ai`, plus the single-argument idempotency call:
-
-```python
 # =========================
 # File: main.py
 # =========================
