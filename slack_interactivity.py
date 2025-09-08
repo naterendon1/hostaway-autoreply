@@ -148,7 +148,7 @@ def update_slack_message_with_sent_reply(
         ctx_elems.append({"type": "mrkdwn", "text": ":bookmark_tabs: Saved for AI learning"})
 
     header_text = (
-        f"*{channel_label} message* from *{guest_name}*
+        f"*{channel_label} message* from *{guest_name}*"
 "
         f"Property: *{addr}*
 "
