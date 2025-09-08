@@ -81,23 +81,39 @@ def _post_thread_note(channel: Optional[str], ts: Optional[str], text: str) -> N
         logging.error(f"Thread note failed: {e}")
 
 
-# ---- Local recs injector --------------------------------------------------
+# ---------------- Places injection ----------------
 def inject_local_recs(meta: Dict[str, Any], guest_msg_override: Optional[str] = None) -> Dict[str, Any]:
-    """Compute local recs (if lat/lng present and query qualifies) and attach to meta.
-    Safe no-op on failures. Returns the mutated meta for convenience.
+    """
+    Populate meta["local_recs_api"] with live POIs based on lat/lng and a qualifying guest message.
+    Safe no-op on any failure.
     """
     try:
-        loc = meta.get("location") or {}
-        lat = loc.get("lat")
-        lng = loc.get("lng")
-        guest_msg = guest_msg_override if guest_msg_override is not None else (meta.get("guest_message") or "")
+        lat = None
+        lng = None
+        guest_msg = guest_msg_override
+        # Prefer nested location dict if present
+        loc = meta.get("location") if isinstance(meta, dict) else None
+        if isinstance(loc, dict):
+            lat = loc.get("lat")
+            lng = loc.get("lng")
+        # Fallbacks if lat/lng are at top-level
+        if lat is None:
+            lat = meta.get("lat") if isinstance(meta, dict) else None
+        if lng is None:
+            lng = meta.get("lng") if isinstance(meta, dict) else None
+        if guest_msg is None:
+            guest_msg = (meta.get("guest_message") or "") if isinstance(meta, dict) else ""
+
         local_recs_api: List[Dict[str, Any]] = []
-        if lat is not None and lng is not None and should_fetch_local_recs(guest_msg):
-            local_recs_api = build_local_recs(lat, lng, guest_msg)
+        if lat is not None and lng is not None and should_fetch_local_recs(guest_msg or ""):
+            local_recs_api = build_local_recs(lat, lng, guest_msg or "")
         meta["local_recs_api"] = local_recs_api
     except Exception as e:
         logging.warning(f"[interactivity] Local recs fetch failed: {e}")
-        meta["local_recs_api"] = []
+        try:
+            meta["local_recs_api"] = []
+        except Exception:
+            pass
     return meta
 
 
@@ -131,16 +147,18 @@ def update_slack_message_with_sent_reply(
     if saved_for_learning:
         ctx_elems.append({"type": "mrkdwn", "text": ":bookmark_tabs: Saved for AI learning"})
 
+    header_text = (
+        f"*{channel_label} message* from *{guest_name}*
+"
+        f"Property: *{addr}*
+"
+        f"Dates: *{check_in} → {check_out}*
+"
+        f"Guests: *{guest_count}* | Status: *{status}*"
+    )
+
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": (
-            f"*{channel_label} message* from *{guest_name}*
-"
-            f"Property: *{addr}*
-"
-            f"Dates: *{check_in} → {check_out}*
-"
-            f"Guests: *{guest_count}* | Status: *{status}*"
-        )}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*
 >{sent_reply}"}},
@@ -151,7 +169,9 @@ def update_slack_message_with_sent_reply(
     try:
         _client.chat_update(channel=channel, ts=ts, blocks=blocks, text="Reply sent to guest!")
     except SlackApiError as e:
-        logging.error(f"❌ Failed to update Slack message with sent reply: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
+        logging.error(
+            f"❌ Failed to update Slack message with sent reply: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}"
+        )
 
 
 # --------- Modal building blocks ----------
@@ -175,12 +195,12 @@ def get_modal_blocks(
     reply_block: Dict[str, Any] = {
         "type": "input",
         "block_id": input_block_id,
-        "label": {"type": "plain_text", "text": "Your reply:" if action_id == "write_own" else "Edit below:", "emoji": True},
+        "label": {"type": "plain_text", "text": ("Your reply:" if action_id == "write_own" else "Edit below:"), "emoji": True},
         "element": {
             "type": "plain_text_input",
             "action_id": input_action_id,
             "multiline": True,
-        }
+        },
     }
     if draft_text:
         reply_block["element"]["initial_value"] = draft_text
@@ -196,16 +216,16 @@ def get_modal_blocks(
             "multiline": True,
             "placeholder": {
                 "type": "plain_text",
-                "text": "Tell the AI how to tweak this reply (e.g., 'offer pest control, not cleaners')."
-            }
-        }
+                "text": "Tell the AI how to tweak this reply (e.g., 'offer pest control, not cleaners').",
+            },
+        },
     }
     if coach_prompt_initial:
         coach_block["element"]["initial_value"] = coach_prompt_initial[:3000]
 
     learning_checkbox_option = {
         "text": {"type": "plain_text", "text": "Save this answer for next time", "emoji": True},
-        "value": "save"
+        "value": "save",
     }
     learning_checkbox: Dict[str, Any] = {
         "type": "input",
@@ -213,35 +233,53 @@ def get_modal_blocks(
         "element": {
             "type": "checkboxes",
             "action_id": "save_answer",
-            "options": [learning_checkbox_option]
+            "options": [learning_checkbox_option],
         },
         "label": {"type": "plain_text", "text": "Learning", "emoji": True},
-        "optional": True
+        "optional": True,
     }
     if checkbox_checked:
         learning_checkbox["element"]["initial_options"] = [learning_checkbox_option]
 
     return [
-        {"type": "section", "block_id": "guest_message_section", "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}
-*Message*: {guest_msg}"}},
+        {
+            "type": "section",
+            "block_id": "guest_message_section",
+            "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}
+*Message*: {guest_msg}"},
+        },
         reply_block,
         coach_block,
-        {"type": "actions", "block_id": "improve_ai_block", "elements": [
-            {"type": "button", "action_id": "improve_with_ai", "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True}}
-        ]},
+        {
+            "type": "actions",
+            "block_id": "improve_ai_block",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "improve_with_ai",
+                    "text": {"type": "plain_text", "text": "Improve with AI", "emoji": True},
+                }
+            ],
+        },
         learning_checkbox,
     ]
 
 
 def add_undo_button(blocks: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     if meta.get("previous_draft"):
-        blocks.append({
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "Undo AI", "emoji": True},
-                 "value": json.dumps(meta), "action_id": "undo_ai"}
-            ]
-        })
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Undo AI", "emoji": True},
+                        "value": json.dumps(meta),
+                        "action_id": "undo_ai",
+                    }
+                ],
+            }
+        )
     return blocks
 
 
@@ -253,7 +291,7 @@ def _background_improve_and_update(
     edited_text: str,
     coach_prompt_text: Optional[str],
     guest_name: str,
-    guest_msg: str
+    guest_msg: str,
 ):
     """
     Uses OpenAI to improve the draft, guided by an optional coach prompt.
@@ -294,8 +332,8 @@ def _background_improve_and_update(
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": sys},
-                    {"role": "user", "content": user}
-                ]
+                    {"role": "user", "content": user},
+                ],
             )
             improved = clean_ai_reply((response.choices[0].message.content or "").strip())
         except Exception as e:
@@ -304,19 +342,23 @@ def _background_improve_and_update(
 
     # Keep the previous draft so "Undo AI" works
     new_meta = {**meta, "previous_draft": edited_text, "improving": False, "coach_prompt": coach_prompt_text or ""}
+
     blocks = get_modal_blocks(
         guest_name,
         guest_msg,
         action_id="edit",
         draft_text=improved,
         checkbox_checked=new_meta.get("checkbox_checked", False),
-        input_block_id="reply_input_ai",   # Force Slack to refill initial_value
+        input_block_id="reply_input_ai",  # Force Slack to refill initial_value
         input_action_id="reply_ai",
         coach_prompt_initial=coach_prompt_text or "",
     )
     blocks = add_undo_button(blocks, new_meta)
     if error_message:
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}}] + blocks
+        blocks = (
+            [{"type": "section", "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}}]
+            + blocks
+        )
 
     final_view = {
         "type": "modal",
@@ -324,7 +366,7 @@ def _background_improve_and_update(
         "submit": {"type": "plain_text", "text": "Send", "emoji": True},
         "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
         "private_metadata": json.dumps(new_meta),
-        "blocks": blocks
+        "blocks": blocks,
     }
 
     if not slack_client:
@@ -390,7 +432,7 @@ def _background_send_and_update(meta: dict, reply_text: str):
                 channel=channel,
                 ts=ts,
                 blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}}],
-                text="Failed to send reply."
+                text="Failed to send reply.",
             )
         except Exception as e:
             logging.error(f"Slack chat_update error: {e}")
@@ -463,12 +505,14 @@ async def slack_actions(
         # --- SEND ---
         if action_id == "send":
             meta = get_meta_from_action(action)
-            meta = inject_local_recs(meta)  # attach local recs if applicable
             # Ensure channel/ts are present for later update
             if channel_id and not meta.get("channel"):
                 meta["channel"] = channel_id
             if message_ts and not meta.get("ts"):
                 meta["ts"] = message_ts
+
+            # Try to enrich meta with local recs before send (harmless if unused)
+            inject_local_recs(meta)
 
             reply_text = meta.get("reply", meta.get("ai_suggestion", "")).strip()
             conv_id = meta.get("conv_id")
@@ -484,9 +528,14 @@ async def slack_actions(
                         view={
                             "type": "modal",
                             "title": {"type": "plain_text", "text": "Sending...", "emoji": True},
-                            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."}}],
-                            "close": {"type": "plain_text", "text": "Close", "emoji": True}
-                        }
+                            "blocks": [
+                                {
+                                    "type": "section",
+                                    "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."},
+                                }
+                            ],
+                            "close": {"type": "plain_text", "text": "Close", "emoji": True},
+                        },
                     )
             except Exception as e:
                 logging.error(f"Slack sending-modal update error: {e}")
@@ -497,12 +546,13 @@ async def slack_actions(
         # --- WRITE OWN ---
         if action_id == "write_own":
             meta = get_meta_from_action(action)
-            meta = inject_local_recs(meta)
             if channel_id:
                 meta["channel"] = channel_id
             if message_ts:
                 meta["ts"] = message_ts
             meta["sent_label"] = "original message sent"
+
+            inject_local_recs(meta)
 
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "(Message unavailable)")
@@ -516,9 +566,13 @@ async def slack_actions(
                 "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
                 "private_metadata": json.dumps(meta),
                 "blocks": get_modal_blocks(
-                    guest_name, guest_msg, action_id="write_own",
-                    draft_text="", checkbox_checked=checkbox_checked,
-                    input_block_id="reply_input", input_action_id="reply",
+                    guest_name,
+                    guest_msg,
+                    action_id="write_own",
+                    draft_text="",
+                    checkbox_checked=checkbox_checked,
+                    input_block_id="reply_input",
+                    input_action_id="reply",
                     coach_prompt_initial=coach_prompt_initial,
                 ),
             }
@@ -529,12 +583,13 @@ async def slack_actions(
         # --- EDIT ---
         if action_id == "edit":
             meta = get_meta_from_action(action)
-            meta = inject_local_recs(meta)
             if channel_id:
                 meta["channel"] = channel_id
             if message_ts:
                 meta["ts"] = message_ts
             meta["sent_label"] = "edited message sent"
+
+            inject_local_recs(meta)
 
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "(Message unavailable)")
@@ -543,9 +598,13 @@ async def slack_actions(
             coach_prompt_initial = meta.get("coach_prompt", "")
 
             modal_blocks = get_modal_blocks(
-                guest_name, guest_msg, action_id="edit",
-                draft_text=ai_suggestion, checkbox_checked=checkbox_checked,
-                input_block_id="reply_input", input_action_id="reply",
+                guest_name,
+                guest_msg,
+                action_id="edit",
+                draft_text=ai_suggestion,
+                checkbox_checked=checkbox_checked,
+                input_block_id="reply_input",
+                input_action_id="reply",
                 coach_prompt_initial=coach_prompt_initial,
             )
             modal_blocks = add_undo_button(modal_blocks, meta)
@@ -565,7 +624,9 @@ async def slack_actions(
                     else:
                         slack_client.views_push(trigger_id=trigger_id, view=modal)
                 except SlackApiError as e:
-                    logging.error(f"Slack modal error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
+                    logging.error(
+                        f"Slack modal error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}"
+                    )
             return JSONResponse({})
 
         # --- IMPROVE WITH AI ---
@@ -610,18 +671,28 @@ async def slack_actions(
                 logging.info("Improve clicked while already improving; ignoring.")
                 return JSONResponse({})
 
+            # Ensure fresh local recs in meta (uses the latest typed message if provided)
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "")
-            meta = inject_local_recs(meta, guest_msg_override=guest_msg)
+            inject_local_recs(meta, guest_msg_override=guest_msg)
 
             # Show loading view (and set improving flag)
-            loading_meta = {**meta, "improving": True, "checkbox_checked": checkbox_checked, "coach_prompt": coach_prompt_value}
+            loading_meta = {
+                **meta,
+                "improving": True,
+                "checkbox_checked": checkbox_checked,
+                "coach_prompt": coach_prompt_value,
+            }
             loading_blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply…"}}
+                {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply…"}},
             ] + get_modal_blocks(
-                guest_name, guest_msg, action_id="edit",
-                draft_text=edited_text, checkbox_checked=checkbox_checked,
-                input_block_id="reply_input", input_action_id="reply",
+                guest_name,
+                guest_msg,
+                action_id="edit",
+                draft_text=edited_text,
+                checkbox_checked=checkbox_checked,
+                input_block_id="reply_input",
+                input_action_id="reply",
                 coach_prompt_initial=coach_prompt_value,
             )
             loading_view = {
@@ -644,7 +715,9 @@ async def slack_actions(
                     logging.error(f"views_update (loading) returned ok=false: {err}")
                     resp2 = slack_client.views_update(view_id=view_id, view=loading_view)
                     if not resp2.get("ok"):
-                        logging.error(f"views_update (loading) fallback ok=false: {resp2.get('error')}")
+                        logging.error(
+                            f"views_update (loading) fallback ok=false: {resp2.get('error')}"
+                        )
                         return JSONResponse({})
                 new_hash = (resp.get("view") or {}).get("hash") or resp.get("hash")
             except Exception as e:
@@ -653,7 +726,9 @@ async def slack_actions(
                     resp2 = slack_client.views_update(view_id=view_id, view=loading_view)
                     new_hash = (resp2.get("view") or {}).get("hash") or resp2.get("hash")
                     if not resp2.get("ok"):
-                        logging.error(f"views_update (loading) exception-fallback ok=false: {resp2.get('error')}")
+                        logging.error(
+                            f"views_update (loading) exception-fallback ok=false: {resp2.get('error')}"
+                        )
                         return JSONResponse({})
                 except Exception as e2:
                     logging.error(f"views_update (loading) second exception: {e2}")
@@ -661,24 +736,35 @@ async def slack_actions(
 
             background_tasks.add_task(
                 _background_improve_and_update,
-                view_id, new_hash, loading_meta, edited_text, coach_prompt_value, guest_name, guest_msg,
+                view_id,
+                new_hash,
+                loading_meta,
+                edited_text,
+                coach_prompt_value,
+                guest_name,
+                guest_msg,
             )
             return JSONResponse({})
 
         # --- UNDO AI ---
         if action_id == "undo_ai":
             meta = get_meta_from_action(action)
-            meta = inject_local_recs(meta)
             guest_name = meta.get("guest_name", "Guest")
             guest_msg = meta.get("guest_message", "")
             previous_draft = meta.get("previous_draft", "")
             checkbox_checked = meta.get("checkbox_checked", False)
             coach_prompt_initial = meta.get("coach_prompt", "")
 
+            inject_local_recs(meta)
+
             blocks = get_modal_blocks(
-                guest_name, guest_msg, action_id="edit",
-                draft_text=previous_draft, checkbox_checked=checkbox_checked,
-                input_block_id="reply_input", input_action_id="reply",
+                guest_name,
+                guest_msg,
+                action_id="edit",
+                draft_text=previous_draft,
+                checkbox_checked=checkbox_checked,
+                input_block_id="reply_input",
+                input_action_id="reply",
                 coach_prompt_initial=coach_prompt_initial,
             )
             blocks = add_undo_button(blocks, meta)
@@ -697,13 +783,14 @@ async def slack_actions(
                     else:
                         slack_client.views_push(trigger_id=trigger_id, view=modal)
                 except SlackApiError as e:
-                    logging.error(f"Slack views push/open error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
+                    logging.error(
+                        f"Slack views push/open error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}"
+                    )
             return JSONResponse({})
 
         # --- SEND GUEST PORTAL (confirmed bookings only) ---
         if action_id == "send_guest_portal":
             meta = get_meta_from_action(action)
-            meta = inject_local_recs(meta)
             # Ensure channel/ts available for thread note feedback
             if channel_id and not meta.get("channel"):
                 meta["channel"] = channel_id
@@ -748,7 +835,6 @@ async def slack_actions(
             meta = json.loads(view.get("private_metadata", "{}") or "{}")
         except Exception:
             meta = {}
-        meta = inject_local_recs(meta)
 
         # Prefer improved field if present
         reply_text: Optional[str] = None
@@ -767,10 +853,12 @@ async def slack_actions(
             coach_prompt_value = (cp_block["coach_prompt"].get("value") or "").strip() or None
 
         if not reply_text or not meta.get("conv_id"):
-            return JSONResponse({
-                "response_action": "errors",
-                "errors": {"reply_input": "Please enter a reply (and make sure we have a conversation id)."}
-            })
+            return JSONResponse(
+                {
+                    "response_action": "errors",
+                    "errors": {"reply_input": "Please enter a reply (and make sure we have a conversation id)."},
+                }
+            )
 
         # Save “learn for next time” checkbox
         save_for_next_time = False
@@ -778,6 +866,9 @@ async def slack_actions(
         if "save_answer" in save_block and save_block["save_answer"].get("selected_options"):
             save_for_next_time = True
         meta["saved_for_learning"] = bool(save_for_next_time)
+
+        # Ensure meta has local recs (for richer learning context)
+        inject_local_recs(meta)
 
         if save_for_next_time:
             # 1) Keep your legacy store (optional, unchanged)
@@ -796,7 +887,8 @@ async def slack_actions(
             try:
                 conn = sqlite3.connect(LEARNING_DB_PATH)
                 cur = conn.cursor()
-                cur.execute("""
+                cur.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS learning_examples_v2 (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         listing_id        TEXT,
@@ -813,7 +905,8 @@ async def slack_actions(
                         approved          INTEGER DEFAULT 1,
                         created_at        TEXT DEFAULT CURRENT_TIMESTAMP
                     )
-                """)
+                    """
+                )
                 # Insert
                 listing_id_val = str(meta.get("listing_id") or "") or None
                 intent_val = meta.get("detected_intent") or "other"
@@ -821,14 +914,15 @@ async def slack_actions(
                 guest_msg_val = (meta.get("guest_message") or "")[:4000]
                 convo_ctx_val = None  # not available here; could be added later from webhook
                 ai_suggestion_val = (meta.get("ai_suggestion") or "")[:4000]
-                coach_prompt_val = (coach_prompt_value or None)
+                coach_prompt_val = coach_prompt_value or None
                 final_reply_val = reply_text[:8000]
                 channel_val = meta.get("type") or None
-                reservation_status_val = (meta.get("status") or None)
+                reservation_status_val = meta.get("status") or None
                 # rough phase if check_in/out provided
                 trip_phase_val = None
                 try:
                     from datetime import date
+
                     def _phase(ci: Optional[str], co: Optional[str]) -> Optional[str]:
                         try:
                             ci_d = date.fromisoformat(ci) if ci else None
@@ -843,6 +937,7 @@ async def slack_actions(
                         if co_d and today > co_d:
                             return "past"
                         return None
+
                     trip_phase_val = _phase(meta.get("check_in"), meta.get("check_out"))
                 except Exception:
                     trip_phase_val = None
@@ -855,9 +950,19 @@ async def slack_actions(
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        listing_id_val, intent_val, tags_val, guest_msg_val, convo_ctx_val, ai_suggestion_val,
-                        coach_prompt_val, final_reply_val, channel_val, reservation_status_val, trip_phase_val, 1
-                    )
+                        listing_id_val,
+                        intent_val,
+                        tags_val,
+                        guest_msg_val,
+                        convo_ctx_val,
+                        ai_suggestion_val,
+                        coach_prompt_val,
+                        final_reply_val,
+                        channel_val,
+                        reservation_status_val,
+                        trip_phase_val,
+                        1,
+                    ),
                 )
                 conn.commit()
                 conn.close()
