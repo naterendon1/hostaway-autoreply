@@ -5,41 +5,35 @@ import os
 import logging
 import json
 import sqlite3
-import hashlib
 from typing import List, Dict, Optional, Any
 from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
 
-# Slack interactivity router (separate file)
+# Slack interactivity router (separate file you already have)
 from slack_interactivity import router as slack_router
-
-# DB bootstrap + idempotency helpers
-from db import init_db, get_slack_thread as db_get_slack_thread, upsert_slack_thread as db_upsert_slack_thread
-from db import already_processed, mark_processed
 
 # Guarded AI composer
 from assistant_core import compose_reply as ac_compose
 
-# Utils you already have (+ new helper can_share_access)
+# Utils you already have
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
     clean_ai_reply,
-    can_share_access,  # <-- NEW
 )
 
 # ---- App & logging ----
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 app.include_router(slack_router, prefix="/slack")
-init_db()  # keeps your legacy table(s) alive + idempotency table
 
 # ---- Env checks ----
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")
+SHOW_NEW_GUEST_TAG = os.getenv("SHOW_NEW_GUEST_TAG", "0") in ("1", "true", "True", "yes", "YES")
 
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
@@ -48,9 +42,6 @@ REQUIRED_ENV_VARS = [
     "SLACK_CHANNEL",
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
-    # Optional Google keys (only if you use Places/Distances inside assistant_core)
-    # "GOOGLE_PLACES_API_KEY",
-    # "GOOGLE_DISTANCE_MATRIX_API_KEY",
 ]
 missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
@@ -58,7 +49,17 @@ if missing:
 
 MAX_THREAD_MESSAGES = 10
 
-# ---------- Tiny helpers wired to db.py (kept for compatibility) ----------
+# ---------- DB bootstrap & helpers ----------
+from db import init_db as db_init
+from db import (
+    get_slack_thread as db_get_slack_thread,   # kept for compat (not used; we post new parents)
+    upsert_slack_thread as db_upsert_slack_thread,
+    note_guest,                                # returning/new guest counter
+    already_processed,                         # idempotency helpers (single arg)
+    mark_processed,
+)
+db_init()
+
 def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
     if not conv_id:
         return None
@@ -71,8 +72,12 @@ def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
     channel = os.getenv("SLACK_CHANNEL")
     db_upsert_slack_thread(str(conv_id), channel or "", ts)
 
-def _bump_guest_seen(email: Optional[str]) -> int:
-    """Simple local counter using learning.db to tag returning guests."""
+# ---------- Legacy tiny local helper (kept for backwards safety, unused now) ----------
+def _bump_guest_seen_local(email: Optional[str]) -> int:
+    """
+    Old local counter using learning.db. Prefer db.note_guest now.
+    Kept only as safety; not used.
+    """
     if not email:
         return 0
     key = (email or "").strip().lower()
@@ -143,7 +148,6 @@ RES_STATUS_ALLOWED = {
     "inquirytimedout": "Inquiry (Timed Out)",
     "inquirynotpossible": "Inquiry (Not Possible)",
 }
-
 BOOKED_STATUSES = {"new", "modified"}  # treat these as confirmed/active
 
 def format_us_date(d: str | None) -> str:
@@ -180,7 +184,7 @@ def pretty_status(s: str | None) -> str:
     m = s.strip().replace("_", " ").replace("-", " ")
     return m[:1].upper() + m[1:] if m else "Unknown"
 
-def channel_label_from(channel_id: int | None, communication_type: str | None) -> str:
+def channel_label_from(channel_id: Optional[int], communication_type: Optional[str]) -> str:
     if isinstance(channel_id, int) and channel_id in CHANNEL_ID_MAP:
         name = CHANNEL_ID_MAP[channel_id]
         if "vrbo" in name.lower():
@@ -214,7 +218,7 @@ def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optiona
     Best-effort extraction of door/arrival info from Hostaway responses.
     Looks through common fields on both reservation and listing payloads.
     """
-    def _get(d: Dict, *keys: str) -> Optional[str]:
+    def _get(d: Dict[str, Any], *keys: str) -> Optional[str]:
         for k in keys:
             v = d.get(k)
             if isinstance(v, str) and v.strip():
@@ -345,17 +349,16 @@ def list_learning(limit: int = 100) -> List[Dict]:
         """
         CREATE TABLE IF NOT EXISTS learning_examples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guest_message TEXT,
-            ai_suggestion TEXT,
-            user_reply TEXT,
-            listing_id TEXT,
-            guest_id TEXT,
+            intent TEXT,
+            question TEXT,
+            answer TEXT,
+            coach_prompt TEXT,
             created_at TEXT
         )
     """
     )
     rows = conn.execute(
-        "SELECT id, guest_message, ai_suggestion, user_reply, listing_id, guest_id, created_at "
+        "SELECT id, intent, question, answer, coach_prompt, created_at "
         "FROM learning_examples ORDER BY id DESC LIMIT ?",
         (limit,),
     ).fetchall()
@@ -385,7 +388,7 @@ def list_feedback(limit: int = 100) -> List[Dict]:
         (limit,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]  # <-- keep legacy admin endpoints unchanged
+    return [dict(r) for r in rows]
 
 # ---------- Webhook ----------
 class HostawayUnifiedWebhook(BaseModel):
@@ -397,45 +400,44 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str | None = None
     date: str | None = None
 
-def _derive_event_id(payload: HostawayUnifiedWebhook) -> str:
-    """
-    Stable id for idempotency. Prefer explicit message ids; else hash core fields.
-    """
-    d = payload.data or {}
-    for k in ("id", "messageId", "conversationMessageId"):
-        if d.get(k):
-            return str(d[k])
-    base = f"{d.get('conversationId','')}-{d.get('created','')}-{d.get('body','')}"
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()
-
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
 
-    # ---- Idempotency: drop duplicates early
-    ev_id = _derive_event_id(payload)
-    if already_processed("hostaway", ev_id):
-        return {"status": "duplicate_ignored"}
-
-    # Only handle inbound guest messages
+    # We only handle inbound guest messages (conversation message received)
     if payload.event != "message.received" or payload.object != "conversationMessage":
         return {"status": "ignored"}
 
-    guest_msg = payload.data.get("body", "")
+    # ------------- Idempotency (single-argument key) -------------
+    d = payload.data or {}
+    ev_core = (
+        d.get("id")
+        or d.get("hash")
+        or d.get("channelThreadMessageId")
+        or d.get("conversationId")
+        or d.get("reservationId")
+        or ""
+    )
+    event_key = f"{payload.object}:{payload.event}:{ev_core}"
+    if already_processed(event_key):
+        return {"status": "duplicate"}
+
+    guest_msg = d.get("body", "")
     if not guest_msg:
-        if payload.data.get("attachments"):
+        if d.get("attachments"):
             logging.info("📷 Skipping image-only message.")
         else:
             logging.info("🧾 Empty message skipped.")
+        mark_processed(event_key)
         return {"status": "ignored"}
 
     # Basic IDs/context
-    conv_id = payload.data.get("conversationId")
-    reservation_id = payload.data.get("reservationId")
-    listing_id = payload.data.get("listingMapId")
-    guest_id = payload.data.get("userId", "")
-    communication_type = payload.data.get("communicationType", "channel")
-    channel_id = payload.data.get("channelId")
+    conv_id = d.get("conversationId")
+    reservation_id = d.get("reservationId")
+    listing_id = d.get("listingMapId")
+    guest_id = d.get("userId", "")
+    communication_type = d.get("communicationType", "channel")
+    channel_id = d.get("channelId")
 
     # Reservation (Hostaway)
     reservation = fetch_hostaway_reservation(reservation_id) or {}
@@ -456,13 +458,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_email:
         guest_email = convo_res.get("guestEmail") or convo_res.get("recipientEmail")
 
-    # Returning guest tag — ONLY if we've seen their email before
+    # Returning / New guest tag (uses persistent db.guests)
     returning_tag = ""
     if guest_email:
-        seen_count = _bump_guest_seen(guest_email)
+        try:
+            seen_count = note_guest(guest_email.strip().lower())
+        except Exception as e:
+            logging.error(f"note_guest failed: {e}")
+            seen_count = 1
         if seen_count > 1:
             returning_tag = " • Returning guest!"
-        # else: keep it empty (no "new guest" label unless you explicitly want it)
+        elif SHOW_NEW_GUEST_TAG and seen_count == 1:
+            returning_tag = " • New guest!"
 
     check_in = res.get("arrivalDate", "N/A")
     check_out = res.get("departureDate", "N/A")
@@ -473,12 +480,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     res_status_pretty = pretty_res_status(raw_status)
     total_price_str = format_price(res.get("totalPrice"), (res.get("currency") or "USD"))
 
-    # Guest portal button eligibility (only for confirmed bookings)
+    # Portal button eligibility (only for confirmed/active bookings)
     guest_portal_url = (res.get("guestPortalUrl") or "").strip() or None
     show_portal_button = bool(guest_portal_url and raw_status in BOOKED_STATUSES)
 
     # Message transport status (from webhook payload)
-    msg_status = pretty_status(payload.data.get("status") or "sent")
+    msg_status = pretty_status(d.get("status") or "sent")
 
     # Slack channel/label
     channel_pretty = channel_label_from(channel_id, communication_type)
@@ -498,7 +505,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         property_address = str(addr_raw)
 
-    # Lat/Lng (optional downstream use)
+    # Lat/Lng for food/distance recs
     loc_res = (listing_obj or {}).get("result", {}) or {}
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
@@ -518,7 +525,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if m.get("body")
     ]
 
-    # Minimal property profile (sane defaults; assistant_core also has defaults)
+    # Minimal property profile (sane defaults; assistant_core may override)
     property_profile = {"checkin_time": "4:00 PM", "checkout_time": "11:00 AM"}
 
     # Policies for the model (include pet policy)
@@ -545,17 +552,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
-    # ---------- Guard access-code sharing (mask codes unless allowed) ----------
-    share_ok = can_share_access(meta_for_ai)
-    meta_for_ai["access_share_allowed"] = share_ok
-    if not share_ok:
-        acc = dict(meta_for_ai.get("access") or {})
-        # wipe out any fields that look code-ish so the model never sees them
-        for k in list(acc.keys()):
-            if any(token in k.lower() for token in ("code", "pin", "lockbox", "garage", "panel", "entry")):
-                acc[k] = None
-        meta_for_ai["access"] = acc
-
     # ---- Guarded AI (assistant_core) ----
     ai_json, _unused_blocks = ac_compose(
         guest_message=guest_msg,
@@ -570,7 +566,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
 
-    # Slack button meta (Edit kept; Ignore removed)
+    # Slack button meta (Edit kept)
     button_meta = {
         "conv_id": conv_id,
         "listing_id": listing_id,
@@ -609,7 +605,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "alt_text": guest_name or "Guest photo",
         }
 
-    actions_elements: List[Dict[str, Any]] = [
+    actions_elements = [
         {
             "type": "button",
             "text": {"type": "plain_text", "text": "✅ Send"},
@@ -659,15 +655,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             blocks=blocks,
             text="New guest message",
         )
-        # Mark processed only after we successfully handled it
-        try:
-            mark_processed("hostaway", ev_id)
-        except Exception as e:
-            logging.error(f"mark_processed failed: {e}")
+        # mark processed only after successful handling
+        mark_processed(event_key)
     except SlackApiError as e:
         logging.error(f"❌ Slack send error: {e.response.data if hasattr(e, 'response') else e}")
+        # do not mark processed so it can retry
+        raise
     except Exception as e:
         logging.error(f"❌ Slack send error: {e}")
+        raise
 
     return {"status": "ok"}
 
