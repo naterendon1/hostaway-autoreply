@@ -50,10 +50,10 @@ def verify_slack_signature(request_body: str, slack_signature: Optional[str], sl
     if not slack_signature:
         return False
 
-    basestring = f"v0:{slack_request_timestamp}:{request_body}".encode("utf-8")
+    base_string = f"v0:{slack_request_timestamp}:{request_body}".encode("utf-8")
     my_signature = "v0=" + hmac.new(
         SLACK_SIGNING_SECRET.encode("utf-8"),
-        basestring,
+        base_string,
         hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(my_signature, slack_signature)
@@ -148,20 +148,16 @@ def update_slack_message_with_sent_reply(
         ctx_elems.append({"type": "mrkdwn", "text": ":bookmark_tabs: Saved for AI learning"})
 
     header_text = (
-        f"*{channel_label} message* from *{guest_name}*"
-"
-        f"Property: *{addr}*
-"
-        f"Dates: *{check_in} → {check_out}*
-"
+        f"*{channel_label} message* from *{guest_name}*\n"
+        f"Property: *{addr}*\n"
+        f"Dates: *{check_in} → {check_out}*\n"
         f"Guests: *{guest_count}* | Status: *{status}*"
     )
 
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*
->{sent_reply}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}},
         {"type": "context", "elements": ctx_elems},
         {"type": "section", "text": {"type": "mrkdwn", "text": f":white_check_mark: *{sent_label}*"}},
     ]
@@ -245,8 +241,7 @@ def get_modal_blocks(
         {
             "type": "section",
             "block_id": "guest_message_section",
-            "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}
-*Message*: {guest_msg}"},
+            "text": {"type": "mrkdwn", "text": f"*Guest*: {guest_name}\n*Message*: {guest_msg}"},
         },
         reply_block,
         coach_block,
@@ -309,21 +304,12 @@ def _background_improve_and_update(
             "Style: concise, casual, informal, easy to understand."
         )
         user = (
-            "Guest message:
-"
-            f"{guest_msg}
-
-"
-            "Current draft reply (to improve, not to lengthen):
-"
-            f"{edited_text}
-
-"
-            "Coach prompt (host's instruction to adjust the reply):
-"
-            f"{(coach_prompt_text or '').strip() or '(none)'}
-
-"
+            "Guest message:\n"
+            f"{guest_msg}\n\n"
+            "Current draft reply (to improve, not to lengthen):\n"
+            f"{edited_text}\n\n"
+            "Coach prompt (host's instruction to adjust the reply):\n"
+            f"{(coach_prompt_text or '').strip() or '(none)'}\n\n"
             "Rewrite the reply to satisfy the coach prompt if present, keep the same intent, and stay concise. "
             "Return ONLY the rewritten reply."
         )
@@ -843,7 +829,7 @@ async def slack_actions(
                 reply_text = block["reply_ai"]["value"]
                 break
             if "reply" in block and isinstance(block["reply"], dict) and block["reply"].get("value"):
-                reply_text = block["reply"].get("value")
+                reply_text = block["reply"]["value"]
                 break
 
         # Optional coach prompt (to save with learning)
