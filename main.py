@@ -431,7 +431,12 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         return {"status": "ignored"}
 
     # ------------- Idempotency (single-argument key) -------------
-    d = payload.data or {}
+    d = payload.data or []
+    if isinstance(d, dict):
+        d = d
+    else:
+        d = {}
+
     ev_core = (
         d.get("id")
         or d.get("hash")
@@ -580,7 +585,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "policies": policies,
         "access": access,  # door_code & arrival_instructions if available
         "location": {"lat": lat, "lng": lng},
-        "local_recs_api": local_recs_api,  # <= include POIs here (AFTER we fetched them)
+        "local_recs_api": local_recs_api,  # <= include POIs here
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
@@ -704,4 +709,3 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
-```
