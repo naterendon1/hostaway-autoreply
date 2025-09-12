@@ -18,6 +18,7 @@ from utils import (
     send_reply_to_hostaway,
     store_learning_example,  # legacy helper kept for backwards compatibility
     clean_ai_reply,
+    sanitize_ai_reply,
 )
 from places import should_fetch_local_recs, build_local_recs
 
@@ -417,8 +418,19 @@ def _background_improve_and_update(
 
 # ---------------- Background: send to Hostaway + update Slack ----------------
 def _background_send_and_update(meta: dict, reply_text: str):
+    # Last-mile guardrail so we never apologize / offer cleaners without cause
     try:
-        ok = send_reply_to_hostaway(meta["conv_id"], reply_text, meta.get("type", "email"))
+        reply_text = sanitize_ai_reply(reply_text, meta.get("guest_message", ""))
+    except Exception:
+        pass
+
+    # Actually send to Hostaway
+    try:
+        ok = send_reply_to_hostaway(
+            meta["conv_id"],
+            reply_text,
+            meta.get("type", "email")
+        )
     except Exception as e:
         logging.error(f"Hostaway send error: {e}")
         ok = False
@@ -455,7 +467,10 @@ def _background_send_and_update(meta: dict, reply_text: str):
             slack_client.chat_update(
                 channel=channel,
                 ts=ts,
-                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}}],
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
+                }],
                 text="Failed to send reply.",
             )
         except Exception as e:
