@@ -614,9 +614,9 @@ def _distance_matrix(lat: float, lng: float, dests: List[Tuple[float, float]]) -
         logging.error(f"Distance matrix error: {e}")
         return []
 
-def _build_food_recs(lat: Optional[float], lng: Optional[float]]) -> List[Dict[str, Any]]:
-    """Return a list of {label, name, rating, reviews, distance, duration, place_id, maps_url} buckets."""
-    if not (lat and lng):
+def _build_food_recs(lat: Optional[float], lng: Optional[float]) -> List[Dict[str, Any]]:
+    """Return a list of {label, name, rating, reviews, distance, duration} buckets."""
+    if lat is None or lng is None:
         return []
     categories = [
         ("BBQ", "bbq barbecue"),
@@ -626,21 +626,18 @@ def _build_food_recs(lat: Optional[float], lng: Optional[float]]) -> List[Dict[s
     ]
     all_picks: List[Dict[str, Any]] = []
     for label, kw in categories:
-        picks = _places_nearby(lat, lng, kw, max_results=4)
+        picks = _places_nearby(float(lat), float(lng), kw, max_results=4)
         if not picks:
             continue
         top = picks[0]
-        top["label"] = label
-        all_picks.append(top)
-    dests = [(p["lat"], p["lng"]) for p in all_picks if p.get("lat") and p.get("lng")]
-    dists = _distance_matrix(lat, lng, dests) if dests else []
+        all_picks.append({"label": label, **top})
+
+    dests = [(p["lat"], p["lng"]) for p in all_picks if p.get("lat") is not None and p.get("lng") is not None]
+    dists = _distance_matrix(float(lat), float(lng), dests) if dests else []
     for i, p in enumerate(all_picks):
         if i < len(dists):
             p["distance"] = dists[i].get("distance")
             p["duration"] = dists[i].get("duration")
-        pid = p.get("place_id")
-        if pid:
-            p["maps_url"] = f"https://www.google.com/maps/place/?q=place_id:{pid}"
     return all_picks
 
 def _format_food_recs(recs: List[Dict[str, Any]]) -> str:
