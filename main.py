@@ -426,7 +426,8 @@ class HostawayUnifiedWebhook(BaseModel):
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
-
+    payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    logging.info("📬 Webhook received (keys only): %s", list(payload_dict.keys()))
     # We only handle inbound guest messages (conversation message received)
     if payload.event != "message.received" or payload.object != "conversationMessage":
         return {"status": "ignored"}
@@ -532,7 +533,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     loc_res = (listing_obj or {}).get("result", {}) or {}
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
-
+    tz_name = (
+         loc_res.get("timeZone") or loc_res.get("timezone")
+         or (listing_cfg.get("property_profile") or {}).get("timezone")
+         or None
+     )
     # Extract access details & pet policy for AI context
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
@@ -569,6 +574,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "check_in": check_in if isinstance(check_in, str) else str(check_in),
         "check_out": check_out if isinstance(check_out, str) else str(check_out),
         "reservation_status": (res.get("status") or "").strip(),  # raw status for guards
+        "timezone": tz_name,
         "property_profile": property_profile,
         "policies": policies,
         "access": access,  # door_code & arrival_instructions if available
@@ -684,10 +690,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     from slack_sdk.errors import SlackApiError
 
     slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+    from slack_sdk.web.async_client import AsyncWebClient
+    from slack_sdk.errors import SlackApiError
+    slack_client = AsyncWebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     slack_channel = os.getenv("SLACK_CHANNEL")
-
+    if not slack_channel:
+        logging.error("SLACK_CHANNEL missing; skipping Slack post.")
+        mark_processed(event_key)
+        return {"status": "ok"}
     try:
         slack_client.chat_postMessage(
+        resp = await slack_client.chat_postMessage(
             channel=slack_channel,
             blocks=blocks,
             text="New guest message",
@@ -695,6 +708,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         # mark processed only after successful handling
         mark_processed(event_key)
     except SlackApiError as e:
+
+       # Handle rate limits once
+         if getattr(e, "response", None) and e.response.status_code == 429:
+             await asyncio.sleep(int(e.response.headers.get("Retry-After", "1")))
+             resp = await slack_client.chat_postMessage(
+                 channel=slack_channel, blocks=blocks, text="New guest message"
+             )
+             mark_processed(event_key)
+             return {"status": "ok"}
         logging.error(f"❌ Slack send error: {e.response.data if hasattr(e, 'response') else e}")
         # do not mark processed so it can retry
         raise
