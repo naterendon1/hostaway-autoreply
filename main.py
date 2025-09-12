@@ -674,10 +674,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     ]
 
     # Post to Slack — ALWAYS create a new parent message (no threading by conv_id)
-    from slack_sdk.web.async_client import AsyncWebClient
+    from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
 
-    slack_client = AsyncWebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+    slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     slack_channel = os.getenv("SLACK_CHANNEL")
     if not slack_channel:
         logging.error("SLACK_CHANNEL missing; skipping Slack post.")
@@ -685,7 +685,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         return {"status": "ok"}
 
     try:
-        resp = await slack_client.chat_postMessage(
+        # Run sync Slack client in a thread so we don't block the event loop
+        await asyncio.to_thread(
+            slack_client.chat_postMessage,
             channel=slack_channel,
             blocks=blocks,
             text="New guest message",
@@ -695,9 +697,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     except SlackApiError as e:
         # Handle rate limits once
         if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 429:
-            await asyncio.sleep(int(e.response.headers.get("Retry-After", "1")))
-            resp = await slack_client.chat_postMessage(
-                channel=slack_channel, blocks=blocks, text="New guest message"
+            retry_after = int(getattr(e.response, "headers", {}).get("Retry-After", "1"))
+            await asyncio.sleep(retry_after)
+            await asyncio.to_thread(
+                slack_client.chat_postMessage,
+                channel=slack_channel,
+                blocks=blocks,
+                text="New guest message",
             )
             mark_processed(event_key)
             return {"status": "ok"}
