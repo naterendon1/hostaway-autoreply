@@ -2,9 +2,11 @@
 # File: main.py
 # =========================
 import os
-import logging
+import re
 import json
+import logging
 import sqlite3
+import asyncio
 from typing import List, Dict, Optional, Any
 from datetime import date, datetime
 
@@ -78,36 +80,14 @@ def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
     db_upsert_slack_thread(str(conv_id), channel or "", ts)
 
 
-# ---------- Legacy tiny local helper (kept for backwards safety, unused now) ----------
-def _bump_guest_seen_local(email: Optional[str]) -> int:
-    """
-    Old local counter using learning.db. Prefer db.note_guest now.
-    Kept only as safety; not used.
-    """
-    if not email:
-        return 0
-    key = (email or "").strip().lower()
-    if not key:
-        return 0
-    conn = sqlite3.connect(LEARNING_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS guest_contacts (
-            email TEXT PRIMARY KEY,
-            seen_count INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-    row = cur.execute("SELECT seen_count FROM guest_contacts WHERE email=?", (key,)).fetchone()
-    if row:
-        seen = int(row["seen_count"]) + 1
-        cur.execute("UPDATE guest_contacts SET seen_count=? WHERE email=?", (seen, key))
-    else:
-        seen = 1
-        cur.execute("INSERT INTO guest_contacts(email, seen_count) VALUES(?, ?)", (key, seen))
-    conn.commit()
-    conn.close()
-    return seen
+# ---------- Sanitization ----------
+def sanitize_guest_message(m: Optional[str]) -> str:
+    """Trim, strip HTML, collapse whitespace, cap length for Slack."""
+    if not m:
+        return ""
+    m = re.sub(r"<[^>]*>", "", m)      # strip HTML/markup
+    m = re.sub(r"\s+", " ", m).strip() # normalize whitespace
+    return m[:2000]                    # hard cap
 
 
 # ---------- Helpers for Slack header formatting ----------
@@ -425,9 +405,10 @@ class HostawayUnifiedWebhook(BaseModel):
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    logging.info(f"📬 Webhook received: {json.dumps(payload.dict(), indent=2)}")
+    # Log compactly (v1/v2 compatible)
     payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
-    logging.info("📬 Webhook received (keys only): %s", list(payload_dict.keys()))
+    logging.info("📬 Webhook received (keys): %s", list(payload_dict.keys()))
+
     # We only handle inbound guest messages (conversation message received)
     if payload.event != "message.received" or payload.object != "conversationMessage":
         return {"status": "ignored"}
@@ -446,7 +427,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if already_processed(event_key):
         return {"status": "duplicate"}
 
-    guest_msg = d.get("body", "")
+    guest_msg = sanitize_guest_message(d.get("body", ""))
     if not guest_msg:
         if d.get("attachments"):
             logging.info("📷 Skipping image-only message.")
@@ -533,11 +514,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     loc_res = (listing_obj or {}).get("result", {}) or {}
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
+
+    # ---------- Load & apply per-listing config ----------
+    listing_cfg = load_listing_config(listing_id)  # reads config/listings/{id}.json or default.json
+
+    # Timezone from listing or config (used downstream by assistant_core)
     tz_name = (
-         loc_res.get("timeZone") or loc_res.get("timezone")
-         or (listing_cfg.get("property_profile") or {}).get("timezone")
-         or None
-     )
+        loc_res.get("timeZone")
+        or loc_res.get("timezone")
+        or (listing_cfg.get("property_profile") or {}).get("timezone")
+        or None
+    )
+
     # Extract access details & pet policy for AI context
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
@@ -562,9 +550,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "pet_fee": pet_policy.get("pet_fee"),
         "pet_deposit_refundable": pet_policy.get("pet_deposit_refundable"),
     }
-
-    # ---------- Load & apply per-listing config ----------
-    listing_cfg = load_listing_config(listing_id)  # reads config/listings/{id}.json or default.json
 
     # Build base meta for the model
     meta_for_ai: Dict[str, Any] = {
@@ -621,7 +606,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "guest_count": guest_count,
         "status": res_status_pretty,  # pretty status for display / interactivity
         "detected_intent": detected_intent,
-        "channel_pretty": channel_prety 
+        "channel_pretty": channel_pretty,
         "property_address": property_address,
         "price": total_price_str,
         "guest_portal_url": guest_portal_url,
@@ -648,17 +633,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "alt_text": guest_name or "Guest photo",
         }
 
+    # Cap long guest messages in Slack preview to keep payload size small
+    preview_msg = (guest_msg[:1200] + "…") if len(guest_msg) > 1200 else guest_msg
+
     actions_elements = [
         {
             "type": "button",
             "text": {"type": "plain_text", "text": "✅ Send"},
-            "value": json.dumps({**button_meta, "action": "send"}),
+            "value": json.dumps({**button_meta, "action": "send"}, ensure_ascii=False),
             "action_id": "send",
         },
         {
             "type": "button",
             "text": {"type": "plain_text", "text": "✏️ Edit"},
-            "value": json.dumps({**button_meta, "action": "edit"}),
+            "value": json.dumps({**button_meta, "action": "edit"}, ensure_ascii=False),
             "action_id": "edit",
         },
     ]
@@ -670,14 +658,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 "type": "button",
                 "style": "primary",
                 "text": {"type": "plain_text", "text": "🔗 Send guest portal"},
-                "value": json.dumps({**button_meta, "action": "send_guest_portal"}),
+                "value": json.dumps({**button_meta, "action": "send_guest_portal"}, ensure_ascii=False),
                 "action_id": "send_guest_portal",
             }
         )
 
     blocks = [
         header_block,
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {preview_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
         {"type": "context", "elements": [
             {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"}
@@ -686,20 +674,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     ]
 
     # Post to Slack — ALWAYS create a new parent message (no threading by conv_id)
-    from slack_sdk import WebClient
-    from slack_sdk.errors import SlackApiError
-
-    slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     from slack_sdk.web.async_client import AsyncWebClient
     from slack_sdk.errors import SlackApiError
+
     slack_client = AsyncWebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     slack_channel = os.getenv("SLACK_CHANNEL")
     if not slack_channel:
         logging.error("SLACK_CHANNEL missing; skipping Slack post.")
         mark_processed(event_key)
         return {"status": "ok"}
+
     try:
-        slack_client.chat_postMessage(
         resp = await slack_client.chat_postMessage(
             channel=slack_channel,
             blocks=blocks,
@@ -708,15 +693,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         # mark processed only after successful handling
         mark_processed(event_key)
     except SlackApiError as e:
-
-       # Handle rate limits once
-         if getattr(e, "response", None) and e.response.status_code == 429:
-             await asyncio.sleep(int(e.response.headers.get("Retry-After", "1")))
-             resp = await slack_client.chat_postMessage(
-                 channel=slack_channel, blocks=blocks, text="New guest message"
-             )
-             mark_processed(event_key)
-             return {"status": "ok"}
+        # Handle rate limits once
+        if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 429:
+            await asyncio.sleep(int(e.response.headers.get("Retry-After", "1")))
+            resp = await slack_client.chat_postMessage(
+                channel=slack_channel, blocks=blocks, text="New guest message"
+            )
+            mark_processed(event_key)
+            return {"status": "ok"}
         logging.error(f"❌ Slack send error: {e.response.data if hasattr(e, 'response') else e}")
         # do not mark processed so it can retry
         raise
