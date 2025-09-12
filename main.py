@@ -11,9 +11,10 @@ from datetime import date, datetime
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
 
+# Local places (Google) helpers
 from places import should_fetch_local_recs, build_local_recs
 
-# Slack interactivity router (separate file you already have)
+# Slack interactivity router (separate file)
 from slack_interactivity import router as slack_router
 
 # Guarded AI composer
@@ -25,8 +26,6 @@ from utils import (
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
     clean_ai_reply,
-    sanitize_ai_reply, 
-    derive_simple_intent,
 )
 
 # ---- App & logging ----
@@ -433,12 +432,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         return {"status": "ignored"}
 
     # ------------- Idempotency (single-argument key) -------------
-    d = payload.data or []
-    if isinstance(d, dict):
-        d = d
-    else:
-        d = {}
-
+    d = payload.data or {}
     ev_core = (
         d.get("id")
         or d.get("hash")
@@ -554,15 +548,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if m.get("body")
     ]
 
-    # --- Local Places (live POIs) ---
-    local_recs_api = []
-    try:
-        if lat is not None and lng is not None and should_fetch_local_recs(guest_msg):
-            local_recs_api = build_local_recs(lat, lng, guest_msg)
-    except Exception as e:
-        logging.warning(f"Local recs fetch failed: {e}")
-        local_recs_api = []
-
     # Minimal property profile (sane defaults; assistant_core may override)
     property_profile = {"checkin_time": "4:00 PM", "checkout_time": "11:00 AM"}
 
@@ -576,7 +561,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # ---------- Load & apply per-listing config ----------
     listing_cfg = load_listing_config(listing_id)  # reads config/listings/{id}.json or default.json
 
-    meta_for_ai = {
+    # Build base meta for the model
+    meta_for_ai: Dict[str, Any] = {
         "listing_id": (str(listing_id) if listing_id is not None else ""),
         "listing_map_id": listing_id,
         "reservation_id": reservation_id,
@@ -587,19 +573,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "policies": policies,
         "access": access,  # door_code & arrival_instructions if available
         "location": {"lat": lat, "lng": lng},
-        "local_recs_api": local_recs_api,  # <= include POIs here
     }
-    meta_for_ai["behavior_rules"] = {
-    "no_unprompted_apologies": True,
-    "no_cleaner_offers_without_issue": True,
-    "informational_default": (
-        "If the guest is just sharing plans or excitement with no request, "
-        "acknowledge briefly and offer one helpful next step (e.g., directions, schedule, parking tips)."
-    ),
-    "keep_it_concise": True,
-    "no_signoffs_or_emojis": True,
-}
-meta_for_ai["guest_intent_hint"] = derive_simple_intent(guest_msg)
+    meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
+
+    # --- Local Places (live POIs) ---
+    local_recs_api: List[Dict[str, Any]] = []
+    try:
+        if lat is not None and lng is not None and should_fetch_local_recs(guest_msg):
+            local_recs_api = build_local_recs(lat, lng, guest_msg)
+    except Exception as e:
+        logging.warning(f"Local recs fetch failed: {e}")
+        local_recs_api = []
+    # Include in meta for the model
+    meta_for_ai["local_recs_api"] = local_recs_api
+
     # ---- Guarded AI (assistant_core) ----
     ai_json, _unused_blocks = ac_compose(
         guest_message=guest_msg,
@@ -607,7 +594,6 @@ meta_for_ai["guest_intent_hint"] = derive_simple_intent(guest_msg)
         meta=meta_for_ai,
     )
     ai_reply = clean_ai_reply(ai_json.get("reply", "") or "")
-    ai_reply = sanitize_ai_reply(ai_reply, guest_msg)
     detected_intent = ai_json.get("intent", "other")
 
     # US dates & phase
@@ -629,10 +615,12 @@ meta_for_ai["guest_intent_hint"] = derive_simple_intent(guest_msg)
         "guest_count": guest_count,
         "status": res_status_pretty,  # pretty status for display / interactivity
         "detected_intent": detected_intent,
-        "channel_pretty": channel_pretty,
+        "channel_pretty": channel_prety if (channel_prety := channel_pretty) else channel_pretty,  # keep name stable
         "property_address": property_address,
         "price": total_price_str,
         "guest_portal_url": guest_portal_url,
+        # keep lat/lng small if present for downstream features
+        "location": {"lat": lat, "lng": lng},
     }
     logging.info("button_meta: %s", json.dumps(button_meta, indent=2))
 
