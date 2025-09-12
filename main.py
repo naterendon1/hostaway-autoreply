@@ -615,7 +615,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "guest_count": guest_count,
         "status": res_status_pretty,  # pretty status for display / interactivity
         "detected_intent": detected_intent,
-        "channel_pretty": channel_prety if (channel_prety := channel_pretty) else channel_pretty,  # keep name stable
+        "channel_pretty": channel_prety 
         "property_address": property_address,
         "price": total_price_str,
         "guest_portal_url": guest_portal_url,
