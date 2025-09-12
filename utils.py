@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from difflib import get_close_matches
 import re
 from openai import OpenAI
+import re
+
 
 # Guard for sharing access codes
 from datetime import date as _date
@@ -1177,3 +1179,68 @@ def get_modal_blocks(guest_name, guest_msg, draft_text="", action_id="edit", che
         }
     ]
     return blocks
+
+_ISSUE_TRIGGERS = [
+    "dirty", "unclean", "mess", "messy", "bugs", "roaches", "ants", "mold",
+    "leak", "broken", "smell", "stain", "hair", "not clean", "cleaning issue",
+    "trash", "disgust", "filthy", "soiled"
+]
+
+def _looks_like_issue(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in _ISSUE_TRIGGERS)
+
+def _looks_informational(text: str) -> bool:
+    """
+    True if guest is just stating plans or excitement, not asking for anything.
+    Heuristic: no '?', no “can you / could you / please”, short-ish, or “coming to/for/to see …”
+    """
+    t = (text or "").strip().lower()
+    if "?" in t:
+        return False
+    if any(kw in t for kw in ["can you", "could you", "please", "send", "need", "what time", "how do", "where do"]):
+        return False
+    return bool(re.search(r"\b(coming|we'?re|we are|visiting|in town|to see|for)\b", t)) or len(t.split()) <= 16
+
+def sanitize_ai_reply(reply: str, guest_msg: str) -> str:
+    """
+    1) Never apologize unless guest raised an issue.
+    2) Never offer cleaners unless guest raised a cleaning issue.
+    3) If message is informational only, reply with a warm ack + relevant help offer.
+    """
+    r = reply or ""
+
+    # 1) Block unprompted apologies
+    if not _looks_like_issue(guest_msg):
+        r = re.sub(r"(?is)\b(i\s*am|i'?m)\s*sorry\b.*?(?:[\.\!\n]|$)", "", r).strip()
+
+    # 2) Block unprompted cleaner offers
+    if not _looks_like_issue(guest_msg):
+        r_lines = []
+        for line in r.splitlines():
+            if re.search(r"(?i)(send|schedule|have)\s+(?:the\s+)?(cleaner|housekeep|maid|cleaning)\b", line):
+                continue
+            r_lines.append(line)
+        r = "\n".join(r_lines).strip()
+
+    # 3) If guest is just sharing plans, steer to helpful, on-topic options
+    if _looks_informational(guest_msg):
+        return (
+            "That sounds like a great weekend! I can share the contest schedule, best beach access points, "
+            "and parking tips—want me to send those?"
+        )
+
+    # Collapse extra blank lines
+    r = re.sub(r"\n{3,}", "\n\n", r).strip()
+    return r or "Got it—what would be most helpful for your plans?"
+
+def derive_simple_intent(guest_msg: str) -> str:
+    t = (guest_msg or "").lower()
+    if _looks_like_issue(t): 
+        return "issue_report"
+    if any(k in t for k in ["restaurant", "things to do", "where to", "coffee", "breakfast", "dinner"]):
+        return "local_recs"
+    if _looks_informational(t):
+        return "informational"
+    return "general"
+
