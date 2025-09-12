@@ -25,6 +25,8 @@ from utils import (
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
     clean_ai_reply,
+    sanitize_ai_reply, 
+    derive_simple_intent,
 )
 
 # ---- App & logging ----
@@ -587,8 +589,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "location": {"lat": lat, "lng": lng},
         "local_recs_api": local_recs_api,  # <= include POIs here
     }
-    meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
-
+    meta_for_ai["behavior_rules"] = {
+    "no_unprompted_apologies": True,
+    "no_cleaner_offers_without_issue": True,
+    "informational_default": (
+        "If the guest is just sharing plans or excitement with no request, "
+        "acknowledge briefly and offer one helpful next step (e.g., directions, schedule, parking tips)."
+    ),
+    "keep_it_concise": True,
+    "no_signoffs_or_emojis": True,
+}
+meta_for_ai["guest_intent_hint"] = derive_simple_intent(guest_msg)
     # ---- Guarded AI (assistant_core) ----
     ai_json, _unused_blocks = ac_compose(
         guest_message=guest_msg,
@@ -596,6 +607,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         meta=meta_for_ai,
     )
     ai_reply = clean_ai_reply(ai_json.get("reply", "") or "")
+    ai_reply = sanitize_ai_reply(ai_reply, guest_msg)
     detected_intent = ai_json.get("intent", "other")
 
     # US dates & phase
