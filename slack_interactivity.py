@@ -86,7 +86,7 @@ def _post_thread_note(channel: Optional[str], ts: Optional[str], text: str) -> N
         logging.error(f"Thread note failed: {e}")
 
 
-# -------------------- Private metadata packing (avoid 3KB limit) --------------------
+# ---------------- Private metadata packing (avoid 3KB limit) --------------------
 MAX_PRIVATE_BYTES = 2800  # safety margin under Slack's ~3KB limit
 PRIVATE_META_KEYS = {
     "conv_id", "listing_id", "guest_id", "guest_name", "guest_message",
@@ -417,24 +417,79 @@ def _background_improve_and_update(
 
 
 # ---------------- Background: send to Hostaway + update Slack ----------------
+def _ensure_feedback_tables(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT,
+            question TEXT,
+            ai_answer TEXT,
+            rating TEXT,
+            reason TEXT,
+            user TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS learning_examples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            intent TEXT,
+            question TEXT,
+            answer TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+
+
+def _insert_feedback_row(row: Dict[str, Any]) -> None:
+    conn = sqlite3.connect(LEARNING_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _ensure_feedback_tables(conn)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ai_feedback (conversation_id, question, ai_answer, rating, reason, user)
+        VALUES (:conversation_id, :question, :ai_answer, :rating, :reason, :user)
+    """, row)
+    conn.commit()
+    conn.close()
+
+
+def _insert_learning_example(question: str, answer: str, intent: str = "") -> None:
+    if not (question and answer):
+        return
+    conn = sqlite3.connect(LEARNING_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _ensure_feedback_tables(conn)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO learning_examples (intent, question, answer)
+        VALUES (?, ?, ?)
+    """, (intent or "", question, answer))
+    conn.commit()
+    conn.close()
+
+
 def _background_send_and_update(meta: dict, reply_text: str):
-    # Last-mile guardrail so we never apologize / offer cleaners without cause
+    # sanitize reply (best-effort)
     try:
         reply_text = sanitize_ai_reply(reply_text, meta.get("guest_message", ""))
     except Exception:
         pass
 
-    # Actually send to Hostaway
+    # Send to Hostaway (actual delivery)
+    ok = False
     try:
-        ok = send_reply_to_hostaway(
-            meta["conv_id"],
-            reply_text,
-            meta.get("type", "email")
-        )
+        conv_id = meta.get("conv_id")
+        comm_type = meta.get("type", "email")
+        if conv_id:
+            ok = bool(send_reply_to_hostaway(conv_id, reply_text, comm_type))
     except Exception as e:
         logging.error(f"Hostaway send error: {e}")
         ok = False
 
+    # Update Slack UI message
     channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
     ts = meta.get("ts")
     if not channel or not ts:
@@ -467,10 +522,7 @@ def _background_send_and_update(meta: dict, reply_text: str):
             slack_client.chat_update(
                 channel=channel,
                 ts=ts,
-                blocks=[{
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}
-                }],
+                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": ":x: *Failed to send reply.*"}}],
                 text="Failed to send reply.",
             )
         except Exception as e:
@@ -522,8 +574,6 @@ async def slack_actions(
     payload: Dict[str, Any] = json.loads(payload_raw)
 
     logging.info("🎯 /slack/actions hit")
-    logging.info(f"Slack Interactivity Payload: {json.dumps(payload, indent=2)}")
-
     ptype = payload.get("type")
 
     # ---------- Block actions ----------
@@ -534,12 +584,86 @@ async def slack_actions(
         container = payload.get("container", {}) or {}
         channel_id = container.get("channel_id") or (payload.get("channel") or {}).get("id")
         message_ts = container.get("message_ts") or (payload.get("message") or {}).get("ts")
+        user_id = (payload.get("user") or {}).get("id")
 
         def get_meta_from_action(_action: Dict[str, Any]) -> dict:
             try:
                 return json.loads(_action.get("value") or "{}")
             except Exception:
                 return {}
+
+        # --- FEEDBACK: 👍 Useful ---
+        if action_id == "rate_up":
+            meta = get_meta_from_action(action)
+            try:
+                _insert_feedback_row({
+                    "conversation_id": str(meta.get("conv_id") or ""),
+                    "question": meta.get("guest_message") or "",
+                    "ai_answer": meta.get("ai_suggestion") or "",
+                    "rating": "up",
+                    "reason": "",
+                    "user": user_id or "",
+                })
+            except Exception as e:
+                logging.error(f"insert feedback up failed: {e}")
+            # Best-effort ephemeral ack
+            try:
+                if slack_client and channel_id and user_id:
+                    slack_client.chat_postEphemeral(channel=channel_id, user=user_id, text="Thanks for the feedback 👍")
+            except Exception as e:
+                logging.debug(f"ephemeral ack failed: {e}")
+            return JSONResponse({"ok": True})
+
+            # (no view to update)
+
+        # --- FEEDBACK: 👎 Needs work (open reason modal) ---
+        if action_id == "rate_down":
+            meta = get_meta_from_action(action)
+            private_meta = json.dumps({
+                "conv_id": meta.get("conv_id"),
+                "guest_message": meta.get("guest_message"),
+                "ai_suggestion": meta.get("ai_suggestion"),
+                "detected_intent": meta.get("detected_intent"),
+                "channel_id": channel_id,
+            })
+            view = {
+                "type": "modal",
+                "callback_id": "rate_down_modal",
+                "private_metadata": private_meta,
+                "title": {"type": "plain_text", "text": "Feedback"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "reason_block",
+                        "label": {"type": "plain_text", "text": "What was wrong?"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reason",
+                            "multiline": True,
+                            "placeholder": {"type": "plain_text", "text": "E.g., tone off, incorrect policy, missed intent..."},
+                        }
+                    },
+                    {
+                        "type": "input",
+                        "optional": True,
+                        "block_id": "improved_block",
+                        "label": {"type": "plain_text", "text": "Your improved reply (optional)"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "improved",
+                            "multiline": True,
+                        }
+                    },
+                ],
+            }
+            try:
+                if slack_client:
+                    slack_client.views_open(trigger_id=trigger_id, view=view)
+            except SlackApiError as e:
+                logging.error(f"views_open failed: {e.response.data if hasattr(e, 'response') else e}")
+            return JSONResponse({})
 
         # --- SEND ---
         if action_id == "send":
@@ -854,11 +978,49 @@ async def slack_actions(
         # Unhandled action ids are no-ops
         return JSONResponse({})
 
-    # ---------- View submission (modal "Send") ----------
+    # ---------- View submission (modal "Send" OR feedback modal) ----------
     if ptype == "view_submission":
         view = payload.get("view", {}) or {}
-        state = view.get("state", {}).get("values", {}) or {}
+        callback_id = view.get("callback_id") or ""
 
+        # Feedback modal submit
+        if callback_id == "rate_down_modal":
+            state = view.get("state", {}).get("values", {}) or {}
+            private_meta = {}
+            try:
+                private_meta = json.loads(view.get("private_metadata") or "{}")
+            except Exception:
+                private_meta = {}
+
+            reason = ((state.get("reason_block") or {}).get("reason") or {}).get("value") or ""
+            improved = ((state.get("improved_block") or {}).get("improved") or {}).get("value") or ""
+            user_id = (payload.get("user") or {}).get("id") or ""
+
+            guest_message = private_meta.get("guest_message") or ""
+            ai_suggestion = private_meta.get("ai_suggestion") or ""
+            conv_id = private_meta.get("conv_id")
+            try:
+                _insert_feedback_row({
+                    "conversation_id": str(conv_id or ""),
+                    "question": guest_message,
+                    "ai_answer": ai_suggestion,
+                    "rating": "down",
+                    "reason": reason.strip(),
+                    "user": user_id,
+                })
+            except Exception as e:
+                logging.error(f"insert feedback down failed: {e}")
+
+            if improved.strip():
+                try:
+                    _insert_learning_example(guest_message, improved.strip(), intent=private_meta.get("detected_intent") or "")
+                except Exception as e:
+                    logging.error(f"insert learning example failed: {e}")
+
+            return JSONResponse({"response_action": "clear"})
+
+        # --- Normal reply modal submission (Send) ---
+        state = view.get("state", {}).get("values", {}) or {}
         try:
             meta = json.loads(view.get("private_metadata", "{}") or "{}")
         except Exception:
@@ -911,91 +1073,19 @@ async def slack_actions(
             except Exception as e:
                 logging.error(f"store_learning_example failed: {e}")
 
-            # 2) New richer table: learning_examples_v2 (with coach_prompt)
+            # 2) New richer table: learning_examples (simple)
             try:
                 conn = sqlite3.connect(LEARNING_DB_PATH)
+                _ensure_feedback_tables(conn)
                 cur = conn.cursor()
                 cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS learning_examples_v2 (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        listing_id        TEXT,
-                        intent            TEXT,
-                        tags              TEXT,
-                        guest_message     TEXT,
-                        conversation_ctx  TEXT,
-                        ai_suggestion     TEXT,
-                        coach_prompt      TEXT,
-                        final_reply       TEXT,
-                        channel           TEXT,
-                        reservation_status TEXT,
-                        trip_phase        TEXT,
-                        approved          INTEGER DEFAULT 1,
-                        created_at        TEXT DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
-                )
-                # Insert
-                listing_id_val = str(meta.get("listing_id") or "") or None
-                intent_val = meta.get("detected_intent") or "other"
-                tags_val = intent_val  # simple seed; you can enrich later
-                guest_msg_val = (meta.get("guest_message") or "")[:4000]
-                convo_ctx_val = None  # not available here; could be added later from webhook
-                ai_suggestion_val = (meta.get("ai_suggestion") or "")[:4000]
-                coach_prompt_val = coach_prompt_value or None
-                final_reply_val = reply_text[:8000]
-                channel_val = meta.get("type") or None
-                reservation_status_val = meta.get("status") or None
-                # rough phase if check_in/out provided
-                trip_phase_val = None
-                try:
-                    from datetime import date
-
-                    def _phase(ci: Optional[str], co: Optional[str]) -> Optional[str]:
-                        try:
-                            ci_d = date.fromisoformat(ci) if ci else None
-                            co_d = date.fromisoformat(co) if co else None
-                        except Exception:
-                            return None
-                        today = date.today()
-                        if ci_d and today < ci_d:
-                            return "upcoming"
-                        if ci_d and co_d and ci_d <= today <= co_d:
-                            return "during"
-                        if co_d and today > co_d:
-                            return "past"
-                        return None
-
-                    trip_phase_val = _phase(meta.get("check_in"), meta.get("check_out"))
-                except Exception:
-                    trip_phase_val = None
-
-                cur.execute(
-                    """
-                    INSERT INTO learning_examples_v2
-                    (listing_id, intent, tags, guest_message, conversation_ctx, ai_suggestion, coach_prompt,
-                     final_reply, channel, reservation_status, trip_phase, approved)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        listing_id_val,
-                        intent_val,
-                        tags_val,
-                        guest_msg_val,
-                        convo_ctx_val,
-                        ai_suggestion_val,
-                        coach_prompt_val,
-                        final_reply_val,
-                        channel_val,
-                        reservation_status_val,
-                        trip_phase_val,
-                        1,
-                    ),
+                    "INSERT INTO learning_examples (intent, question, answer) VALUES (?, ?, ?)",
+                    (meta.get("detected_intent") or "other", (meta.get("guest_message") or "")[:4000], reply_text[:8000]),
                 )
                 conn.commit()
                 conn.close()
             except Exception as e:
-                logging.error(f"learning_examples_v2 insert failed: {e}")
+                logging.error(f"learning_examples insert failed: {e}")
 
         # Ensure Slack update can happen
         container = payload.get("container", {}) or {}
