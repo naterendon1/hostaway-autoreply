@@ -2,11 +2,10 @@
 # File: main.py
 # =========================
 import os
-import re
-import json
+import time
 import logging
+import json
 import sqlite3
-import asyncio
 from typing import List, Dict, Optional, Any
 from datetime import date, datetime
 
@@ -80,14 +79,36 @@ def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
     db_upsert_slack_thread(str(conv_id), channel or "", ts)
 
 
-# ---------- Sanitization ----------
-def sanitize_guest_message(m: Optional[str]) -> str:
-    """Trim, strip HTML, collapse whitespace, cap length for Slack."""
-    if not m:
-        return ""
-    m = re.sub(r"<[^>]*>", "", m)      # strip HTML/markup
-    m = re.sub(r"\s+", " ", m).strip() # normalize whitespace
-    return m[:2000]                    # hard cap
+# ---------- Legacy tiny local helper (kept for backwards safety, unused now) ----------
+def _bump_guest_seen_local(email: Optional[str]) -> int:
+    """
+    Old local counter using learning.db. Prefer db.note_guest now.
+    Kept only as safety; not used.
+    """
+    if not email:
+        return 0
+    key = (email or "").strip().lower()
+    if not key:
+        return 0
+    conn = sqlite3.connect(LEARNING_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guest_contacts (
+            email TEXT PRIMARY KEY,
+            seen_count INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    row = cur.execute("SELECT seen_count FROM guest_contacts WHERE email=?", (key,)).fetchone()
+    if row:
+        seen = int(row["seen_count"]) + 1
+        cur.execute("UPDATE guest_contacts SET seen_count=? WHERE email=?", (seen, key))
+    else:
+        seen = 1
+        cur.execute("INSERT INTO guest_contacts(email, seen_count) VALUES(?, ?)", (key, seen))
+    conn.commit()
+    conn.close()
+    return seen
 
 
 # ---------- Helpers for Slack header formatting ----------
@@ -378,18 +399,86 @@ def list_feedback(limit: int = 100) -> List[Dict]:
             question TEXT,
             ai_answer TEXT,
             rating TEXT,
+            reason TEXT,
             user TEXT,
-            created_at TEXT
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """
     )
     rows = conn.execute(
-        "SELECT id, conversation_id, question, ai_answer, rating, user, created_at "
+        "SELECT id, conversation_id, question, ai_answer, rating, reason, user, created_at "
         "FROM ai_feedback ORDER BY id DESC LIMIT ?",
         (limit,),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+@app.get("/feedback/summary", dependencies=[Depends(require_admin)])
+def feedback_summary():
+    conn = sqlite3.connect(LEARNING_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT,
+            question TEXT,
+            ai_answer TEXT,
+            rating TEXT,
+            reason TEXT,
+            user TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    rows = conn.execute("""
+        SELECT rating, COUNT(*) AS n
+        FROM ai_feedback
+        GROUP BY rating
+        ORDER BY n DESC
+    """).fetchall()
+    top_reasons = conn.execute("""
+        SELECT reason, COUNT(*) AS n
+        FROM ai_feedback
+        WHERE rating = 'down' AND reason IS NOT NULL AND reason <> ''
+        GROUP BY reason
+        ORDER BY n DESC
+        LIMIT 10
+    """).fetchall()
+    conn.close()
+    return {
+        "counts": [{ "rating": r["rating"], "count": r["n"] } for r in rows],
+        "top_reasons": [{ "reason": r["reason"], "count": r["n"] } for r in top_reasons],
+    }
+
+
+@app.get("/feedback/export.csv", dependencies=[Depends(require_admin)])
+def feedback_export_csv():
+    from fastapi.responses import PlainTextResponse
+    conn = sqlite3.connect(LEARNING_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT id, conversation_id, question, ai_answer, rating, reason, user, created_at
+        FROM ai_feedback ORDER BY id DESC
+    """).fetchall()
+    conn.close()
+    header = "id,conversation_id,question,ai_answer,rating,reason,user,created_at"
+    def _csv_escape(s):
+        if s is None: return ""
+        s = str(s).replace('"', '""')
+        return f'"{s}"'
+    body = "\n".join(
+        ",".join([
+            str(r["id"]),
+            _csv_escape(r["conversation_id"]),
+            _csv_escape(r["question"]),
+            _csv_escape(r["ai_answer"]),
+            _csv_escape(r["rating"]),
+            _csv_escape(r["reason"]),
+            _csv_escape(r["user"]),
+            _csv_escape(r["created_at"]),
+        ]) for r in rows
+    )
+    return PlainTextResponse("\n".join([header, body]), media_type="text/csv")
 
 
 # ---------- Webhook ----------
@@ -405,7 +494,7 @@ class HostawayUnifiedWebhook(BaseModel):
 
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
-    # Log compactly (v1/v2 compatible)
+    # Wider logging without blowing up the logs
     payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
     logging.info("📬 Webhook received (keys): %s", list(payload_dict.keys()))
 
@@ -427,7 +516,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if already_processed(event_key):
         return {"status": "duplicate"}
 
-    guest_msg = sanitize_guest_message(d.get("body", ""))
+    guest_msg = d.get("body", "")
     if not guest_msg:
         if d.get("attachments"):
             logging.info("📷 Skipping image-only message.")
@@ -454,6 +543,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     # Conversation (for picture/email fallback and history)
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     convo_res = convo_obj.get("result", {}) or {}
+    if convo_res:
+        logging.info("✅ Conversation %s fetched with messages.", convo_res.get("id"))
     guest_photo = (
         convo_res.get("recipientPicture")
         or convo_res.get("guestPicture")
@@ -515,13 +606,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
 
-    # ---------- Load & apply per-listing config ----------
+    # ---------- Load per-listing config BEFORE deriving timezone ----------
     listing_cfg = load_listing_config(listing_id)  # reads config/listings/{id}.json or default.json
-
-    # Timezone from listing or config (used downstream by assistant_core)
     tz_name = (
-        loc_res.get("timeZone")
-        or loc_res.get("timezone")
+        loc_res.get("timeZone") or loc_res.get("timezone")
         or (listing_cfg.get("property_profile") or {}).get("timezone")
         or None
     )
@@ -604,14 +692,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "check_in": check_in,
         "check_out": check_out,
         "guest_count": guest_count,
-        "status": res_status_pretty,  # pretty status for display / interactivity
+        "status": res_status_pretty,          # pretty status for display / interactivity
         "detected_intent": detected_intent,
-        "channel_pretty": channel_pretty,
+        "channel_pretty": channel_pretty,     # ✅ fixed typo/assignment
         "property_address": property_address,
         "price": total_price_str,
         "guest_portal_url": guest_portal_url,
-        # keep lat/lng small if present for downstream features
-        "location": {"lat": lat, "lng": lng},
+        "location": {"lat": lat, "lng": lng}, # keep lat/lng small if present
     }
     logging.info("button_meta: %s", json.dumps(button_meta, indent=2))
 
@@ -633,20 +720,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             "alt_text": guest_name or "Guest photo",
         }
 
-    # Cap long guest messages in Slack preview to keep payload size small
-    preview_msg = (guest_msg[:1200] + "…") if len(guest_msg) > 1200 else guest_msg
-
     actions_elements = [
         {
             "type": "button",
             "text": {"type": "plain_text", "text": "✅ Send"},
-            "value": json.dumps({**button_meta, "action": "send"}, ensure_ascii=False),
+            "value": json.dumps({**button_meta, "action": "send"}),
             "action_id": "send",
         },
         {
             "type": "button",
             "text": {"type": "plain_text", "text": "✏️ Edit"},
-            "value": json.dumps({**button_meta, "action": "edit"}, ensure_ascii=False),
+            "value": json.dumps({**button_meta, "action": "edit"}),
             "action_id": "edit",
         },
     ]
@@ -658,14 +742,38 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 "type": "button",
                 "style": "primary",
                 "text": {"type": "plain_text", "text": "🔗 Send guest portal"},
-                "value": json.dumps({**button_meta, "action": "send_guest_portal"}, ensure_ascii=False),
+                "value": json.dumps({**button_meta, "action": "send_guest_portal"}),
                 "action_id": "send_guest_portal",
             }
         )
 
+    # 👍 / 👎 rating buttons
+    rating_payload = {
+        "conv_id": conv_id,
+        "listing_id": listing_id,
+        "guest_message": guest_msg,
+        "ai_suggestion": ai_reply,
+        "detected_intent": detected_intent,
+    }
+    actions_elements.extend([
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "👍 Useful"},
+            "value": json.dumps(rating_payload),
+            "action_id": "rate_up",
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "👎 Needs work"},
+            "style": "danger",
+            "value": json.dumps(rating_payload),
+            "action_id": "rate_down",
+        },
+    ])
+
     blocks = [
         header_block,
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {preview_msg}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
         {"type": "context", "elements": [
             {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"}
@@ -683,11 +791,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         logging.error("SLACK_CHANNEL missing; skipping Slack post.")
         mark_processed(event_key)
         return {"status": "ok"}
-
     try:
-        # Run sync Slack client in a thread so we don't block the event loop
-        await asyncio.to_thread(
-            slack_client.chat_postMessage,
+        slack_client.chat_postMessage(
             channel=slack_channel,
             blocks=blocks,
             text="New guest message",
@@ -695,16 +800,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         # mark processed only after successful handling
         mark_processed(event_key)
     except SlackApiError as e:
-        # Handle rate limits once
-        if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 429:
-            retry_after = int(getattr(e.response, "headers", {}).get("Retry-After", "1"))
-            await asyncio.sleep(retry_after)
-            await asyncio.to_thread(
-                slack_client.chat_postMessage,
-                channel=slack_channel,
-                blocks=blocks,
-                text="New guest message",
-            )
+        # Handle rate limits once (sync client; no aiohttp needed)
+        try:
+            status = getattr(e, "response", {}).status_code if hasattr(e, "response") else None
+        except Exception:
+            status = None
+        if status == 429 and hasattr(e, "response"):
+            retry_after = int(e.response.headers.get("Retry-After", "1"))
+            time.sleep(max(retry_after, 1))
+            slack_client.chat_postMessage(channel=slack_channel, blocks=blocks, text="New guest message")
             mark_processed(event_key)
             return {"status": "ok"}
         logging.error(f"❌ Slack send error: {e.response.data if hasattr(e, 'response') else e}")
