@@ -10,6 +10,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
+from zoneinfo import ZoneInfo  # NEW: timezone-aware dates
+
 import requests
 from pydantic import BaseModel, Field, ValidationError, conlist
 from openai import OpenAI
@@ -197,7 +199,7 @@ def _similar_examples(q: str, limit: int = 3) -> List[Dict[str, str]]:
         conn.close()
     return examples
 
-# ---------- Date & parse helpers (single source of truth) ----------
+# ---------- Date & parse helpers ----------
 def _coerce_iso_day(s: str) -> Optional[datetime]:
     """Return a datetime for the YYYY-MM-DD part of s, or None."""
     if not s:
@@ -216,9 +218,7 @@ def _day_after(date_iso: str) -> Optional[str]:
     return (d + timedelta(days=1)).strftime("%Y-%m-%d") if d else None
 
 def _daterange(start_iso: str, end_iso: str) -> List[str]:
-    """
-    Half-open range of ISO dates: [start, end). Useful for nightly pricing or extension quotes.
-    """
+    """Half-open range of ISO dates: [start, end). Useful for nightly pricing or extension quotes."""
     s = _coerce_iso_day(start_iso)
     e = _coerce_iso_day(end_iso)
     if not s or not e or e <= s:
@@ -236,16 +236,24 @@ def _us_date(iso: Optional[str]) -> str:
     except Exception:
         return iso or "N/A"
 
+# Existing numeric parser
 _EXTRA_NIGHTS_RE = re.compile(r'(?:add|extend|extra)\s+(\d+)\s*(?:more\s*)?(?:day|days|night|nights)', re.I)
+# NEW: wordy night counts
+_WORD_NIGHTS = {"one": 1, "an": 1, "another": 1, "two": 2, "couple": 2, "few": 3, "three": 3}
 
 def _parse_extra_nights(text: str) -> Optional[int]:
-    m = _EXTRA_NIGHTS_RE.search(text or "")
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
+    t = text or ""
+    m = _EXTRA_NIGHTS_RE.search(t)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    # Wordy phrasing like "another night", "couple nights"
+    for w, n in _WORD_NIGHTS.items():
+        if re.search(rf"\b{w}\b.*\bnight", t, re.I):
+            return n
+    return None
 
 # ---------- Hostaway helpers ----------
 def _token() -> Optional[str]:
@@ -418,7 +426,8 @@ _DEP_LINK = ["link", "portal", "send link", "pay now", "payment link"]
 _DEP_AMT = ["how much", "amount", "$", "is the security deposit", "is deposit", "deposit $"]
 _FOOD = [
     "dinner","lunch","breakfast","brunch","coffee","restaurant","eat","food",
-    "bbq","barbecue","italian","pizza","sandwich","deli","tacos","seafood","burger"
+    "bbq","barbecue","italian","pizza","sandwich","deli","tacos","seafood","burger",
+    "recommend","recommendation","where should we eat","good places to eat"
 ]
 _CODE_PHRASES = [
     "door code","keypad","lock code","entry code","code to the door","code for the door",
@@ -554,7 +563,7 @@ def _distance_matrix(lat: float, lng: float, dests: List[Tuple[float, float]]) -
         return []
 
 def _build_food_recs(lat: Optional[float], lng: Optional[float]) -> List[Dict[str, Any]]:
-    """Return a list of {label, name, rating, reviews, distance, duration} buckets."""
+    """Return a list of {label, name, rating, reviews, distance, duration, place_id} buckets."""
     if not (lat and lng):
         return []
     categories = [
@@ -579,25 +588,17 @@ def _build_food_recs(lat: Optional[float], lng: Optional[float]) -> List[Dict[st
     return all_picks
 
 def _format_food_recs(recs: List[Dict[str, Any]]) -> str:
+    """Visible formatting only; no raw place IDs/CIDs in text."""
     if not recs:
         return ""
     lines = []
     for r in recs:
-        parts = []
-        if r.get("label"):
-            parts.append(f"{r['label']}:")
-        line = f"{' '.join(parts)} {r['name']} — {r['rating']:.1f}★"
-        if r.get("reviews"):
-            line += f" ({int(r['reviews']):,})"
-        if r.get("duration"):
-            line += f", ~{r['duration']}"
-        elif r.get("distance"):
-            line += f", {r['distance']}"
-        # include a minimal citation the UI could linkify later
-        if r.get("place_id"):
-            line += f"  (cid:{r['place_id']})"
-        lines.append(line)
-    return "Here are a few solid nearby picks:\n" + "\n".join(f"- {ln}" for ln in lines)
+        label = f"{r['label']}: " if r.get("label") else ""
+        rating = f"{r['rating']:.1f}★" if r.get("rating") is not None else ""
+        reviews = f" ({int(r['reviews']):,})" if r.get("reviews") else ""
+        tail = f", ~{r['duration']}" if r.get("duration") else (f", {r['distance']}" if r.get("distance") else "")
+        lines.append(f"- {label}{r['name']} — {rating}{reviews}{tail}".strip())
+    return "Here are a few solid nearby picks:\n" + "\n".join(lines)
 
 # ---------- Context ----------
 def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -612,7 +613,13 @@ def _context(guest_message: str, history: List[Dict[str, str]], meta: Dict[str, 
             break
 
     # Arrival/access/pets
-    today_str = datetime.utcnow().date().isoformat()
+    tz_name = (meta.get("timezone")
+               or (meta.get("property_profile") or {}).get("timezone")
+               or "UTC")
+    try:
+        today_str = datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    except Exception:
+        today_str = datetime.utcnow().date().isoformat()
     is_checkin_day = (str(meta.get("check_in") or "")[:10] == today_str)
 
     ctx_access = meta.get("access") or {}
@@ -824,6 +831,9 @@ def _llm(system_prompt: str, ctx: Dict[str, Any]) -> AIResponse:
 
 # ---------- Text polish ----------
 def _polish(text: str) -> str:
+    """
+    Keep fixes minimal; avoid breaking numbers/IDs like 4.4★ or 3,757 or place IDs.
+    """
     if not text:
         return text
     fixes = {
@@ -835,8 +845,10 @@ def _polish(text: str) -> str:
     }
     for k, v in fixes.items():
         text = text.replace(k, v)
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)  # split missing space before capital
+    # IMPORTANT: do NOT split lowercase→Uppercase (it mangles IDs like ChIJ...)
     text = re.sub(r"\s{2,}", " ", text).strip()
+    # no trailing stray punctuation dashes
+    text = re.sub(r"[—–-]\s*$", "", text).strip()
     return text
 
 # ---------- Guardrails ----------
@@ -846,15 +858,28 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
     latest = (ctx.get("latest_guest_message") or "").lower()
     text = ai.reply or ""
 
-    # If we have curated food recs, prefer deterministic formatting
+    # Helper: only surface food recs when intent/keywords suggest it
+    def _intent_allows_food(ai_intent: str, msg: str) -> bool:
+        return (ai_intent == "food_recs") or any(w in msg for w in _FOOD)
+
+    # If we have curated food recs, format them ONLY when appropriate
     curated = ctx.get("food_recs") or []
-    if curated:
+    if curated and _intent_allows_food(getattr(ai.intent, "value", str(ai.intent)), latest):
         formatted = _format_food_recs(curated)
         if formatted:
             ai.intent = Intent.food_recs
             ai.needs_clarification = False
             ai.clarifying_question = ""
             ai.reply = _polish(formatted)
+            # Add place IDs to citations (not visible in text)
+            cits = []
+            for r in curated:
+                pid = r.get("place_id")
+                if pid:
+                    cits.append(f"place_id:{pid}")
+                if len(cits) >= 10:
+                    break
+            ai.citations = cits
             return ai  # done
 
     # Door code hard-guard
@@ -871,7 +896,7 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
             ai.needs_clarification = False
             ai.clarifying_question = ""
 
-    # NEW: gratitude / “all set” gets a simple acknowledgement — no cleaners/apologies
+    # Gratitude / “all set” → brief acknowledgement only
     if _GRATITUDE_RE.search(latest):
         ai.intent = Intent.other
         ai.needs_clarification = False
@@ -938,7 +963,7 @@ def _guards(ai: AIResponse, ctx: Dict[str, Any]) -> AIResponse:
         if (ai.intent in (Intent.early_check_in, Intent.late_checkout)) and day_after_open:
             text += " By the way, the night after is open—would you like me to check if extending your stay works?"
 
-    # NEW: Only apologize / send cleaners for actual cleanliness issues
+    # Only apologize / send cleaners for actual cleanliness issues
     if ai.intent == Intent.issue_report or _is_cleaning_issue(latest):
         base = text or "Thanks for flagging that."
         if "sorry" not in base.lower():
@@ -1015,7 +1040,7 @@ def compose_reply(
     """
     meta expects (as available):
       listing_id, listing_map_id, reservation_id, reservation_status, check_in, check_out,
-      property_profile, policies, access, location {lat,lng}
+      property_profile, policies, access, location {lat,lng}, timezone?
     """
     _init_db()
     ctx = _context(guest_message, conversation_history, meta)
