@@ -672,7 +672,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         conversation_history=conversation_history,
         meta=meta_for_ai,
     )
-    ai_reply = clean_ai_reply(ai_json.get("reply", "") or "")
+    # ---- Guarded AI (assistant_core) ----
+    ai_json, _unused_blocks = ac_compose(
+        guest_message=guest_msg,
+        conversation_history=conversation_history,
+        meta=meta_for_ai,
+    )
+
+    # Don’t over-clean list-style food recs
+    ai_reply_raw = ai_json.get("reply", "") or ""
+    if (ai_json.get("intent") or "").lower() == "food_recs":
+        ai_reply = ai_reply_raw
+    else:
+        ai_reply = clean_ai_reply(ai_reply_raw)
+
     detected_intent = ai_json.get("intent", "other")
 
     # US dates & phase
