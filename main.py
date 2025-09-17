@@ -61,6 +61,9 @@ from db import (
     note_guest,                                # returning/new guest counter
     already_processed,                         # idempotency helpers (single arg)
     mark_processed,
+    # --- NEW for robust SQL logging ---
+    log_message_event,
+    log_ai_exchange,
 )
 db_init()
 
@@ -533,6 +536,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     communication_type = d.get("communicationType", "channel")
     channel_id = d.get("channelId")
 
+    # --- NEW: persist inbound message meta (robust SQL) ---
+    try:
+        log_message_event(
+            direction="inbound",
+            provider="hostaway",
+            conversation_id=str(conv_id) if conv_id else None,
+            reservation_id=str(reservation_id) if reservation_id else None,
+            listing_id=str(listing_id) if listing_id else None,
+            guest_id=str(guest_id) if guest_id else None,
+            channel=channel_label_from(channel_id, communication_type),
+            payload={"guest_message": guest_msg, "raw": d},
+        )
+    except Exception as e:
+        logging.warning(f"message logging failed: {e}")
+
     # Reservation (Hostaway)
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res = reservation.get("result", {}) or {}
@@ -687,6 +705,24 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         ai_reply = clean_ai_reply(ai_reply_raw)
 
     detected_intent = ai_json.get("intent", "other")
+
+    # --- NEW: persist AI draft/suggestion tied to this message ---
+    try:
+        log_ai_exchange(
+            conversation_id=str(conv_id) if conv_id else None,
+            guest_message=guest_msg,
+            ai_suggestion=ai_reply,
+            intent=detected_intent,
+            meta={
+                "listing_id": listing_id,
+                "reservation_id": reservation_id,
+                "policies": meta_for_ai.get("policies"),
+                "access": meta_for_ai.get("access"),
+                "timezone": meta_for_ai.get("timezone"),
+            },
+        )
+    except Exception as e:
+        logging.warning(f"ai exchange logging failed: {e}")
 
     # US dates & phase
     us_check_in = format_us_date(check_in)
