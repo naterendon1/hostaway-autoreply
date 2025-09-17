@@ -22,6 +22,9 @@ from utils import (
 )
 from places import should_fetch_local_recs, build_local_recs
 
+# --- NEW: analytics hook
+from db import record_event
+
 logging.basicConfig(level=logging.INFO)
 router = APIRouter()
 
@@ -489,6 +492,24 @@ def _background_send_and_update(meta: dict, reply_text: str):
         logging.error(f"Hostaway send error: {e}")
         ok = False
 
+    # ---- NEW analytics hook (right after computing ok) ----
+    try:
+        record_event(
+            "slack",
+            "send" if ok else "send.failed",
+            conversation_id=str(meta.get("conv_id") or ""),
+            reservation_id=str(meta.get("reservation_id") or ""),
+            listing_id=str(meta.get("listing_id") or ""),
+            guest_id=str(meta.get("guest_id") or ""),
+            user_id="",  # Slack user id not reliably available here
+            intent=meta.get("detected_intent"),
+            text=reply_text,
+            payload={"saved_for_learning": bool(meta.get("saved_for_learning"))},
+        )
+    except Exception as e:
+        logging.error(f"analytics send: {e}")
+    # -------------------------------------------------------
+
     # Update Slack UI message
     channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
     ts = meta.get("ts")
@@ -606,6 +627,24 @@ async def slack_actions(
                 })
             except Exception as e:
                 logging.error(f"insert feedback up failed: {e}")
+
+            # ---- NEW analytics hook ----
+            try:
+                record_event(
+                    "slack",
+                    "rate_up",
+                    conversation_id=str(meta.get("conv_id") or ""),
+                    listing_id=str(meta.get("listing_id") or ""),
+                    guest_id=str((meta.get("guest_id") or "")),
+                    user_id=user_id or "",
+                    rating="up",
+                    intent=meta.get("detected_intent"),
+                    text=meta.get("ai_suggestion") or "",
+                )
+            except Exception as e:
+                logging.error(f"analytics rate_up: {e}")
+            # ----------------------------
+
             # Best-effort ephemeral ack
             try:
                 if slack_client and channel_id and user_id:
@@ -1010,6 +1049,24 @@ async def slack_actions(
                 })
             except Exception as e:
                 logging.error(f"insert feedback down failed: {e}")
+
+            # ---- NEW analytics hook ----
+            try:
+                record_event(
+                    "slack",
+                    "rate_down",
+                    conversation_id=str(conv_id or ""),
+                    listing_id="",
+                    guest_id="",
+                    user_id=user_id,
+                    rating="down",
+                    reason=reason.strip() or None,
+                    intent=private_meta.get("detected_intent"),
+                    text=ai_suggestion or "",
+                )
+            except Exception as e:
+                logging.error(f"analytics rate_down: {e}")
+            # ----------------------------
 
             if improved.strip():
                 try:
