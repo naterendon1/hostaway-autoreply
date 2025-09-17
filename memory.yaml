@@ -1,1 +1,8 @@
-# AI learning memory will be stored here in YAML format
+# AI learning memory will be stored here in YAML format# memory.yaml
+templates:
+  - intent: "late_checkin"
+    question: "Can I check in at 1am?"
+    answer: "No problem—self check-in is available any time."
+  - intent: "extra_towels"
+    question: "Do you have extra towels?"
+    answer: "Yep! There’s a spare set in the hallway closet."
