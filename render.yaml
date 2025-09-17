@@ -1,0 +1,55 @@
+# path: render.yaml
+services:
+  - type: web
+    name: hostaway-autoreply
+    runtime: python
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /ping
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: HOSTAWAY_CLIENT_ID
+        sync: false
+      - key: HOSTAWAY_CLIENT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GOOGLE_PLACES_API_KEY
+        sync: false
+      - key: GOOGLE_DISTANCE_MATRIX_API_KEY
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: SLACK_CHANNEL
+        value: C12345678
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: HOSTAWAY_API_BASE
+        value: https://api.hostaway.com/v1
+      - key: LEARNING_DB_PATH
+        value: /var/data/learning.db
+      # If you want memory.yaml to be writable/persistent:
+      - key: MEMORY_YAML_PATH
+        value: /var/data/memory.yaml
+      - key: DEFAULT_CHECKIN_TIME
+        value: "16:00"
+      - key: DEFAULT_CHECKOUT_TIME
+        value: "11:00"
+      - key: EARLY_CHECKIN_FEE
+        value: "0"
+      - key: LATE_CHECKOUT_FEE
+        value: "0"
+      - key: SHOW_NEW_GUEST_TAG
+        value: "0"
+      - key: ADMIN_TOKEN
+        sync: false
+    disks:
+      - name: data
+        mountPath: /var/data
+        sizeGB: 1
