@@ -5,7 +5,7 @@ services:
     runtime: python
     plan: starter
     region: oregon
-    autoDeploy: true
+    # autoDeployTrigger: off   # uncomment ONLY if you want to disable auto deploys
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /ping
@@ -34,7 +34,6 @@ services:
         value: https://api.hostaway.com/v1
       - key: LEARNING_DB_PATH
         value: /var/data/learning.db
-      # If you want memory.yaml to be writable/persistent:
       - key: MEMORY_YAML_PATH
         value: /var/data/memory.yaml
       - key: DEFAULT_CHECKIN_TIME
@@ -49,7 +48,7 @@ services:
         value: "0"
       - key: ADMIN_TOKEN
         sync: false
-    disks:
-      - name: data
-        mountPath: /var/data
-        sizeGB: 1
+    disk:                      # <-- singular, not 'disks'
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
