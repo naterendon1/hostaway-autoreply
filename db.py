@@ -11,12 +11,11 @@ DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 logger = logging.getLogger(__name__)
 
 def _connect() -> sqlite3.Connection:
-    """Open a connection; make sure parent dir exists (Render disk path)."""
+    """Open a connection; ensure parent dir exists (Render disk path)."""
     p = Path(DB_PATH)
     if p.parent and not p.parent.exists():
         p.parent.mkdir(parents=True, exist_ok=True)  # why: first boot on /var/data
-    # why: uvicorn can handle requests on different threads
-    conn = sqlite3.connect(str(p), check_same_thread=False)
+    conn = sqlite3.connect(str(p), check_same_thread=False)  # why: uvicorn threads
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -116,16 +115,14 @@ def get_similar_response(listing_id: Any, question: str, threshold: float = 0.6)
     c.execute("SELECT question_text, response_text FROM custom_responses WHERE listing_id = ?", (str(listing_id) if listing_id is not None else "",))
     results = c.fetchall()
     conn.close()
-    question_words = set((question or "").lower().split())
-    if not question_words:
+    q_words = set((question or "").lower().split())
+    if not q_words:
         return None
     for prev_q, prev_resp in results:
-        prev_words = set((prev_q or "").lower().split())
-        if not prev_words:
+        p_words = set((prev_q or "").lower().split())
+        if not p_words:
             continue
-        overlap = question_words & prev_words
-        score = len(overlap) / max(len(prev_words), 1)
-        if score >= threshold:
+        if len(q_words & p_words) / max(len(p_words), 1) >= threshold:
             return prev_resp
     return None
 
@@ -293,10 +290,34 @@ def record_event(source: str, event: str, **fields: Any) -> None:
     finally:
         conn.close()
 
-# path: main.py  (add this if not present)
-# from fastapi import FastAPI
-# from db import init_db
-# app = FastAPI()
-# @app.on_event("startup")
-# def _startup() -> None:
-#     init_db()  # why: ensure tables exist before first request
+# ---- Flexible wrapper expected by main.py ----
+def log_message_event(*args: Any, **fields: Any) -> None:
+    """
+    Accepts:
+      - (conversation_id, role, message, **fields)
+      - (conversation_id, message, **fields)  → role='user'
+      - (source, conversation_id, role, message, **fields)
+    Sends to analytics_events with event='message'; message/role go into metadata.
+    """
+    source = "app"
+    conversation_id = ""
+    role = fields.pop("role", "user")
+    message = fields.pop("message", "")
+
+    if len(args) == 4:
+        source, conversation_id, role, message = args  # legacy: 4-arg form
+    elif len(args) == 3:
+        conversation_id, role, message = args
+    elif len(args) == 2:
+        conversation_id, message = args
+    elif len(args) == 1:
+        message = args[0]
+
+    record_event(
+        source=source,
+        event="message",
+        conversation_id=str(conversation_id or ""),
+        role=role,
+        message=message,
+        **fields,
+    )
