@@ -1,58 +1,40 @@
-# db.py
+# path: db.py
 import os
 import sqlite3
 import logging
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any
 
-# Use one DB file everywhere; override with env if desired
 DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
-
 logger = logging.getLogger(__name__)
 
-
 def _connect() -> sqlite3.Connection:
-    """
-    Open a connection with a sane default row factory.
-    """
-    conn = sqlite3.connect(DB_PATH)
+    """Open a connection; make sure parent dir exists (Render disk path)."""
+    p = Path(DB_PATH)
+    if p.parent and not p.parent.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)  # why: first boot on /var/data
+    # why: uvicorn can handle requests on different threads
+    conn = sqlite3.connect(str(p), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def _ensure_columns(conn: sqlite3.Connection, table: str, columns: Dict[str, str]) -> None:
-    """
-    Idempotently add missing columns to an existing table.
-    columns: {"col_name": "SQL_TYPE [DEFAULT ...]"}
-    """
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info({table})")
-    existing = {row[1] for row in cur.fetchall()}  # column names
+    existing = {row[1] for row in cur.fetchall()}
     for name, decl in columns.items():
         if name not in existing:
             try:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
             except Exception as e:
-                logger.debug(f"ALTER TABLE {table} ADD COLUMN {name} failed or already exists: {e}")
+                logger.debug(f"ALTER TABLE {table} ADD COLUMN {name} failed/exists: {e}")
     conn.commit()
 
-
 def init_db() -> None:
-    """
-    Initialize all tables we use:
-      - custom_responses         (original learning store)
-      - ai_feedback              (feedback log; now includes 'reason' + created_at default)
-      - slack_threads            (threading info so we can update a Slack message)
-      - guests                   (to detect returning guests by email)
-      - processed_events         (idempotency for webhooks/actions)
-      - learning_examples        (simple examples store; includes coach_prompt)
-    Also performs light, idempotent migrations to add newer columns on older DBs.
-    """
     conn = _connect()
     c = conn.cursor()
-
-    # Original table (legacy learning store)
     c.execute("""
         CREATE TABLE IF NOT EXISTS custom_responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,8 +44,6 @@ def init_db() -> None:
             created_at TEXT
         )
     """)
-
-    # Feedback table (enhanced: includes reason + created_at default)
     c.execute("""
         CREATE TABLE IF NOT EXISTS ai_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,13 +55,10 @@ def init_db() -> None:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Migrations: add missing columns on older DBs
     _ensure_columns(conn, "ai_feedback", {
         "reason": "TEXT",
         "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
     })
-
-    # Slack thread binding (one Slack thread per Hostaway conversation)
     c.execute("""
         CREATE TABLE IF NOT EXISTS slack_threads (
             conv_id TEXT PRIMARY KEY,
@@ -89,8 +66,6 @@ def init_db() -> None:
             ts TEXT NOT NULL
         )
     """)
-
-    # Simple guest registry to detect "returning guest"
     c.execute("""
         CREATE TABLE IF NOT EXISTS guests (
             email TEXT PRIMARY KEY,
@@ -99,16 +74,12 @@ def init_db() -> None:
             count INTEGER DEFAULT 1
         )
     """)
-
-    # Idempotency for incoming webhooks / Slack actions
     c.execute("""
         CREATE TABLE IF NOT EXISTS processed_events (
             event_id TEXT PRIMARY KEY,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # Examples used by "Save for learning"
     c.execute("""
         CREATE TABLE IF NOT EXISTS learning_examples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +90,6 @@ def init_db() -> None:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Backwards-compat migration for learning_examples (older DBs may miss some columns)
     _ensure_columns(conn, "learning_examples", {
         "intent": "TEXT",
         "question": "TEXT",
@@ -127,12 +97,8 @@ def init_db() -> None:
         "coach_prompt": "TEXT",
         "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
     })
-
     conn.commit()
     conn.close()
-
-
-# ---------------- Existing functions (kept) ----------------
 
 def save_custom_response(listing_id: Any, question: str, response: str) -> None:
     conn = _connect()
@@ -144,24 +110,15 @@ def save_custom_response(listing_id: Any, question: str, response: str) -> None:
     conn.commit()
     conn.close()
 
-
 def get_similar_response(listing_id: Any, question: str, threshold: float = 0.6) -> Optional[str]:
-    """
-    Extremely simple "similarity": word overlap ratio vs. previously saved questions
-    for that listing. Good enough as a lightweight fallback.
-    """
     conn = _connect()
     c = conn.cursor()
-    c.execute("""
-        SELECT question_text, response_text FROM custom_responses WHERE listing_id = ?
-    """, (str(listing_id) if listing_id is not None else "",))
+    c.execute("SELECT question_text, response_text FROM custom_responses WHERE listing_id = ?", (str(listing_id) if listing_id is not None else "",))
     results = c.fetchall()
     conn.close()
-
     question_words = set((question or "").lower().split())
     if not question_words:
         return None
-
     for prev_q, prev_resp in results:
         prev_words = set((prev_q or "").lower().split())
         if not prev_words:
@@ -172,13 +129,7 @@ def get_similar_response(listing_id: Any, question: str, threshold: float = 0.6)
             return prev_resp
     return None
 
-
 def save_learning_example(listing_id: Any, question: str, corrected_reply: str) -> None:
-    """
-    Kept for backward-compatibility with older codepaths.
-    Writes into custom_responses as your original "learning store".
-    (Your newer UI also saves to learning_examples; that path is handled elsewhere.)
-    """
     conn = _connect()
     c = conn.cursor()
     c.execute("""
@@ -188,13 +139,8 @@ def save_learning_example(listing_id: Any, question: str, corrected_reply: str) 
     conn.commit()
     conn.close()
 
-
 def save_ai_feedback(conv_id: str, question: str, answer: str, rating: str, user: str, reason: str = "") -> None:
-    """
-    Store a feedback row. 'reason' is optional for legacy callers.
-    """
     conn = _connect()
-    # Ensure enhanced schema exists even if init_db wasn't called yet in this process
     _ensure_columns(conn, "ai_feedback", {"reason": "TEXT", "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP"})
     c = conn.cursor()
     c.execute("""
@@ -210,18 +156,10 @@ def save_ai_feedback(conv_id: str, question: str, answer: str, rating: str, user
     conn.commit()
     conn.close()
 
-
-# Backwards-compat exports expected elsewhere in your code
 store_learning_example = save_learning_example
 store_ai_feedback = save_ai_feedback
 
-
-# ---------------- New/maintained functions for features ----------------
-
 def upsert_slack_thread(conv_id: str, channel: str, ts: str) -> None:
-    """
-    Save or update the Slack thread (ts) used for a Hostaway conversation.
-    """
     if not conv_id or not channel or not ts:
         logger.warning("upsert_slack_thread called with missing args")
         return
@@ -235,11 +173,7 @@ def upsert_slack_thread(conv_id: str, channel: str, ts: str) -> None:
     conn.commit()
     conn.close()
 
-
 def get_slack_thread(conv_id: str) -> Optional[Dict[str, str]]:
-    """
-    Return {'channel': 'C123', 'ts': '1700000000.123456'} if we know the thread.
-    """
     if not conv_id:
         return None
     conn = _connect()
@@ -249,12 +183,7 @@ def get_slack_thread(conv_id: str) -> Optional[Dict[str, str]]:
     conn.close()
     return {"channel": row["channel"], "ts": row["ts"]} if row else None
 
-
 def note_guest(email: str) -> int:
-    """
-    Upsert a guest by email and increment their count. Returns the visit count.
-    Used by your returning-guest logic.
-    """
     if not email:
         return 1
     conn = _connect()
@@ -271,13 +200,7 @@ def note_guest(email: str) -> int:
     conn.close()
     return cnt
 
-
-# ---------------- Idempotency helpers ----------------
-
 def already_processed(event_id: Optional[str]) -> bool:
-    """
-    Return True if we've seen this event_id before (for webhook/action idempotency).
-    """
     if not event_id:
         return False
     conn = _connect()
@@ -287,11 +210,7 @@ def already_processed(event_id: Optional[str]) -> bool:
     conn.close()
     return exists
 
-
 def mark_processed(event_id: Optional[str]) -> None:
-    """
-    Mark an event_id as processed. Safe to call repeatedly.
-    """
     if not event_id:
         return
     conn = _connect()
@@ -306,10 +225,6 @@ def mark_processed(event_id: Optional[str]) -> None:
         conn.close()
 
 def _ensure_events_table(conn: sqlite3.Connection) -> None:
-    """
-    Create analytics_events and idempotently ensure expected columns exist.
-    Why: slack_interactivity calls record_event() for analytics.
-    """
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS analytics_events (
@@ -328,7 +243,6 @@ def _ensure_events_table(conn: sqlite3.Connection) -> None:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Keep schema forward-compatible on old DBs
     _ensure_columns(conn, "analytics_events", {
         "source": "TEXT",
         "event": "TEXT",
@@ -346,27 +260,16 @@ def _ensure_events_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 def record_event(source: str, event: str, **fields: Any) -> None:
-    """
-    Write a lightweight analytics event.
-
-    Dedicated columns (stringified if None):
-      conversation_id, reservation_id, listing_id, guest_id, user_id, rating, reason, intent
-
-    Any extra keys are packed into JSON `metadata` to avoid schema churn.
-    """
     allowed = {
         "conversation_id", "reservation_id", "listing_id",
         "guest_id", "user_id", "rating", "reason", "intent",
     }
     row = {k: (fields.get(k) or "") for k in allowed}
     extra = {k: v for k, v in fields.items() if k not in allowed}
-
     try:
         metadata = json.dumps(extra, ensure_ascii=False) if extra else None
     except Exception:
-        # last-resort: stringify un-serializable values
         metadata = json.dumps({k: str(v) for k, v in extra.items()}, ensure_ascii=False) if extra else None
-
     conn = _connect()
     try:
         _ensure_events_table(conn)
@@ -389,3 +292,11 @@ def record_event(source: str, event: str, **fields: Any) -> None:
         conn.commit()
     finally:
         conn.close()
+
+# path: main.py  (add this if not present)
+# from fastapi import FastAPI
+# from db import init_db
+# app = FastAPI()
+# @app.on_event("startup")
+# def _startup() -> None:
+#     init_db()  # why: ensure tables exist before first request
