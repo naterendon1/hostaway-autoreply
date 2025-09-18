@@ -7,14 +7,12 @@ import sqlite3
 from typing import List, Dict, Optional, Any
 from datetime import date, datetime
 
-from fastapi import FastAPI, Depends, HTTPException, Header, Query
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, Body
 from pydantic import BaseModel
 
-# Slack SDK
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-# Local modules
 from places import should_fetch_local_recs, build_local_recs
 from slack_interactivity import router as slack_router
 from assistant_core import compose_reply as ac_compose
@@ -25,7 +23,6 @@ from utils import (
     clean_ai_reply,
 )
 
-# DB API
 from db import init_db as db_init
 from db import (
     get_slack_thread as db_get_slack_thread,
@@ -48,13 +45,13 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")
 SHOW_NEW_GUEST_TAG = os.getenv("SHOW_NEW_GUEST_TAG", "0") in ("1", "true", "True", "yes", "YES")
 DEBUG_CONVERSATION = os.getenv("DEBUG_CONVERSATION", "0") in ("1", "true", "True", "yes", "YES")
-SLACK_SKIP_READS = os.getenv("SLACK_SKIP_READS", "1") in ("1", "true", "True", "yes", "YES")  # why: avoid missing_scope
+SLACK_SKIP_READS = os.getenv("SLACK_SKIP_READS", "1") in ("1", "true", "True", "yes", "YES")  # default: no read scopes
 
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
     "OPENAI_API_KEY",
-    "SLACK_CHANNEL",        # '#host-messages' or channel ID 'C…/G…'
+    "SLACK_CHANNEL",        # MUST be channel ID: C…/G…
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
 ]
@@ -65,59 +62,29 @@ if _missing:
 MAX_THREAD_MESSAGES = 10
 
 # ---------- Slack helpers ----------
-_SLACK_CHANNEL_ID: Optional[str] = None  # cached ID
+_SLACK_CHANNEL_ID: Optional[str] = None
 
 def _hint_is_id(hint: str) -> bool:
     return bool(hint) and hint[0] in ("C", "G") and len(hint) > 8
 
-def _resolve_slack_channel_id(client: WebClient, hint: str) -> Optional[str]:
-    """Name → ID (requires conversations:read)."""
-    if not hint:
-        return None
-    if _hint_is_id(hint):
-        return hint
-    name = hint.lstrip("#")
-    cursor = None
-    try:
-        while True:
-            resp = client.conversations_list(
-                types="public_channel,private_channel",
-                exclude_archived=True,
-                limit=1000,
-                cursor=cursor,
-            )
-            for ch in resp.get("channels", []):
-                if ch.get("name") == name:
-                    return ch.get("id")
-            cursor = (resp.get("response_metadata") or {}).get("next_cursor")
-            if not cursor:
-                break
-    except SlackApiError as e:
-        logging.warning(f"conversations_list failed: {getattr(e, 'response', {}).data if hasattr(e,'response') else e}")
-    return None
-
 def _ensure_bot_in_channel(client: WebClient, channel_id: str) -> None:
-    """Public channels only. Private requires manual invite."""
     try:
         client.conversations_join(channel=channel_id)
     except SlackApiError:
-        pass
+        pass  # private or already joined
 
 def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, Any]], text: str) -> bool:
-    """Post without read scopes if channel ID is provided."""
-    chan_id = _SLACK_CHANNEL_ID
-    if not chan_id:
-        if _hint_is_id(channel_hint):
-            chan_id = channel_hint
-        elif SLACK_SKIP_READS:
-            logging.error("SLACK_SKIP_READS=1 and SLACK_CHANNEL is a name. Set SLACK_CHANNEL to the channel ID.")
-            return False
-        else:
-            chan_id = _resolve_slack_channel_id(client, channel_hint)
-            if not chan_id:
-                logging.error("Failed to resolve SLACK_CHANNEL. Use an ID or add conversations:read and reinstall the app.")
-                return False
-
+    """
+    Post only when we have a Slack channel ID (no read scopes).
+    """
+    chan_id = (_SLACK_CHANNEL_ID or (channel_hint or "").strip())
+    if not _hint_is_id(chan_id):
+        logging.error(
+            "SLACK_CHANNEL must be a Slack channel ID (starts with 'C' or 'G'). "
+            "Current value=%r. Fix: set SLACK_CHANNEL to the Channel ID from Slack → Channel details → About → Channel ID.",
+            channel_hint,
+        )
+        return False
     try:
         client.chat_postMessage(channel=chan_id, blocks=blocks, text=text)
         return True
@@ -132,7 +99,7 @@ def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, 
                 logging.error(f"Slack retry failed: {getattr(e2, 'response', {}).data if hasattr(e2,'response') else e2}")
                 return False
         if err == "channel_not_found":
-            logging.error("Slack error channel_not_found. Verify channel ID/name and workspace.")
+            logging.error("Slack error channel_not_found. Verify channel ID and workspace.")
             return False
         if err == "is_archived":
             logging.error("Slack channel is archived.")
@@ -155,52 +122,6 @@ def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, 
     except Exception as e:
         logging.error(f"Unexpected Slack error: {e}")
         return False
-
-def _startup_slack_check() -> None:
-    """Avoid Slack read APIs unless necessary or allowed."""
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    hint = os.getenv("SLACK_CHANNEL", "")
-    if not token or not hint:
-        logging.warning("Slack not fully configured (SLACK_BOT_TOKEN / SLACK_CHANNEL).")
-        return
-
-    global _SLACK_CHANNEL_ID
-    if _hint_is_id(hint):
-        _SLACK_CHANNEL_ID = hint
-        logging.info(f"Using SLACK_CHANNEL as ID: {_SLACK_CHANNEL_ID}")
-        return  # no reads → no missing_scope
-
-    # If we only have a name and reads are disabled, don't call Slack.
-    if SLACK_SKIP_READS:
-        logging.error("SLACK_CHANNEL is a name but SLACK_SKIP_READS=1. Set SLACK_CHANNEL to the channel ID to skip read scopes.")
-        return
-
-    # Reads allowed: resolve name → ID and attempt membership/info.
-    client = WebClient(token=token)
-    try:
-        who = client.auth_test()
-        logging.info(f"Slack bot authed as {who.get('bot_id') or who.get('user')} in team {who.get('team')}.")
-    except SlackApiError as e:
-        logging.error(f"Slack auth_test failed: {getattr(e, 'response', {}).data if hasattr(e,'response') else e}")
-        return
-
-    _SLACK_CHANNEL_ID = _resolve_slack_channel_id(client, hint)
-    if not _SLACK_CHANNEL_ID:
-        logging.error("Could not resolve SLACK_CHANNEL. Use a channel ID or add conversations:read and reinstall the app.")
-        return
-
-    try:
-        info = client.conversations_info(channel=_SLACK_CHANNEL_ID)
-        ch = info.get("channel", {}) or {}
-        logging.info(
-            f"Resolved SLACK_CHANNEL → ID={_SLACK_CHANNEL_ID} "
-            f"(private={bool(ch.get('is_private'))}, member={bool(ch.get('is_member'))})."
-        )
-        if not ch.get("is_member"):
-            _ensure_bot_in_channel(client, _SLACK_CHANNEL_ID)
-    except SlackApiError as e:
-        err = getattr(e, "response", {}).data.get("error") if hasattr(e, "response") else None
-        logging.error(f"conversations_info failed ({err}). If private, invite the bot.")
 
 # ---------- Optional legacy Slack threading ----------
 def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
@@ -376,45 +297,30 @@ def require_admin(x_admin_token: str | None = Header(None, alias="X-Admin-Token"
 
 @app.get("/admin/slack-diagnose", dependencies=[Depends(require_admin)])
 def slack_diagnose():
-    """Safe diagnose: avoids read calls if SLACK_SKIP_READS=1 and a channel ID is provided."""
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    hint = os.getenv("SLACK_CHANNEL", "")
+    hint = (os.getenv("SLACK_CHANNEL", "") or "").strip()
     res: Dict[str, Any] = {"hint": hint, "skip_reads": SLACK_SKIP_READS, "cached_id": _SLACK_CHANNEL_ID}
-    if not token:
-        res["error"] = "missing SLACK_BOT_TOKEN"; return res
-
-    # If we already have an ID and skip_reads, just return it.
-    if _SLACK_CHANNEL_ID and (SLACK_SKIP_READS or _hint_is_id(hint)):
+    if _SLACK_CHANNEL_ID and _hint_is_id(_SLACK_CHANNEL_ID):
         res["resolved_id"] = _SLACK_CHANNEL_ID
-        res["note"] = "Using channel ID without Slack read scopes."
-        return res
+        res["note"] = "Using channel ID; no read scopes required."
+    else:
+        res["error"] = "Set SLACK_CHANNEL to the Channel ID (starts with C/G)."
+    return res
 
-    # Otherwise, try minimal checks (may require scopes).
+@app.post("/admin/slack-ping", dependencies=[Depends(require_admin)])
+def admin_slack_ping(channel: Optional[str] = Query(None), text: str = Body("hostaway-autoreply ping")):
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if not token:
+        raise HTTPException(status_code=500, detail="SLACK_BOT_TOKEN missing")
+    chan = (channel or _SLACK_CHANNEL_ID or os.getenv("SLACK_CHANNEL", "")).strip()
+    if not _hint_is_id(chan):
+        raise HTTPException(status_code=400, detail="Provide a channel ID. Set SLACK_CHANNEL to the Channel ID.")
     client = WebClient(token=token)
     try:
-        who = client.auth_test()
-        res["team"] = who.get("team"); res["bot"] = who.get("bot_id") or who.get("user")
+        resp = client.chat_postMessage(channel=chan, text=text)
+        return {"ok": resp.get("ok"), "channel": chan, "ts": resp.get("ts")}
     except SlackApiError as e:
-        res["auth_error"] = getattr(e, "response", {}).data if hasattr(e, "response") else str(e)
-        return res
-
-    chan_id = _SLACK_CHANNEL_ID or (_resolve_slack_channel_id(client, hint) if not _hint_is_id(hint) else hint)
-    res["resolved_id"] = chan_id
-    if not chan_id:
-        res["channel_error"] = "could not resolve channel (provide channel ID or add conversations:read)."
-        return res
-
-    if SLACK_SKIP_READS:
-        res["note"] = "Resolved, but skipping conversations.info due to SLACK_SKIP_READS=1."
-        return res
-
-    try:
-        info = client.conversations_info(channel=chan_id)
-        ch = info.get("channel", {}) or {}
-        res["channel"] = {"name": ch.get("name"), "is_private": ch.get("is_private"), "is_member": ch.get("is_member")}
-    except SlackApiError as e:
-        res["conversations_info_error"] = getattr(e, "response", {}).data if hasattr(e,"response") else str(e)
-    return res
+        data = e.response.data if hasattr(e, "response") else {"error": str(e)}
+        return {"ok": False, "channel": chan, **data}
 
 @app.get("/learning", dependencies=[Depends(require_admin)])
 def list_learning(limit: int = 100) -> List[Dict]:
@@ -732,7 +638,16 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 @app.on_event("startup")
 def _startup() -> None:
     db_init()
-    _startup_slack_check()
+    hint = (os.getenv("SLACK_CHANNEL") or "").strip()
+    global _SLACK_CHANNEL_ID
+    if _hint_is_id(hint):
+        _SLACK_CHANNEL_ID = hint
+        logging.info("Using SLACK_CHANNEL as ID: %s", _SLACK_CHANNEL_ID)
+    else:
+        if SLACK_SKIP_READS:
+            logging.error("SLACK_CHANNEL is a name but reads are disabled. Set SLACK_CHANNEL to the Channel ID (C…/G…).")
+        else:
+            logging.info("SLACK_SKIP_READS is off, but name-based resolution is disabled in this build. Provide a Channel ID.")
 
 @app.get("/ping")
 def ping():
