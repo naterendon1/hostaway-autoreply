@@ -10,11 +10,11 @@ from datetime import date, datetime
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
 
-# Slack SDK (needed for helpers below)
+# Slack SDK
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-# Local helpers
+# Local modules from your repo
 from places import should_fetch_local_recs, build_local_recs
 from slack_interactivity import router as slack_router
 from assistant_core import compose_reply as ac_compose
@@ -25,7 +25,7 @@ from utils import (
     clean_ai_reply,
 )
 
-# DB functions
+# DB API (paired with your updated db.py)
 from db import init_db as db_init
 from db import (
     get_slack_thread as db_get_slack_thread,
@@ -37,25 +37,23 @@ from db import (
     log_ai_exchange,
 )
 
-# ---- App & logging ----
-logging.basicConfig(level=logging.INFO)
+# ---------- App & logging ----------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 app = FastAPI()
 app.include_router(slack_router, prefix="/slack")
 
-@app.on_event("startup")
-def _startup() -> None:
-    db_init()  # ensure tables on boot
-
-# ---- Env & config ----
+# ---------- Env & config ----------
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")
 SHOW_NEW_GUEST_TAG = os.getenv("SHOW_NEW_GUEST_TAG", "0") in ("1", "true", "True", "yes", "YES")
+DEBUG_CONVERSATION = os.getenv("DEBUG_CONVERSATION", "0") in ("1", "true", "True", "yes", "YES")
 
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
     "OPENAI_API_KEY",
-    "SLACK_CHANNEL",        # can be channel ID or #name
+    "SLACK_CHANNEL",        # '#host-messages' or channel ID 'C…/G…'
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
 ]
@@ -66,15 +64,16 @@ if _missing:
 MAX_THREAD_MESSAGES = 10
 
 # ---------- Slack helpers ----------
+_SLACK_CHANNEL_ID: Optional[str] = None  # cached resolved ID
+
 def _resolve_slack_channel_id(client: WebClient, hint: str) -> Optional[str]:
     """
-    Accepts a channel ID (C.../G...) or a #name/name. Returns a channel ID or None.
-    Why: avoid 'channel_not_found' when a name is provided.
+    Accepts channel ID (C…/G…) or '#name'/name. Returns channel ID or None.
     """
     if not hint:
         return None
     hint = hint.strip()
-    if hint.startswith("C") or hint.startswith("G"):  # already an ID
+    if hint.startswith(("C", "G")) and len(hint) > 8:
         return hint
     name = hint.lstrip("#")
     cursor = None
@@ -93,50 +92,48 @@ def _resolve_slack_channel_id(client: WebClient, hint: str) -> Optional[str]:
             if not cursor:
                 break
     except SlackApiError as e:
-        logging.warning(f"conversations_list failed: {e}")
+        logging.warning(f"conversations_list failed: {getattr(e, 'response', {}).data if hasattr(e,'response') else e}")
     return None
 
 def _ensure_bot_in_channel(client: WebClient, channel_id: str) -> None:
     """
-    Try to join public channels to avoid 'not_in_channel'. Private channels require an invite.
+    Join public channels if not a member. Private channels require manual invite.
     """
     try:
         client.conversations_join(channel=channel_id)
-    except SlackApiError as e:
-        # It's fine if already in channel or join not allowed (private).
-        pass
+    except SlackApiError:
+        pass  # ignore if already in or join not allowed
 
 def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, Any]], text: str) -> bool:
     """
-    Robust post: resolve channel, join if needed, retry once on membership errors.
-    Returns True if sent, else False (without raising).
+    Robust post: resolve channel, handle not_in_channel, simple rate-limit retry.
+    Returns True on success, False otherwise (no exception).
     """
-    channel_id = _resolve_slack_channel_id(client, channel_hint)
-    if not channel_id:
-        logging.error("Slack channel resolution failed. Check SLACK_CHANNEL (ID like C… or #name).")
+    chan_id = _SLACK_CHANNEL_ID or _resolve_slack_channel_id(client, channel_hint)
+    if not chan_id:
+        logging.error("Slack channel resolution failed. Set SLACK_CHANNEL to '#host-messages' or a channel ID.")
         return False
 
     try:
-        client.chat_postMessage(channel=channel_id, blocks=blocks, text=text)
+        client.chat_postMessage(channel=chan_id, blocks=blocks, text=text)
         return True
     except SlackApiError as e:
         err = getattr(e, "response", {}).data.get("error") if hasattr(e, "response") else None
-        if err in {"not_in_channel"}:
-            _ensure_bot_in_channel(client, channel_id)
+        if err == "not_in_channel":
+            _ensure_bot_in_channel(client, chan_id)
             try:
-                client.chat_postMessage(channel=channel_id, blocks=blocks, text=text)
+                client.chat_postMessage(channel=chan_id, blocks=blocks, text=text)
                 return True
             except SlackApiError as e2:
                 logging.error(f"Slack post retry failed: {getattr(e2, 'response', {}).data if hasattr(e2, 'response') else e2}")
                 return False
-        elif err in {"channel_not_found"}:
-            # Try resolving from name (if hint looked like an ID but in wrong workspace this still fails)
-            logging.error("Slack error channel_not_found. Verify channel and workspace matching your bot token.")
+        if err == "channel_not_found":
+            logging.error("Slack error channel_not_found. Verify channel name/ID and workspace for your bot token.")
             return False
-        elif err == "is_archived":
+        if err == "is_archived":
             logging.error("Slack channel is archived.")
             return False
-        elif err == "rate_limited":
+        if err == "rate_limited":
             retry_after = 1
             try:
                 retry_after = int(e.response.headers.get("Retry-After", "1"))
@@ -144,19 +141,54 @@ def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, 
                 pass
             time.sleep(max(retry_after, 1))
             try:
-                client.chat_postMessage(channel=channel_id, blocks=blocks, text=text)
+                client.chat_postMessage(channel=chan_id, blocks=blocks, text=text)
                 return True
             except SlackApiError as e3:
                 logging.error(f"Slack rate-limit retry failed: {getattr(e3, 'response', {}).data if hasattr(e3, 'response') else e3}")
                 return False
-        else:
-            logging.error(f"Slack send error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
-            return False
+        logging.error(f"Slack send error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
+        return False
     except Exception as e:
         logging.error(f"Unexpected Slack error: {e}")
         return False
 
-# ---------- Slack threading (optional legacy) ----------
+def _startup_slack_check() -> None:
+    """
+    Resolve '#host-messages' → channel ID, check membership, cache ID.
+    """
+    token = os.getenv("SLACK_BOT_TOKEN")
+    hint = os.getenv("SLACK_CHANNEL", "")
+    if not token or not hint:
+        logging.warning("Slack not fully configured (SLACK_BOT_TOKEN / SLACK_CHANNEL).")
+        return
+    client = WebClient(token=token)
+    try:
+        who = client.auth_test()
+        logging.info(f"Slack bot authed as {who.get('bot_id') or who.get('user')} in team {who.get('team')}.")
+    except SlackApiError as e:
+        logging.error(f"Slack auth_test failed: {getattr(e, 'response', {}).data if hasattr(e,'response') else e}")
+        return
+
+    global _SLACK_CHANNEL_ID
+    _SLACK_CHANNEL_ID = _resolve_slack_channel_id(client, hint)
+    if not _SLACK_CHANNEL_ID:
+        logging.error("Could not resolve SLACK_CHANNEL. Use '#host-messages' or channel ID; invite the bot if private.")
+        return
+
+    try:
+        info = client.conversations_info(channel=_SLACK_CHANNEL_ID)
+        ch = info.get("channel", {}) or {}
+        logging.info(
+            f"Resolved SLACK_CHANNEL → ID={_SLACK_CHANNEL_ID} "
+            f"(private={bool(ch.get('is_private'))}, member={bool(ch.get('is_member'))})."
+        )
+        if not ch.get("is_member"):
+            _ensure_bot_in_channel(client, _SLACK_CHANNEL_ID)
+    except SlackApiError as e:
+        err = getattr(e, "response", {}).data.get("error") if hasattr(e, "response") else None
+        logging.error(f"conversations_info failed ({err}). If private, invite the bot.")
+
+# ---------- Optional legacy Slack threading ----------
 def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
     if not conv_id:
         return None
@@ -169,47 +201,23 @@ def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
     channel = os.getenv("SLACK_CHANNEL") or ""
     db_upsert_slack_thread(str(conv_id), channel, ts)
 
-# ---------- Helpers ----------
+# ---------- Assorted helpers ----------
 CHANNEL_ID_MAP = {
-    2018: "Airbnb (Official)",
-    2002: "HomeAway",
-    2005: "Booking.com",
-    2007: "Expedia",
-    2009: "HomeAway (iCal)",
-    2010: "Vrbo",
-    2000: "Direct",
-    2013: "Booking Engine",
-    2015: "Custom iCal",
-    2016: "TripAdvisor (iCal)",
-    2017: "WordPress",
-    2019: "Marriott",
-    2020: "Partner",
-    2021: "GDS",
-    2022: "Google",
+    2018: "Airbnb (Official)", 2002: "HomeAway", 2005: "Booking.com", 2007: "Expedia",
+    2009: "HomeAway (iCal)", 2010: "Vrbo", 2000: "Direct", 2013: "Booking Engine",
+    2015: "Custom iCal", 2016: "TripAdvisor (iCal)", 2017: "WordPress", 2019: "Marriott",
+    2020: "Partner", 2021: "GDS", 2022: "Google",
 }
 COMM_TYPE_MAP = {
-    "airbnb": "Airbnb",
-    "airbnbofficial": "Airbnb (Official)",
-    "vrbo": "Vrbo",
-    "bookingcom": "Booking.com",
-    "direct": "Direct",
-    "expedia": "Expedia",
-    "channel": "Channel",
-    "email": "Email",
+    "airbnb": "Airbnb", "airbnbofficial": "Airbnb (Official)", "vrbo": "Vrbo",
+    "bookingcom": "Booking.com", "direct": "Direct", "expedia": "Expedia",
+    "channel": "Channel", "email": "Email",
 }
 RES_STATUS_ALLOWED = {
-    "new": "New",
-    "modified": "Modified",
-    "cancelled": "Cancelled",
-    "ownerstay": "Owner Stay",
-    "pending": "Pending",
-    "awaitingpayment": "Awaiting Payment",
-    "declined": "Declined",
-    "expired": "Expired",
-    "inquiry": "Inquiry",
-    "inquirypreapproved": "Inquiry (Preapproved)",
-    "inquirydenied": "Inquiry (Denied)",
-    "inquirytimedout": "Inquiry (Timed Out)",
+    "new": "New", "modified": "Modified", "cancelled": "Cancelled", "ownerstay": "Owner Stay",
+    "pending": "Pending", "awaitingpayment": "Awaiting Payment", "declined": "Declined",
+    "expired": "Expired", "inquiry": "Inquiry", "inquirypreapproved": "Inquiry (Preapproved)",
+    "inquirydenied": "Inquiry (Denied)", "inquirytimedout": "Inquiry (Timed Out)",
     "inquirynotpossible": "Inquiry (Not Possible)",
 }
 BOOKED_STATUSES = {"new", "modified"}
@@ -223,7 +231,7 @@ def format_us_date(d: str | None) -> str:
             dt = datetime.strptime(s[:19], fmt)
             return dt.strftime("%m/%d/%Y")
         except Exception:
-            continue
+            pass
     return s
 
 def format_price(amount, currency: str | None = "USD") -> str:
@@ -276,14 +284,19 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
     return "unknown"
 
 def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optional[Dict]) -> Dict[str, Optional[str]]:
+    """
+    Pull door/access info from common fields on reservation/listing.
+    """
     def _get(d: Dict[str, Any], *keys: str) -> Optional[str]:
         for k in keys:
             v = d.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
         return None
+
     listing = (listing_obj or {}).get("result") or {}
     reservation = (reservation_obj or {}).get("result") or {}
+
     code = (
         _get(reservation, "doorCode", "door_code", "accessCode", "checkInCode", "entryCode")
         or _get(listing, "doorCode", "door_code", "accessCode", "checkInCode", "entryCode")
@@ -297,16 +310,19 @@ def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optiona
 def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]:
     listing = (listing_obj or {}).get("result") or {}
     pets_allowed = listing.get("petsAllowed") if "petsAllowed" in listing else None
+
     rules_blob = ""
     for k in ("rules", "houseRules", "description", "summary"):
         v = listing.get(k)
         if isinstance(v, str):
             rules_blob += " " + v.lower()
+
     if pets_allowed is None and rules_blob:
         if "no pets" in rules_blob or "pets not allowed" in rules_blob:
             pets_allowed = False
         elif "pets allowed" in rules_blob or "pet friendly" in rules_blob:
             pets_allowed = True
+
     return {"pets_allowed": pets_allowed, "pet_fee": None, "pet_deposit_refundable": None}
 
 def _safe_read_json(path: str) -> Dict:
@@ -320,6 +336,9 @@ def _safe_read_json(path: str) -> Dict:
         return {}
 
 def load_listing_config(listing_id: Optional[int | str]) -> Dict:
+    """
+    Load config/listings/{listing_id}.json, fallback to config/listings/default.json.
+    """
     if not listing_id:
         return _safe_read_json("config/listings/default.json")
     by_id = _safe_read_json(f"config/listings/{listing_id}.json")
@@ -329,11 +348,14 @@ def load_listing_config(listing_id: Optional[int | str]) -> Dict:
 
 def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
     out = dict(meta)
+
+    # Property profile (check-in/out times, etc.)
     prof = dict(out.get("property_profile") or {})
     if isinstance(cfg.get("property_profile"), dict):
         prof.update({k: v for k, v in cfg["property_profile"].items() if v is not None})
     out["property_profile"] = prof
 
+    # Policies
     pol = dict(out.get("policies") or {})
     if isinstance(cfg.get("policies"), dict):
         pol.update({k: v for k, v in cfg["policies"].items() if v is not None})
@@ -341,6 +363,7 @@ def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
         pol["pets_allowed"] = cfg.get("pets_allowed")
     out["policies"] = pol
 
+    # Access / arrival details
     acc = dict(out.get("access") or {})
     if isinstance(cfg.get("access_and_arrival"), dict):
         for k, v in cfg["access_and_arrival"].items():
@@ -348,6 +371,7 @@ def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
                 acc[k] = v
     out["access"] = acc
 
+    # House rules & extras
     if isinstance(cfg.get("house_rules"), dict):
         out["house_rules"] = cfg["house_rules"]
     if isinstance(cfg.get("amenities_and_quirks"), dict):
@@ -358,6 +382,7 @@ def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
         out["core_identity"] = cfg["core_identity"]
     if isinstance(cfg.get("upsells"), dict):
         out["upsells"] = cfg["upsells"]
+
     return out
 
 # ---------- Admin ----------
@@ -369,81 +394,93 @@ def require_admin(
     if supplied != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+@app.get("/admin/slack-diagnose", dependencies=[Depends(require_admin)])
+def slack_diagnose():
+    token = os.getenv("SLACK_BOT_TOKEN")
+    hint = os.getenv("SLACK_CHANNEL", "")
+    res: Dict[str, Any] = {"hint": hint, "resolved_id": _SLACK_CHANNEL_ID}
+    if not token:
+        res["error"] = "missing SLACK_BOT_TOKEN"
+        return res
+    client = WebClient(token=token)
+    try:
+        who = client.auth_test()
+        res["team"] = who.get("team")
+        res["bot"] = who.get("bot_id") or who.get("user")
+    except SlackApiError as e:
+        res["auth_error"] = getattr(e, "response", {}).data if hasattr(e, "response") else str(e)
+        return res
+    chan_id = _SLACK_CHANNEL_ID or _resolve_slack_channel_id(client, hint)
+    res["resolved_id"] = chan_id
+    if not chan_id:
+        res["channel_error"] = "could not resolve channel (name or ID)."
+        return res
+    try:
+        info = client.conversations_info(channel=chan_id)
+        ch = info.get("channel", {}) or {}
+        res["channel"] = {
+            "name": ch.get("name"),
+            "is_private": ch.get("is_private"),
+            "is_member": ch.get("is_member"),
+            "id": ch.get("id"),
+        }
+    except SlackApiError as e:
+        res["conversations_info_error"] = getattr(e, "response", {}).data if hasattr(e,"response") else str(e)
+    return res
+
 @app.get("/learning", dependencies=[Depends(require_admin)])
 def list_learning(limit: int = 100) -> List[Dict]:
-    conn = sqlite3.connect(LEARNING_DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = sqlite3.connect(LEARNING_DB_PATH); conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS learning_examples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            intent TEXT,
-            question TEXT,
-            answer TEXT,
-            coach_prompt TEXT,
-            created_at TEXT
+            intent TEXT, question TEXT, answer TEXT, coach_prompt TEXT, created_at TEXT
         )
     """)
     rows = conn.execute(
         "SELECT id, intent, question, answer, coach_prompt, created_at "
-        "FROM learning_examples ORDER BY id DESC LIMIT ?",
-        (limit,),
+        "FROM learning_examples ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/feedback", dependencies=[Depends(require_admin)])
 def list_feedback(limit: int = 100) -> List[Dict]:
-    conn = sqlite3.connect(LEARNING_DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = sqlite3.connect(LEARNING_DB_PATH); conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ai_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT,
-            question TEXT,
-            ai_answer TEXT,
-            rating TEXT,
-            reason TEXT,
-            user TEXT,
+            conversation_id TEXT, question TEXT, ai_answer TEXT,
+            rating TEXT, reason TEXT, user TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
     rows = conn.execute(
         "SELECT id, conversation_id, question, ai_answer, rating, reason, user, created_at "
-        "FROM ai_feedback ORDER BY id DESC LIMIT ?",
-        (limit,),
+        "FROM ai_feedback ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/feedback/summary", dependencies=[Depends(require_admin)])
 def feedback_summary():
-    conn = sqlite3.connect(LEARNING_DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = sqlite3.connect(LEARNING_DB_PATH); conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ai_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT,
-            question TEXT,
-            ai_answer TEXT,
-            rating TEXT,
-            reason TEXT,
-            user TEXT,
+            conversation_id TEXT, question TEXT, ai_answer TEXT,
+            rating TEXT, reason TEXT, user TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
     rows = conn.execute("""
-        SELECT rating, COUNT(*) AS n
-        FROM ai_feedback
-        GROUP BY rating
-        ORDER BY n DESC
+        SELECT rating, COUNT(*) AS n FROM ai_feedback GROUP BY rating ORDER BY n DESC
     """).fetchall()
     top_reasons = conn.execute("""
         SELECT reason, COUNT(*) AS n
         FROM ai_feedback
         WHERE rating = 'down' AND reason IS NOT NULL AND reason <> ''
-        GROUP BY reason
-        ORDER BY n DESC
-        LIMIT 10
+        GROUP BY reason ORDER BY n DESC LIMIT 10
     """).fetchall()
     conn.close()
     return {
@@ -454,28 +491,20 @@ def feedback_summary():
 @app.get("/feedback/export.csv", dependencies=[Depends(require_admin)])
 def feedback_export_csv():
     from fastapi.responses import PlainTextResponse
-    conn = sqlite3.connect(LEARNING_DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = sqlite3.connect(LEARNING_DB_PATH); conn.row_factory = sqlite3.Row
     rows = conn.execute("""
         SELECT id, conversation_id, question, ai_answer, rating, reason, user, created_at
         FROM ai_feedback ORDER BY id DESC
     """).fetchall()
     conn.close()
     header = "id,conversation_id,question,ai_answer,rating,reason,user,created_at"
-    def _csv_escape(s):
+    def _csv(s):
         if s is None: return ""
-        s = str(s).replace('"', '""')
-        return f'"{s}"'
+        s = str(s).replace('"','""'); return f'"{s}"'
     body = "\n".join(
         ",".join([
-            str(r["id"]),
-            _csv_escape(r["conversation_id"]),
-            _csv_escape(r["question"]),
-            _csv_escape(r["ai_answer"]),
-            _csv_escape(r["rating"]),
-            _csv_escape(r["reason"]),
-            _csv_escape(r["user"]),
-            _csv_escape(r["created_at"]),
+            str(r["id"]), _csv(r["conversation_id"]), _csv(r["question"]), _csv(r["ai_answer"]),
+            _csv(r["rating"]), _csv(r["reason"]), _csv(r["user"]), _csv(r["created_at"]),
         ]) for r in rows
     )
     return PlainTextResponse("\n".join([header, body]), media_type="text/csv")
@@ -516,6 +545,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         mark_processed(event_key)
         return {"status": "ignored"}
 
+    # Basic IDs
     conv_id = d.get("conversationId")
     reservation_id = d.get("reservationId")
     listing_id = d.get("listingMapId")
@@ -523,7 +553,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     communication_type = d.get("communicationType", "channel")
     channel_id = d.get("channelId")
 
-    # Inbound event log (non-fatal)
+    # Inbound analytics (non-fatal)
     try:
         log_message_event(
             direction="inbound",
@@ -538,6 +568,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     except Exception as e:
         logging.warning(f"message logging failed: {e}")
 
+    # Hostaway fetches
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res = reservation.get("result", {}) or {}
 
@@ -545,6 +576,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     guest_email = res.get("guestEmail") or None
 
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
+    if DEBUG_CONVERSATION:
+        try:
+            logging.info("[DEBUG] Full conversation object: %s", json.dumps(convo_obj, indent=2))
+        except Exception:
+            pass
     convo_res = convo_obj.get("result", {}) or {}
     if convo_res:
         logging.info("✅ Conversation %s fetched with messages.", convo_res.get("id"))
@@ -557,6 +593,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     if not guest_email:
         guest_email = convo_res.get("guestEmail") or convo_res.get("recipientEmail")
 
+    # Returning/New guest tag
     returning_tag = ""
     if guest_email:
         try:
@@ -569,6 +606,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         elif SHOW_NEW_GUEST_TAG and seen_count == 1:
             returning_tag = " • New guest!"
 
+    # Reservation details
     check_in = res.get("arrivalDate", "N/A")
     check_out = res.get("departureDate", "N/A")
     guest_count = res.get("numberOfGuests", "N/A")
@@ -580,6 +618,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     msg_status = pretty_status(d.get("status") or "sent")
     channel_pretty = channel_label_from(channel_id, communication_type)
 
+    # Listing details
     listing_obj = fetch_hostaway_listing(listing_id)
     addr_raw = (listing_obj or {}).get("result", {}).get("address") or "Address unavailable"
     if isinstance(addr_raw, dict):
@@ -598,16 +637,17 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
 
+    # Config + policies/access
     listing_cfg = load_listing_config(listing_id)
     tz_name = (
         loc_res.get("timeZone") or loc_res.get("timezone")
         or (listing_cfg.get("property_profile") or {}).get("timezone")
         or None
     )
-
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
 
+    # Conversation history
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
@@ -617,13 +657,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         if m.get("body")
     ]
 
+    # Base meta
     property_profile = {"checkin_time": "4:00 PM", "checkout_time": "11:00 AM"}
     policies = {
         "pets_allowed": pet_policy.get("pets_allowed"),
         "pet_fee": pet_policy.get("pet_fee"),
         "pet_deposit_refundable": pet_policy.get("pet_deposit_refundable"),
     }
-
     meta_for_ai: Dict[str, Any] = {
         "listing_id": (str(listing_id) if listing_id is not None else ""),
         "listing_map_id": listing_id,
@@ -639,7 +679,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
-    # Optional: Local Places
+    # Optional local places
     local_recs_api: List[Dict[str, Any]] = []
     try:
         if lat is not None and lng is not None and should_fetch_local_recs(guest_msg):
@@ -649,17 +689,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         local_recs_api = []
     meta_for_ai["local_recs_api"] = local_recs_api
 
-    # ---- Compose AI once ----
+    # Compose AI once
     ai_json, _unused_blocks = ac_compose(
         guest_message=guest_msg,
         conversation_history=conversation_history,
         meta=meta_for_ai,
     )
     ai_reply_raw = ai_json.get("reply", "") or ""
-    if (ai_json.get("intent") or "").lower() == "food_recs":
-        ai_reply = ai_reply_raw
-    else:
-        ai_reply = clean_ai_reply(ai_reply_raw)
+    ai_reply = ai_reply_raw if (ai_json.get("intent") or "").lower() == "food_recs" else clean_ai_reply(ai_reply_raw)
     detected_intent = ai_json.get("intent", "other")
 
     # Persist AI suggestion (non-fatal)
@@ -680,6 +717,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     except Exception as e:
         logging.warning(f"ai exchange logging failed: {e}")
 
+    # Presentation
     us_check_in = format_us_date(check_in)
     us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
@@ -779,21 +817,24 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         {"type": "actions", "elements": actions_elements},
     ]
 
-    # --- Robust Slack send ---
+    # Slack post (robust, no 500 loops)
     slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     slack_channel_hint = os.getenv("SLACK_CHANNEL", "")
     sent = _post_to_slack(slack_client, slack_channel_hint, blocks, "New guest message")
     if not sent:
-        # Avoid 500/retries storm: mark as processed and return OK
         mark_processed(event_key)
         logging.error("Slack post failed; marked processed to avoid retries. Check SLACK_CHANNEL and bot membership.")
         return {"status": "ok"}
 
-    # Success
     mark_processed(event_key)
     return {"status": "ok"}
 
-# ---------- Health ----------
+# ---------- Startup & health ----------
+@app.on_event("startup")
+def _startup() -> None:
+    db_init()
+    _startup_slack_check()
+
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
