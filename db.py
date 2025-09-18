@@ -161,7 +161,7 @@ def get_similar_response(listing_id: Any, question: str, threshold: float = 0.6)
     conn = _connect(); c = conn.cursor()
     c.execute("SELECT question_text, response_text FROM custom_responses WHERE listing_id = ?", (str(listing_id) if listing_id is not None else "",))
     results = c.fetchall(); conn.close()
-    q_words = set((question or "").lower().split()); 
+    q_words = set((question or "").lower().split())
     if not q_words: return None
     for prev_q, prev_resp in results:
         p_words = set((prev_q or "").lower().split())
@@ -291,10 +291,16 @@ def record_event(source: str, event: str, **fields: Any) -> None:
         conn.close()
 
 def log_message_event(*args: Any, **fields: Any) -> None:
+    """
+    Flexible logger → analytics_events as event='message'.
+    Dedupes canonical keys so record_event won't receive duplicate kwargs.
+    """
     source = "app"
     conversation_id = ""
     role = fields.pop("role", "user")
     message = fields.pop("message", "")
+
+    # Legacy positional forms
     if len(args) == 4:
         source, conversation_id, role, message = args
     elif len(args) == 3:
@@ -303,7 +309,29 @@ def log_message_event(*args: Any, **fields: Any) -> None:
         conversation_id, message = args
     elif len(args) == 1:
         message = args[0]
-    record_event(source=source, event="message", conversation_id=str(conversation_id or ""), role=role, message=message, **fields)
+
+    # Pop canonical keys from **fields** to avoid "multiple values" error
+    canonical = {
+        "conversation_id", "reservation_id", "listing_id",
+        "guest_id", "user_id", "rating", "reason", "intent",
+    }
+    picked = {k: fields.pop(k, None) for k in canonical}
+
+    record_event(
+        source=source,
+        event="message",
+        conversation_id=str(picked.get("conversation_id") or conversation_id or ""),
+        reservation_id=picked.get("reservation_id"),
+        listing_id=picked.get("listing_id"),
+        guest_id=picked.get("guest_id"),
+        user_id=picked.get("user_id"),
+        rating=picked.get("rating"),
+        reason=picked.get("reason"),
+        intent=picked.get("intent"),
+        role=role,            # goes to metadata
+        message=message,      # goes to metadata
+        **fields,             # remaining extras → metadata
+    )
 
 def log_ai_exchange(conversation_id: Optional[str], guest_message: str, ai_suggestion: str, intent: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> None:
     """
