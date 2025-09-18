@@ -10,6 +10,10 @@ from datetime import date, datetime
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from pydantic import BaseModel
 
+# Slack SDK (needed for helpers below)
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
 # Local helpers
 from places import should_fetch_local_recs, build_local_recs
 from slack_interactivity import router as slack_router
@@ -51,7 +55,7 @@ REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
     "OPENAI_API_KEY",
-    "SLACK_CHANNEL",
+    "SLACK_CHANNEL",        # can be channel ID or #name
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
 ]
@@ -60,6 +64,97 @@ if _missing:
     raise RuntimeError(f"Missing required environment variables: {_missing}")
 
 MAX_THREAD_MESSAGES = 10
+
+# ---------- Slack helpers ----------
+def _resolve_slack_channel_id(client: WebClient, hint: str) -> Optional[str]:
+    """
+    Accepts a channel ID (C.../G...) or a #name/name. Returns a channel ID or None.
+    Why: avoid 'channel_not_found' when a name is provided.
+    """
+    if not hint:
+        return None
+    hint = hint.strip()
+    if hint.startswith("C") or hint.startswith("G"):  # already an ID
+        return hint
+    name = hint.lstrip("#")
+    cursor = None
+    try:
+        while True:
+            resp = client.conversations_list(
+                types="public_channel,private_channel",
+                exclude_archived=True,
+                limit=1000,
+                cursor=cursor,
+            )
+            for ch in resp.get("channels", []):
+                if ch.get("name") == name:
+                    return ch.get("id")
+            cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+    except SlackApiError as e:
+        logging.warning(f"conversations_list failed: {e}")
+    return None
+
+def _ensure_bot_in_channel(client: WebClient, channel_id: str) -> None:
+    """
+    Try to join public channels to avoid 'not_in_channel'. Private channels require an invite.
+    """
+    try:
+        client.conversations_join(channel=channel_id)
+    except SlackApiError as e:
+        # It's fine if already in channel or join not allowed (private).
+        pass
+
+def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, Any]], text: str) -> bool:
+    """
+    Robust post: resolve channel, join if needed, retry once on membership errors.
+    Returns True if sent, else False (without raising).
+    """
+    channel_id = _resolve_slack_channel_id(client, channel_hint)
+    if not channel_id:
+        logging.error("Slack channel resolution failed. Check SLACK_CHANNEL (ID like C… or #name).")
+        return False
+
+    try:
+        client.chat_postMessage(channel=channel_id, blocks=blocks, text=text)
+        return True
+    except SlackApiError as e:
+        err = getattr(e, "response", {}).data.get("error") if hasattr(e, "response") else None
+        if err in {"not_in_channel"}:
+            _ensure_bot_in_channel(client, channel_id)
+            try:
+                client.chat_postMessage(channel=channel_id, blocks=blocks, text=text)
+                return True
+            except SlackApiError as e2:
+                logging.error(f"Slack post retry failed: {getattr(e2, 'response', {}).data if hasattr(e2, 'response') else e2}")
+                return False
+        elif err in {"channel_not_found"}:
+            # Try resolving from name (if hint looked like an ID but in wrong workspace this still fails)
+            logging.error("Slack error channel_not_found. Verify channel and workspace matching your bot token.")
+            return False
+        elif err == "is_archived":
+            logging.error("Slack channel is archived.")
+            return False
+        elif err == "rate_limited":
+            retry_after = 1
+            try:
+                retry_after = int(e.response.headers.get("Retry-After", "1"))
+            except Exception:
+                pass
+            time.sleep(max(retry_after, 1))
+            try:
+                client.chat_postMessage(channel=channel_id, blocks=blocks, text=text)
+                return True
+            except SlackApiError as e3:
+                logging.error(f"Slack rate-limit retry failed: {getattr(e3, 'response', {}).data if hasattr(e3, 'response') else e3}")
+                return False
+        else:
+            logging.error(f"Slack send error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
+            return False
+    except Exception as e:
+        logging.error(f"Unexpected Slack error: {e}")
+        return False
 
 # ---------- Slack threading (optional legacy) ----------
 def _get_thread_ts(conv_id: Optional[int | str]) -> Optional[str]:
@@ -405,12 +500,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     d = payload.data or {}
     ev_core = (
-        d.get("id")
-        or d.get("hash")
-        or d.get("channelThreadMessageId")
-        or d.get("conversationId")
-        or d.get("reservationId")
-        or ""
+        d.get("id") or d.get("hash") or d.get("channelThreadMessageId")
+        or d.get("conversationId") or d.get("reservationId") or ""
     )
     event_key = f"{payload.object}:{payload.event}:{ev_core}"
     if already_processed(event_key):
@@ -548,7 +639,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
-    # Optional: Local Places (guarded)
+    # Optional: Local Places
     local_recs_api: List[Dict[str, Any]] = []
     try:
         if lat is not None and lng is not None and should_fetch_local_recs(guest_msg):
@@ -688,40 +779,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         {"type": "actions", "elements": actions_elements},
     ]
 
-    # Post to Slack
-    from slack_sdk import WebClient
-    from slack_sdk.errors import SlackApiError
-
+    # --- Robust Slack send ---
     slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
-    slack_channel = os.getenv("SLACK_CHANNEL")
-    if not slack_channel:
-        logging.error("SLACK_CHANNEL missing; skipping Slack post.")
+    slack_channel_hint = os.getenv("SLACK_CHANNEL", "")
+    sent = _post_to_slack(slack_client, slack_channel_hint, blocks, "New guest message")
+    if not sent:
+        # Avoid 500/retries storm: mark as processed and return OK
         mark_processed(event_key)
+        logging.error("Slack post failed; marked processed to avoid retries. Check SLACK_CHANNEL and bot membership.")
         return {"status": "ok"}
-    try:
-        slack_client.chat_postMessage(
-            channel=slack_channel,
-            blocks=blocks,
-            text="New guest message",
-        )
-        mark_processed(event_key)
-    except SlackApiError as e:
-        try:
-            status = getattr(e, "response", {}).status_code if hasattr(e, "response") else None
-        except Exception:
-            status = None
-        if status == 429 and hasattr(e, "response"):
-            retry_after = int(e.response.headers.get("Retry-After", "1"))
-            time.sleep(max(retry_after, 1))
-            slack_client.chat_postMessage(channel=slack_channel, blocks=blocks, text="New guest message")
-            mark_processed(event_key)
-            return {"status": "ok"}
-        logging.error(f"❌ Slack send error: {e.response.data if hasattr(e, 'response') else e}")
-        raise
-    except Exception as e:
-        logging.error(f"❌ Slack send error: {e}")
-        raise
 
+    # Success
+    mark_processed(event_key)
     return {"status": "ok"}
 
 # ---------- Health ----------
