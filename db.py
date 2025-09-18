@@ -2,6 +2,7 @@
 import os
 import sqlite3
 import logging
+import json
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -299,6 +300,91 @@ def mark_processed(event_id: Optional[str]) -> None:
         c.execute(
             "INSERT OR IGNORE INTO processed_events (event_id, created_at) VALUES (?, ?)",
             (event_id, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def _ensure_events_table(conn: sqlite3.Connection) -> None:
+    """
+    Create analytics_events and idempotently ensure expected columns exist.
+    Why: slack_interactivity calls record_event() for analytics.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS analytics_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            event TEXT,
+            conversation_id TEXT,
+            reservation_id TEXT,
+            listing_id TEXT,
+            guest_id TEXT,
+            user_id TEXT,
+            rating TEXT,
+            reason TEXT,
+            intent TEXT,
+            metadata TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Keep schema forward-compatible on old DBs
+    _ensure_columns(conn, "analytics_events", {
+        "source": "TEXT",
+        "event": "TEXT",
+        "conversation_id": "TEXT",
+        "reservation_id": "TEXT",
+        "listing_id": "TEXT",
+        "guest_id": "TEXT",
+        "user_id": "TEXT",
+        "rating": "TEXT",
+        "reason": "TEXT",
+        "intent": "TEXT",
+        "metadata": "TEXT",
+        "created_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
+    })
+    conn.commit()
+
+def record_event(source: str, event: str, **fields: Any) -> None:
+    """
+    Write a lightweight analytics event.
+
+    Dedicated columns (stringified if None):
+      conversation_id, reservation_id, listing_id, guest_id, user_id, rating, reason, intent
+
+    Any extra keys are packed into JSON `metadata` to avoid schema churn.
+    """
+    allowed = {
+        "conversation_id", "reservation_id", "listing_id",
+        "guest_id", "user_id", "rating", "reason", "intent",
+    }
+    row = {k: (fields.get(k) or "") for k in allowed}
+    extra = {k: v for k, v in fields.items() if k not in allowed}
+
+    try:
+        metadata = json.dumps(extra, ensure_ascii=False) if extra else None
+    except Exception:
+        # last-resort: stringify un-serializable values
+        metadata = json.dumps({k: str(v) for k, v in extra.items()}, ensure_ascii=False) if extra else None
+
+    conn = _connect()
+    try:
+        _ensure_events_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO analytics_events (
+                source, event,
+                conversation_id, reservation_id, listing_id, guest_id, user_id,
+                rating, reason, intent, metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source, event,
+                row["conversation_id"], row["reservation_id"], row["listing_id"], row["guest_id"], row["user_id"],
+                row["rating"], row["reason"], row["intent"], metadata,
+                datetime.utcnow().isoformat(),
+            ),
         )
         conn.commit()
     finally:
