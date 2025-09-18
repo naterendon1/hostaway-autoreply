@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-# Local modules from your repo
+# Local modules
 from places import should_fetch_local_recs, build_local_recs
 from slack_interactivity import router as slack_router
 from assistant_core import compose_reply as ac_compose
@@ -25,7 +25,7 @@ from utils import (
     clean_ai_reply,
 )
 
-# DB API (paired with your updated db.py)
+# DB API
 from db import init_db as db_init
 from db import (
     get_slack_thread as db_get_slack_thread,
@@ -48,6 +48,7 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")
 SHOW_NEW_GUEST_TAG = os.getenv("SHOW_NEW_GUEST_TAG", "0") in ("1", "true", "True", "yes", "YES")
 DEBUG_CONVERSATION = os.getenv("DEBUG_CONVERSATION", "0") in ("1", "true", "True", "yes", "YES")
+SLACK_SKIP_READS = os.getenv("SLACK_SKIP_READS", "1") in ("1", "true", "True", "yes", "YES")  # why: avoid missing_scope
 
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
@@ -64,16 +65,16 @@ if _missing:
 MAX_THREAD_MESSAGES = 10
 
 # ---------- Slack helpers ----------
-_SLACK_CHANNEL_ID: Optional[str] = None  # cached resolved ID
+_SLACK_CHANNEL_ID: Optional[str] = None  # cached ID
+
+def _hint_is_id(hint: str) -> bool:
+    return bool(hint) and hint[0] in ("C", "G") and len(hint) > 8
 
 def _resolve_slack_channel_id(client: WebClient, hint: str) -> Optional[str]:
-    """
-    Accepts channel ID (C…/G…) or '#name'/name. Returns channel ID or None.
-    """
+    """Name → ID (requires conversations:read)."""
     if not hint:
         return None
-    hint = hint.strip()
-    if hint.startswith(("C", "G")) and len(hint) > 8:
+    if _hint_is_id(hint):
         return hint
     name = hint.lstrip("#")
     cursor = None
@@ -96,23 +97,26 @@ def _resolve_slack_channel_id(client: WebClient, hint: str) -> Optional[str]:
     return None
 
 def _ensure_bot_in_channel(client: WebClient, channel_id: str) -> None:
-    """
-    Join public channels if not a member. Private channels require manual invite.
-    """
+    """Public channels only. Private requires manual invite."""
     try:
         client.conversations_join(channel=channel_id)
     except SlackApiError:
-        pass  # ignore if already in or join not allowed
+        pass
 
 def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, Any]], text: str) -> bool:
-    """
-    Robust post: resolve channel, handle not_in_channel, simple rate-limit retry.
-    Returns True on success, False otherwise (no exception).
-    """
-    chan_id = _SLACK_CHANNEL_ID or _resolve_slack_channel_id(client, channel_hint)
+    """Post without read scopes if channel ID is provided."""
+    chan_id = _SLACK_CHANNEL_ID
     if not chan_id:
-        logging.error("Slack channel resolution failed. Set SLACK_CHANNEL to '#host-messages' or a channel ID.")
-        return False
+        if _hint_is_id(channel_hint):
+            chan_id = channel_hint
+        elif SLACK_SKIP_READS:
+            logging.error("SLACK_SKIP_READS=1 and SLACK_CHANNEL is a name. Set SLACK_CHANNEL to the channel ID.")
+            return False
+        else:
+            chan_id = _resolve_slack_channel_id(client, channel_hint)
+            if not chan_id:
+                logging.error("Failed to resolve SLACK_CHANNEL. Use an ID or add conversations:read and reinstall the app.")
+                return False
 
     try:
         client.chat_postMessage(channel=chan_id, blocks=blocks, text=text)
@@ -125,10 +129,10 @@ def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, 
                 client.chat_postMessage(channel=chan_id, blocks=blocks, text=text)
                 return True
             except SlackApiError as e2:
-                logging.error(f"Slack post retry failed: {getattr(e2, 'response', {}).data if hasattr(e2, 'response') else e2}")
+                logging.error(f"Slack retry failed: {getattr(e2, 'response', {}).data if hasattr(e2,'response') else e2}")
                 return False
         if err == "channel_not_found":
-            logging.error("Slack error channel_not_found. Verify channel name/ID and workspace for your bot token.")
+            logging.error("Slack error channel_not_found. Verify channel ID/name and workspace.")
             return False
         if err == "is_archived":
             logging.error("Slack channel is archived.")
@@ -144,7 +148,7 @@ def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, 
                 client.chat_postMessage(channel=chan_id, blocks=blocks, text=text)
                 return True
             except SlackApiError as e3:
-                logging.error(f"Slack rate-limit retry failed: {getattr(e3, 'response', {}).data if hasattr(e3, 'response') else e3}")
+                logging.error(f"Slack rate-limit retry failed: {getattr(e3, 'response', {}).data if hasattr(e3,'response') else e3}")
                 return False
         logging.error(f"Slack send error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
         return False
@@ -153,14 +157,25 @@ def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, 
         return False
 
 def _startup_slack_check() -> None:
-    """
-    Resolve '#host-messages' → channel ID, check membership, cache ID.
-    """
-    token = os.getenv("SLACK_BOT_TOKEN")
+    """Avoid Slack read APIs unless necessary or allowed."""
+    token = os.getenv("SLACK_BOT_TOKEN", "")
     hint = os.getenv("SLACK_CHANNEL", "")
     if not token or not hint:
         logging.warning("Slack not fully configured (SLACK_BOT_TOKEN / SLACK_CHANNEL).")
         return
+
+    global _SLACK_CHANNEL_ID
+    if _hint_is_id(hint):
+        _SLACK_CHANNEL_ID = hint
+        logging.info(f"Using SLACK_CHANNEL as ID: {_SLACK_CHANNEL_ID}")
+        return  # no reads → no missing_scope
+
+    # If we only have a name and reads are disabled, don't call Slack.
+    if SLACK_SKIP_READS:
+        logging.error("SLACK_CHANNEL is a name but SLACK_SKIP_READS=1. Set SLACK_CHANNEL to the channel ID to skip read scopes.")
+        return
+
+    # Reads allowed: resolve name → ID and attempt membership/info.
     client = WebClient(token=token)
     try:
         who = client.auth_test()
@@ -169,10 +184,9 @@ def _startup_slack_check() -> None:
         logging.error(f"Slack auth_test failed: {getattr(e, 'response', {}).data if hasattr(e,'response') else e}")
         return
 
-    global _SLACK_CHANNEL_ID
     _SLACK_CHANNEL_ID = _resolve_slack_channel_id(client, hint)
     if not _SLACK_CHANNEL_ID:
-        logging.error("Could not resolve SLACK_CHANNEL. Use '#host-messages' or channel ID; invite the bot if private.")
+        logging.error("Could not resolve SLACK_CHANNEL. Use a channel ID or add conversations:read and reinstall the app.")
         return
 
     try:
@@ -201,7 +215,7 @@ def _set_thread_ts(conv_id: Optional[int | str], ts: str) -> None:
     channel = os.getenv("SLACK_CHANNEL") or ""
     db_upsert_slack_thread(str(conv_id), channel, ts)
 
-# ---------- Assorted helpers ----------
+# ---------- Helpers ----------
 CHANNEL_ID_MAP = {
     2018: "Airbnb (Official)", 2002: "HomeAway", 2005: "Booking.com", 2007: "Expedia",
     2009: "HomeAway (iCal)", 2010: "Vrbo", 2000: "Direct", 2013: "Booking Engine",
@@ -284,45 +298,33 @@ def trip_phase(check_in: str | None, check_out: str | None) -> str:
     return "unknown"
 
 def extract_access_details(listing_obj: Optional[Dict], reservation_obj: Optional[Dict]) -> Dict[str, Optional[str]]:
-    """
-    Pull door/access info from common fields on reservation/listing.
-    """
     def _get(d: Dict[str, Any], *keys: str) -> Optional[str]:
         for k in keys:
             v = d.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
         return None
-
     listing = (listing_obj or {}).get("result") or {}
     reservation = (reservation_obj or {}).get("result") or {}
-
-    code = (
-        _get(reservation, "doorCode", "door_code", "accessCode", "checkInCode", "entryCode")
+    code = _get(reservation, "doorCode", "door_code", "accessCode", "checkInCode", "entryCode") \
         or _get(listing, "doorCode", "door_code", "accessCode", "checkInCode", "entryCode")
-    )
-    arrival_instructions = (
-        _get(reservation, "arrivalInstructions", "checkInInstructions", "houseManual", "welcomeMessage")
+    arrival = _get(reservation, "arrivalInstructions", "checkInInstructions", "houseManual", "welcomeMessage") \
         or _get(listing, "arrivalInstructions", "checkInInstructions", "houseManual", "welcomeMessage")
-    )
-    return {"door_code": code, "arrival_instructions": arrival_instructions}
+    return {"door_code": code, "arrival_instructions": arrival}
 
 def extract_pet_policy(listing_obj: Optional[Dict]) -> Dict[str, Optional[bool]]:
     listing = (listing_obj or {}).get("result") or {}
     pets_allowed = listing.get("petsAllowed") if "petsAllowed" in listing else None
-
     rules_blob = ""
     for k in ("rules", "houseRules", "description", "summary"):
         v = listing.get(k)
         if isinstance(v, str):
             rules_blob += " " + v.lower()
-
     if pets_allowed is None and rules_blob:
         if "no pets" in rules_blob or "pets not allowed" in rules_blob:
             pets_allowed = False
         elif "pets allowed" in rules_blob or "pet friendly" in rules_blob:
             pets_allowed = True
-
     return {"pets_allowed": pets_allowed, "pet_fee": None, "pet_deposit_refundable": None}
 
 def _safe_read_json(path: str) -> Dict:
@@ -336,94 +338,80 @@ def _safe_read_json(path: str) -> Dict:
         return {}
 
 def load_listing_config(listing_id: Optional[int | str]) -> Dict:
-    """
-    Load config/listings/{listing_id}.json, fallback to config/listings/default.json.
-    """
     if not listing_id:
         return _safe_read_json("config/listings/default.json")
     by_id = _safe_read_json(f"config/listings/{listing_id}.json")
-    if by_id:
-        return by_id
-    return _safe_read_json("config/listings/default.json")
+    return by_id or _safe_read_json("config/listings/default.json")
 
 def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
     out = dict(meta)
-
-    # Property profile (check-in/out times, etc.)
     prof = dict(out.get("property_profile") or {})
     if isinstance(cfg.get("property_profile"), dict):
         prof.update({k: v for k, v in cfg["property_profile"].items() if v is not None})
     out["property_profile"] = prof
-
-    # Policies
     pol = dict(out.get("policies") or {})
     if isinstance(cfg.get("policies"), dict):
         pol.update({k: v for k, v in cfg["policies"].items() if v is not None})
     if "pets_allowed" in cfg:
         pol["pets_allowed"] = cfg.get("pets_allowed")
     out["policies"] = pol
-
-    # Access / arrival details
     acc = dict(out.get("access") or {})
     if isinstance(cfg.get("access_and_arrival"), dict):
         for k, v in cfg["access_and_arrival"].items():
             if v is not None:
                 acc[k] = v
     out["access"] = acc
-
-    # House rules & extras
-    if isinstance(cfg.get("house_rules"), dict):
-        out["house_rules"] = cfg["house_rules"]
-    if isinstance(cfg.get("amenities_and_quirks"), dict):
-        out["amenities_and_quirks"] = cfg["amenities_and_quirks"]
-    if isinstance(cfg.get("safety_and_emergencies"), dict):
-        out["safety_and_emergencies"] = cfg["safety_and_emergencies"]
-    if isinstance(cfg.get("core_identity"), dict):
-        out["core_identity"] = cfg["core_identity"]
-    if isinstance(cfg.get("upsells"), dict):
-        out["upsells"] = cfg["upsells"]
-
+    if isinstance(cfg.get("house_rules"), dict): out["house_rules"] = cfg["house_rules"]
+    if isinstance(cfg.get("amenities_and_quirks"), dict): out["amenities_and_quirks"] = cfg["amenities_and_quirks"]
+    if isinstance(cfg.get("safety_and_emergencies"), dict): out["safety_and_emergencies"] = cfg["safety_and_emergencies"]
+    if isinstance(cfg.get("core_identity"), dict): out["core_identity"] = cfg["core_identity"]
+    if isinstance(cfg.get("upsells"), dict): out["upsells"] = cfg["upsells"]
     return out
 
 # ---------- Admin ----------
-def require_admin(
-    x_admin_token: str | None = Header(None, alias="X-Admin-Token"),
-    token: str | None = Query(None),
-):
+def require_admin(x_admin_token: str | None = Header(None, alias="X-Admin-Token"), token: str | None = Query(None)):
     supplied = x_admin_token or token
     if supplied != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 @app.get("/admin/slack-diagnose", dependencies=[Depends(require_admin)])
 def slack_diagnose():
-    token = os.getenv("SLACK_BOT_TOKEN")
+    """Safe diagnose: avoids read calls if SLACK_SKIP_READS=1 and a channel ID is provided."""
+    token = os.getenv("SLACK_BOT_TOKEN", "")
     hint = os.getenv("SLACK_CHANNEL", "")
-    res: Dict[str, Any] = {"hint": hint, "resolved_id": _SLACK_CHANNEL_ID}
+    res: Dict[str, Any] = {"hint": hint, "skip_reads": SLACK_SKIP_READS, "cached_id": _SLACK_CHANNEL_ID}
     if not token:
-        res["error"] = "missing SLACK_BOT_TOKEN"
+        res["error"] = "missing SLACK_BOT_TOKEN"; return res
+
+    # If we already have an ID and skip_reads, just return it.
+    if _SLACK_CHANNEL_ID and (SLACK_SKIP_READS or _hint_is_id(hint)):
+        res["resolved_id"] = _SLACK_CHANNEL_ID
+        res["note"] = "Using channel ID without Slack read scopes."
         return res
+
+    # Otherwise, try minimal checks (may require scopes).
     client = WebClient(token=token)
     try:
         who = client.auth_test()
-        res["team"] = who.get("team")
-        res["bot"] = who.get("bot_id") or who.get("user")
+        res["team"] = who.get("team"); res["bot"] = who.get("bot_id") or who.get("user")
     except SlackApiError as e:
         res["auth_error"] = getattr(e, "response", {}).data if hasattr(e, "response") else str(e)
         return res
-    chan_id = _SLACK_CHANNEL_ID or _resolve_slack_channel_id(client, hint)
+
+    chan_id = _SLACK_CHANNEL_ID or (_resolve_slack_channel_id(client, hint) if not _hint_is_id(hint) else hint)
     res["resolved_id"] = chan_id
     if not chan_id:
-        res["channel_error"] = "could not resolve channel (name or ID)."
+        res["channel_error"] = "could not resolve channel (provide channel ID or add conversations:read)."
         return res
+
+    if SLACK_SKIP_READS:
+        res["note"] = "Resolved, but skipping conversations.info due to SLACK_SKIP_READS=1."
+        return res
+
     try:
         info = client.conversations_info(channel=chan_id)
         ch = info.get("channel", {}) or {}
-        res["channel"] = {
-            "name": ch.get("name"),
-            "is_private": ch.get("is_private"),
-            "is_member": ch.get("is_member"),
-            "id": ch.get("id"),
-        }
+        res["channel"] = {"name": ch.get("name"), "is_private": ch.get("is_private"), "is_member": ch.get("is_member")}
     except SlackApiError as e:
         res["conversations_info_error"] = getattr(e, "response", {}).data if hasattr(e,"response") else str(e)
     return res
@@ -528,10 +516,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         return {"status": "ignored"}
 
     d = payload.data or {}
-    ev_core = (
-        d.get("id") or d.get("hash") or d.get("channelThreadMessageId")
+    ev_core = d.get("id") or d.get("hash") or d.get("channelThreadMessageId") \
         or d.get("conversationId") or d.get("reservationId") or ""
-    )
     event_key = f"{payload.object}:{payload.event}:{ev_core}"
     if already_processed(event_key):
         return {"status": "duplicate"}
@@ -542,10 +528,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             logging.info("📷 Skipping image-only message.")
         else:
             logging.info("🧾 Empty message skipped.")
-        mark_processed(event_key)
-        return {"status": "ignored"}
+        mark_processed(event_key); return {"status": "ignored"}
 
-    # Basic IDs
     conv_id = d.get("conversationId")
     reservation_id = d.get("reservationId")
     listing_id = d.get("listingMapId")
@@ -553,7 +537,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     communication_type = d.get("communicationType", "channel")
     channel_id = d.get("channelId")
 
-    # Inbound analytics (non-fatal)
     try:
         log_message_event(
             direction="inbound",
@@ -568,7 +551,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     except Exception as e:
         logging.warning(f"message logging failed: {e}")
 
-    # Hostaway fetches
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res = reservation.get("result", {}) or {}
 
@@ -577,36 +559,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     if DEBUG_CONVERSATION:
-        try:
-            logging.info("[DEBUG] Full conversation object: %s", json.dumps(convo_obj, indent=2))
-        except Exception:
-            pass
+        try: logging.info("[DEBUG] Full conversation object: %s", json.dumps(convo_obj, indent=2))
+        except Exception: pass
     convo_res = convo_obj.get("result", {}) or {}
-    if convo_res:
-        logging.info("✅ Conversation %s fetched with messages.", convo_res.get("id"))
-    guest_photo = (
-        convo_res.get("recipientPicture")
-        or convo_res.get("guestPicture")
-        or res.get("guestPicture")
-        or None
-    )
+    if convo_res: logging.info("✅ Conversation %s fetched with messages.", convo_res.get("id"))
+    guest_photo = convo_res.get("recipientPicture") or convo_res.get("guestPicture") or res.get("guestPicture") or None
     if not guest_email:
         guest_email = convo_res.get("guestEmail") or convo_res.get("recipientEmail")
 
-    # Returning/New guest tag
     returning_tag = ""
     if guest_email:
-        try:
-            seen_count = note_guest(guest_email.strip().lower())
-        except Exception as e:
-            logging.error(f"note_guest failed: {e}")
-            seen_count = 1
-        if seen_count > 1:
-            returning_tag = " • Returning guest!"
-        elif SHOW_NEW_GUEST_TAG and seen_count == 1:
-            returning_tag = " • New guest!"
+        try: seen_count = note_guest(guest_email.strip().lower())
+        except Exception as e: logging.error(f"note_guest failed: {e}"); seen_count = 1
+        if seen_count > 1: returning_tag = " • Returning guest!"
+        elif SHOW_NEW_GUEST_TAG and seen_count == 1: returning_tag = " • New guest!"
 
-    # Reservation details
     check_in = res.get("arrivalDate", "N/A")
     check_out = res.get("departureDate", "N/A")
     guest_count = res.get("numberOfGuests", "N/A")
@@ -618,17 +585,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     msg_status = pretty_status(d.get("status") or "sent")
     channel_pretty = channel_label_from(channel_id, communication_type)
 
-    # Listing details
     listing_obj = fetch_hostaway_listing(listing_id)
     addr_raw = (listing_obj or {}).get("result", {}).get("address") or "Address unavailable"
     if isinstance(addr_raw, dict):
         property_address = (
             ", ".join(
                 str(addr_raw.get(k, "")).strip()
-                for k in ["address", "city", "state", "zip", "country"]
-                if addr_raw.get(k)
-            )
-            or "Address unavailable"
+                for k in ["address","city","state","zip","country"] if addr_raw.get(k)
+            ) or "Address unavailable"
         )
     else:
         property_address = str(addr_raw)
@@ -637,33 +601,28 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     lat = loc_res.get("latitude") or loc_res.get("lat")
     lng = loc_res.get("longitude") or loc_res.get("lng")
 
-    # Config + policies/access
     listing_cfg = load_listing_config(listing_id)
-    tz_name = (
-        loc_res.get("timeZone") or loc_res.get("timezone")
-        or (listing_cfg.get("property_profile") or {}).get("timezone")
-        or None
-    )
+    tz_name = loc_res.get("timeZone") or loc_res.get("timezone") \
+        or (listing_cfg.get("property_profile") or {}).get("timezone") or None
+
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
 
-    # Conversation history
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
     conversation_history = [
-        {"role": "guest" if m.get("isIncoming") else "host", "text": m.get("body", "")}
-        for m in msgs[-MAX_THREAD_MESSAGES:]
-        if m.get("body")
+        {"role":"guest" if m.get("isIncoming") else "host", "text": m.get("body","")}
+        for m in msgs[-MAX_THREAD_MESSAGES:] if m.get("body")
     ]
 
-    # Base meta
-    property_profile = {"checkin_time": "4:00 PM", "checkout_time": "11:00 AM"}
+    property_profile = {"checkin_time":"4:00 PM","checkout_time":"11:00 AM"}
     policies = {
         "pets_allowed": pet_policy.get("pets_allowed"),
         "pet_fee": pet_policy.get("pet_fee"),
         "pet_deposit_refundable": pet_policy.get("pet_deposit_refundable"),
     }
+
     meta_for_ai: Dict[str, Any] = {
         "listing_id": (str(listing_id) if listing_id is not None else ""),
         "listing_map_id": listing_id,
@@ -679,7 +638,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
-    # Optional local places
     local_recs_api: List[Dict[str, Any]] = []
     try:
         if lat is not None and lng is not None and should_fetch_local_recs(guest_msg):
@@ -689,17 +647,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         local_recs_api = []
     meta_for_ai["local_recs_api"] = local_recs_api
 
-    # Compose AI once
-    ai_json, _unused_blocks = ac_compose(
-        guest_message=guest_msg,
-        conversation_history=conversation_history,
-        meta=meta_for_ai,
-    )
+    ai_json, _unused = ac_compose(guest_message=guest_msg, conversation_history=conversation_history, meta=meta_for_ai)
     ai_reply_raw = ai_json.get("reply", "") or ""
     ai_reply = ai_reply_raw if (ai_json.get("intent") or "").lower() == "food_recs" else clean_ai_reply(ai_reply_raw)
     detected_intent = ai_json.get("intent", "other")
 
-    # Persist AI suggestion (non-fatal)
     try:
         log_ai_exchange(
             conversation_id=str(conv_id) if conv_id else None,
@@ -707,38 +659,24 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             ai_suggestion=ai_reply,
             intent=detected_intent,
             meta={
-                "listing_id": listing_id,
-                "reservation_id": reservation_id,
-                "policies": meta_for_ai.get("policies"),
-                "access": meta_for_ai.get("access"),
+                "listing_id": listing_id, "reservation_id": reservation_id,
+                "policies": meta_for_ai.get("policies"), "access": meta_for_ai.get("access"),
                 "timezone": meta_for_ai.get("timezone"),
             },
         )
     except Exception as e:
         logging.warning(f"ai exchange logging failed: {e}")
 
-    # Presentation
-    us_check_in = format_us_date(check_in)
-    us_check_out = format_us_date(check_out)
+    us_check_in = format_us_date(check_in); us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
 
     button_meta = {
-        "conv_id": conv_id,
-        "listing_id": listing_id,
-        "guest_id": guest_id,
-        "type": communication_type,
-        "guest_name": guest_name,
-        "guest_message": guest_msg,
-        "ai_suggestion": ai_reply,
-        "check_in": check_in,
-        "check_out": check_out,
-        "guest_count": guest_count,
-        "status": res_status_pretty,
-        "detected_intent": detected_intent,
-        "channel_pretty": channel_pretty,
-        "property_address": property_address,
-        "price": total_price_str,
-        "guest_portal_url": guest_portal_url,
+        "conv_id": conv_id, "listing_id": listing_id, "guest_id": guest_id, "type": communication_type,
+        "guest_name": guest_name, "guest_message": guest_msg, "ai_suggestion": ai_reply,
+        "check_in": check_in, "check_out": check_out, "guest_count": guest_count,
+        "status": res_status_pretty, "detected_intent": detected_intent,
+        "channel_pretty": channel_pretty, "property_address": property_address,
+        "price": total_price_str, "guest_portal_url": guest_portal_url,
         "location": {"lat": lat, "lng": lng},
     }
     logging.info("button_meta: %s", json.dumps(button_meta, indent=2))
@@ -749,75 +687,36 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         f"Dates: *{us_check_in} → {us_check_out}*\n"
         f"Guests: *{guest_count}* | Res: *{res_status_pretty}* | Price: *{total_price_str}*"
     )
-    header_block: Dict[str, Any] = {
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": header_text},
-    }
+    header_block: Dict[str, Any] = {"type":"section","text":{"type":"mrkdwn","text": header_text}}
     if (guest_photo or ""):
-        header_block["accessory"] = {
-            "type": "image",
-            "image_url": guest_photo,
-            "alt_text": guest_name or "Guest photo",
-        }
+        header_block["accessory"] = {"type":"image","image_url": guest_photo,"alt_text": guest_name or "Guest photo"}
 
     actions_elements = [
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "✅ Send"},
-            "value": json.dumps({**button_meta, "action": "send"}),
-            "action_id": "send",
-        },
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "✏️ Edit"},
-            "value": json.dumps({**button_meta, "action": "edit"}),
-            "action_id": "edit",
-        },
+        {"type":"button","text":{"type":"plain_text","text":"✅ Send"},"value":json.dumps({**button_meta,"action":"send"}),"action_id":"send"},
+        {"type":"button","text":{"type":"plain_text","text":"✏️ Edit"},"value":json.dumps({**button_meta,"action":"edit"}),"action_id":"edit"},
     ]
     if guest_portal_url and show_portal_button:
         actions_elements.append(
-            {
-                "type": "button",
-                "style": "primary",
-                "text": {"type": "plain_text", "text": "🔗 Send guest portal"},
-                "value": json.dumps({**button_meta, "action": "send_guest_portal"}),
-                "action_id": "send_guest_portal",
-            }
+            {"type":"button","style":"primary","text":{"type":"plain_text","text":"🔗 Send guest portal"},
+             "value":json.dumps({**button_meta,"action":"send_guest_portal"}),"action_id":"send_guest_portal"}
         )
     rating_payload = {
-        "conv_id": conv_id,
-        "listing_id": listing_id,
-        "guest_message": guest_msg,
-        "ai_suggestion": ai_reply,
-        "detected_intent": detected_intent,
+        "conv_id": conv_id, "listing_id": listing_id, "guest_message": guest_msg,
+        "ai_suggestion": ai_reply, "detected_intent": detected_intent,
     }
     actions_elements.extend([
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "👍 Useful"},
-            "value": json.dumps(rating_payload),
-            "action_id": "rate_up",
-        },
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "👎 Needs work"},
-            "style": "danger",
-            "value": json.dumps(rating_payload),
-            "action_id": "rate_down",
-        },
+        {"type":"button","text":{"type":"plain_text","text":"👍 Useful"},"value":json.dumps(rating_payload),"action_id":"rate_up"},
+        {"type":"button","text":{"type":"plain_text","text":"👎 Needs work"},"style":"danger","value":json.dumps(rating_payload),"action_id":"rate_down"},
     ])
 
     blocks = [
         header_block,
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n>{ai_reply}"}},
-        {"type": "context", "elements": [
-            {"type": "mrkdwn", "text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"}
-        ]},
-        {"type": "actions", "elements": actions_elements},
+        {"type":"section","text":{"type":"mrkdwn","text": f"> {guest_msg}"}},
+        {"type":"section","text":{"type":"mrkdwn","text": f"*Suggested Reply:*\n>{ai_reply}"}},
+        {"type":"context","elements":[{"type":"mrkdwn","text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"}]},
+        {"type":"actions","elements": actions_elements},
     ]
 
-    # Slack post (robust, no 500 loops)
     slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
     slack_channel_hint = os.getenv("SLACK_CHANNEL", "")
     sent = _post_to_slack(slack_client, slack_channel_hint, blocks, "New guest message")
