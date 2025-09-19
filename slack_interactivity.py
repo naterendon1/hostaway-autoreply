@@ -14,6 +14,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from openai import OpenAI
 
+from db import record_event  # ← analytics
 from utils import (
     send_reply_to_hostaway,
     store_learning_example,  # legacy helper kept for backwards compatibility
@@ -21,9 +22,6 @@ from utils import (
     sanitize_ai_reply,
 )
 from places import should_fetch_local_recs, build_local_recs
-
-# --- NEW: analytics hook
-from db import record_event
 
 logging.basicConfig(level=logging.INFO)
 router = APIRouter()
@@ -373,14 +371,15 @@ def _background_improve_and_update(
     # Keep the previous draft so "Undo AI" works
     new_meta = {**meta, "previous_draft": edited_text, "improving": False, "coach_prompt": coach_prompt_text or ""}
 
+    # IMPORTANT: keep stable IDs so submission always reads "reply"
     blocks = get_modal_blocks(
         guest_name,
         guest_msg,
         action_id="edit",
         draft_text=improved,
         checkbox_checked=new_meta.get("checkbox_checked", False),
-        input_block_id="reply_input_ai",  # Force Slack to refill initial_value
-        input_action_id="reply_ai",
+        input_block_id="reply_input",   # stable
+        input_action_id="reply",        # stable
         coach_prompt_initial=coach_prompt_text or "",
     )
     blocks = add_undo_button(blocks, new_meta)
@@ -492,23 +491,21 @@ def _background_send_and_update(meta: dict, reply_text: str):
         logging.error(f"Hostaway send error: {e}")
         ok = False
 
-    # ---- NEW analytics hook (right after computing ok) ----
+    # --- Analytics: send / send.failed
     try:
         record_event(
-            "slack",
-            "send" if ok else "send.failed",
+            "slack", "send" if ok else "send.failed",
             conversation_id=str(meta.get("conv_id") or ""),
             reservation_id=str(meta.get("reservation_id") or ""),
             listing_id=str(meta.get("listing_id") or ""),
             guest_id=str(meta.get("guest_id") or ""),
-            user_id="",  # Slack user id not reliably available here
+            user_id="",  # Slack user id is only present in interaction payload; OK to omit here
             intent=meta.get("detected_intent"),
             text=reply_text,
-            payload={"saved_for_learning": bool(meta.get("saved_for_learning"))},
+            payload={"saved_for_learning": bool(meta.get("saved_for_learning"))}
         )
     except Exception as e:
         logging.error(f"analytics send: {e}")
-    # -------------------------------------------------------
 
     # Update Slack UI message
     channel = meta.get("channel") or os.getenv("SLACK_CHANNEL")
@@ -613,6 +610,20 @@ async def slack_actions(
             except Exception:
                 return {}
 
+        # --- NO-OP: disabled-looking button in "Working…" view ---
+        if action_id == "noop":
+            # Just acknowledge; optionally add an ephemeral nudge
+            try:
+                if slack_client and channel_id and user_id:
+                    slack_client.chat_postEphemeral(
+                        channel=channel_id,
+                        user=user_id,
+                        text="Still working on the improvement…"
+                    )
+            except Exception:
+                pass
+            return JSONResponse({"ok": True})
+
         # --- FEEDBACK: 👍 Useful ---
         if action_id == "rate_up":
             meta = get_meta_from_action(action)
@@ -628,22 +639,20 @@ async def slack_actions(
             except Exception as e:
                 logging.error(f"insert feedback up failed: {e}")
 
-            # ---- NEW analytics hook ----
+            # Analytics
             try:
                 record_event(
-                    "slack",
-                    "rate_up",
+                    "slack", "rate_up",
                     conversation_id=str(meta.get("conv_id") or ""),
                     listing_id=str(meta.get("listing_id") or ""),
                     guest_id=str((meta.get("guest_id") or "")),
                     user_id=user_id or "",
                     rating="up",
                     intent=meta.get("detected_intent"),
-                    text=meta.get("ai_suggestion") or "",
+                    text=meta.get("ai_suggestion") or ""
                 )
             except Exception as e:
                 logging.error(f"analytics rate_up: {e}")
-            # ----------------------------
 
             # Best-effort ephemeral ack
             try:
@@ -652,8 +661,6 @@ async def slack_actions(
             except Exception as e:
                 logging.debug(f"ephemeral ack failed: {e}")
             return JSONResponse({"ok": True})
-
-            # (no view to update)
 
         # --- FEEDBACK: 👎 Needs work (open reason modal) ---
         if action_id == "rate_down":
@@ -734,6 +741,16 @@ async def slack_actions(
                                 {
                                     "type": "section",
                                     "text": {"type": "mrkdwn", "text": ":hourglass: Sending your message..."},
+                                },
+                                {
+                                    "type": "actions",
+                                    "elements": [
+                                        {
+                                            "type": "button",
+                                            "action_id": "noop",
+                                            "text": {"type": "plain_text", "text": "Working…"},
+                                        }
+                                    ],
                                 }
                             ],
                             "close": {"type": "plain_text", "text": "Close", "emoji": True},
@@ -841,11 +858,13 @@ async def slack_actions(
                 logging.error("No view_id on improve_with_ai payload")
                 return JSONResponse({})
 
+            view_hash = view.get("hash")  # hash guard
+
             # Read current typed text from common text inputs (robust scan)
             edited_text = ""
             state_values = (view.get("state") or {}).get("values") or {}
-            # Specific IDs first
-            for key in ("reply_input_ai", "reply_input"):
+            # Specific IDs first (stable IDs)
+            for key in ("reply_input",):
                 block = state_values.get(key, {})
                 if block:
                     for v in block.values():
@@ -898,32 +917,44 @@ async def slack_actions(
                 "checkbox_checked": checkbox_checked,
                 "coach_prompt": coach_prompt_value,
             }
-            loading_blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Improving your reply…"}},
-            ] + get_modal_blocks(
-                guest_name,
-                guest_msg,
-                action_id="edit",
-                draft_text=edited_text or "",
-                checkbox_checked=checkbox_checked,
-                input_block_id="reply_input",
-                input_action_id="reply",
-                coach_prompt_initial=coach_prompt_value,
-            )
+            # "Disabled-looking" control: show a no-op button and omit submit
             loading_view = {
                 "type": "modal",
                 "title": {"type": "plain_text", "text": "Improving…", "emoji": True},
-                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                # Omit "submit" to prevent sending during improvement
+                "close": {"type": "plain_text", "text": "Close", "emoji": True},
                 "private_metadata": pack_private_meta(loading_meta),
-                "blocks": loading_blocks,
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: Working on your reply…"}},
+                    {
+                        "type": "input",
+                        "block_id": "reply_input",
+                        "label": {"type": "plain_text", "text": "Your reply (temporarily locked)"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "reply",
+                            "multiline": True,
+                            "initial_value": edited_text or "",
+                        },
+                    },
+                    {"type": "actions", "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "noop",
+                            "text": {"type": "plain_text", "text": "Working…"},
+                        }
+                    ]},
+                    {"type": "context", "elements": [
+                        {"type": "mrkdwn", "text": "We’ll restore *Send* as soon as the improved draft arrives."}
+                    ]},
+                ],
             }
 
-            # Schedule the real improvement in the background (we won't rely on hash here)
+            # Schedule the real improvement in the background (now with hash guard)
             background_tasks.add_task(
                 _background_improve_and_update,
                 view_id,
-                None,  # don't rely on hash; background will handle fallbacks
+                view_hash,
                 loading_meta,
                 edited_text or "",
                 coach_prompt_value,
@@ -1050,11 +1081,10 @@ async def slack_actions(
             except Exception as e:
                 logging.error(f"insert feedback down failed: {e}")
 
-            # ---- NEW analytics hook ----
+            # Analytics
             try:
                 record_event(
-                    "slack",
-                    "rate_down",
+                    "slack", "rate_down",
                     conversation_id=str(conv_id or ""),
                     listing_id="",
                     guest_id="",
@@ -1062,11 +1092,10 @@ async def slack_actions(
                     rating="down",
                     reason=reason.strip() or None,
                     intent=private_meta.get("detected_intent"),
-                    text=ai_suggestion or "",
+                    text=ai_suggestion or ""
                 )
             except Exception as e:
                 logging.error(f"analytics rate_down: {e}")
-            # ----------------------------
 
             if improved.strip():
                 try:
@@ -1083,12 +1112,9 @@ async def slack_actions(
         except Exception:
             meta = {}
 
-        # Prefer improved field if present
+        # Read only the stable "reply" field
         reply_text: Optional[str] = None
-        for block_id, block in state.items():
-            if "reply_ai" in block and isinstance(block["reply_ai"], dict) and block["reply_ai"].get("value"):
-                reply_text = block["reply_ai"]["value"]
-                break
+        for block in state.values():
             if "reply" in block and isinstance(block["reply"], dict) and block["reply"].get("value"):
                 reply_text = block["reply"]["value"]
                 break
