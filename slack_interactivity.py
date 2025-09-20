@@ -339,7 +339,6 @@ def _background_improve_and_update(
     if not openai_client:
         error_message = "OpenAI key not configured; showing your original text."
     else:
-        # Build a precise instruction that references both the guest message and the coach prompt.
         sys = (
             "You edit messages for a vacation-rental host. "
             "Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis. "
@@ -364,6 +363,7 @@ def _background_improve_and_update(
                 ],
             )
             improved = clean_ai_reply((response.choices[0].message.content or "").strip())
+            improved = sanitize_ai_reply(improved, guest_msg)
         except Exception as e:
             logging.error(f"OpenAI error in background 'improve_with_ai': {e}")
             error_message = f"Error improving with AI: {str(e)}"
@@ -587,7 +587,7 @@ async def slack_actions(
     raw_body_bytes = await request.body()
     raw_body = raw_body_bytes.decode("utf-8") if raw_body_bytes else ""
     if not verify_slack_signature(raw_body, x_slack_signature, x_slack_request_timestamp):
-        raise HTTPException(status_code=401, detail="Invalid Slack signature or timestamp.")
+        raise HTTPException(status_code=401, detail="Invalid Slack signature.")
 
     form = await request.form()
     payload_raw = form.get("payload")
@@ -653,8 +653,6 @@ async def slack_actions(
                 logging.debug(f"ephemeral ack failed: {e}")
             return JSONResponse({"ok": True})
 
-            # (no view to update)
-
         # --- FEEDBACK: 👎 Needs work (open reason modal) ---
         if action_id == "rate_down":
             meta = get_meta_from_action(action)
@@ -704,7 +702,7 @@ async def slack_actions(
                 logging.error(f"views_open failed: {e.response.data if hasattr(e, 'response') else e}")
             return JSONResponse({})
 
-        # --- SEND (always via modal confirm; no direct-send) ---
+        # --- SEND (immediate; no confirm modal) ---
         if action_id == "send":
             meta = get_meta_from_action(action)
 
@@ -735,7 +733,6 @@ async def slack_actions(
             _post_thread_note(channel_id, message_ts, "✅ Sending reply to guest…")
 
             return JSONResponse({"ok": True})
-
 
         # --- WRITE OWN ---
         if action_id == "write_own":
@@ -1089,7 +1086,7 @@ async def slack_actions(
 
         # STRICT: read reply ONLY from modal inputs (never from meta here)
         reply_text: Optional[str] = None
-        for block_id, block in state.items():
+        for block in state.values():
             if "reply_ai" in block and isinstance(block["reply_ai"], dict) and block["reply_ai"].get("value"):
                 reply_text = block["reply_ai"]["value"]
                 break
