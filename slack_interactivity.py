@@ -705,58 +705,37 @@ async def slack_actions(
             return JSONResponse({})
 
         # --- SEND (always via modal confirm; no direct-send) ---
-        if action_id == "send":
-            meta = get_meta_from_action(action)
+# --- SEND (make it immediate; no modal) ---
+    if action_id == "send":
+        meta = get_meta_from_action(action)
 
-            # ensure channel/ts for later update AND for fingerprint
-            if channel_id and not meta.get("channel"):
-                meta["channel"] = channel_id
-            if message_ts and not meta.get("ts"):
-                meta["ts"] = message_ts
+    # ensure channel/ts for later update + analytics/thread notes
+        if channel_id and not meta.get("channel"):
+            meta["channel"] = channel_id
+        if message_ts and not meta.get("ts"):
+            meta["ts"] = message_ts
 
-            # Try to enrich meta with local recs before send (harmless if unused)
-            inject_local_recs(meta)
+    # keep the label so the header shows the right tag after send
+        meta["sent_label"] = meta.get("sent_label", "message sent")
 
-            # Build the draft that will go into the modal (do not send yet)
-            draft = (meta.get("reply") or meta.get("ai_suggestion") or "").strip()
-            guest_name = meta.get("guest_name", "Guest")
-            guest_msg = meta.get("guest_message", "(Message unavailable)")
-            checkbox_checked = bool(meta.get("checkbox_checked", False))
-            coach_prompt_initial = meta.get("coach_prompt", "")
+    # enrich meta with local recs (harmless if unused) so learning/analytics get context
+        inject_local_recs(meta)
 
-            # Fingerprint to prevent cross-thread/stale sends
-            import uuid
-            meta["fingerprint"] = f"{meta.get('channel','')}|{meta.get('ts','')}|{meta.get('conv_id','')}|{uuid.uuid4()}"
+    # the suggested text to send (fallbacks in order)
+        reply_text = (meta.get("reply") or meta.get("ai_suggestion") or "").strip()
 
-            # keep label so header shows correct label after send
-            meta["sent_label"] = meta.get("sent_label", "message sent")
+        if not reply_text or not meta.get("conv_id"):
+        # best-effort hint in the thread if something is missing
+            _post_thread_note(channel_id, message_ts, "⚠️ Nothing to send (no draft or no conversation id).")
+            return JSONResponse({"ok": True})
+    # fire-and-forget: send to Hostaway and then update the Slack blocks in the background
+    background_tasks.add_task(_background_send_and_update, meta, reply_text)
 
-            confirm_modal = {
-                "type": "modal",
-                "title": {"type": "plain_text", "text": "Confirm & Send", "emoji": True},
-                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
-                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
-                "private_metadata": pack_private_meta(meta),
-                "blocks": get_modal_blocks(
-                    guest_name,
-                    guest_msg,
-                    action_id="edit",
-                    draft_text=draft,
-                    checkbox_checked=checkbox_checked,
-                    input_block_id="reply_input",
-                    input_action_id="reply",
-                    coach_prompt_initial=coach_prompt_initial,
-                ),
-            }
-            if slack_client:
-                try:
-                    if container.get("type") == "message":
-                        slack_client.views_open(trigger_id=trigger_id, view=confirm_modal)
-                    else:
-                        slack_client.views_push(trigger_id=trigger_id, view=confirm_modal)
-                except SlackApiError as e:
-                    logging.error(f"Slack modal error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
-            return JSONResponse({})
+    # optional tiny ack so teammates see an action immediately (before background finishes)
+    _post_thread_note(channel_id, message_ts, "✅ Sending reply to guest…")
+
+    return JSONResponse({"ok": True})
+
 
         # --- WRITE OWN ---
         if action_id == "write_own":
