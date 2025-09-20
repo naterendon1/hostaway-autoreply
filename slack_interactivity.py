@@ -705,36 +705,36 @@ async def slack_actions(
             return JSONResponse({})
 
         # --- SEND (always via modal confirm; no direct-send) ---
-# --- SEND (make it immediate; no modal) ---
-    if action_id == "send":
-        meta = get_meta_from_action(action)
+        if action_id == "send":
+            meta = get_meta_from_action(action)
 
-    # ensure channel/ts for later update + analytics/thread notes
-        if channel_id and not meta.get("channel"):
-            meta["channel"] = channel_id
-        if message_ts and not meta.get("ts"):
-            meta["ts"] = message_ts
+            # ensure channel/ts for later update + analytics/thread notes
+            if channel_id and not meta.get("channel"):
+                meta["channel"] = channel_id
+            if message_ts and not meta.get("ts"):
+                meta["ts"] = message_ts
 
-    # keep the label so the header shows the right tag after send
-        meta["sent_label"] = meta.get("sent_label", "message sent")
+            # keep the label so the header shows the right tag after send
+            meta["sent_label"] = meta.get("sent_label", "message sent")
 
-    # enrich meta with local recs (harmless if unused) so learning/analytics get context
-        inject_local_recs(meta)
+            # enrich meta with local recs (harmless if unused) so learning/analytics get context
+            inject_local_recs(meta)
 
-    # the suggested text to send (fallbacks in order)
-        reply_text = (meta.get("reply") or meta.get("ai_suggestion") or "").strip()
+            # the suggested text to send (fallbacks in order)
+            reply_text = (meta.get("reply") or meta.get("ai_suggestion") or "").strip()
 
-        if not reply_text or not meta.get("conv_id"):
-        # best-effort hint in the thread if something is missing
-            _post_thread_note(channel_id, message_ts, "⚠️ Nothing to send (no draft or no conversation id).")
+            if not reply_text or not meta.get("conv_id"):
+                # best-effort hint in the thread if something is missing
+                _post_thread_note(channel_id, message_ts, "⚠️ Nothing to send (no draft or no conversation id).")
+                return JSONResponse({"ok": True})
+
+            # fire-and-forget: send to Hostaway and then update the Slack blocks in the background
+            background_tasks.add_task(_background_send_and_update, meta, reply_text)
+
+            # optional tiny ack so teammates see an action immediately (before background finishes)
+            _post_thread_note(channel_id, message_ts, "✅ Sending reply to guest…")
+
             return JSONResponse({"ok": True})
-    # fire-and-forget: send to Hostaway and then update the Slack blocks in the background
-    background_tasks.add_task(_background_send_and_update, meta, reply_text)
-
-    # optional tiny ack so teammates see an action immediately (before background finishes)
-    _post_thread_note(channel_id, message_ts, "✅ Sending reply to guest…")
-
-    return JSONResponse({"ok": True})
 
 
         # --- WRITE OWN ---
