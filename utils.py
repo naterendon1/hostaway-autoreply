@@ -8,10 +8,66 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, date as _date
 from difflib import get_close_matches
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import requests
 from openai import OpenAI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+_router_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+PrimaryIntent = Literal[
+    "arrival_update", "trash_help", "accessibility", "food_recs",
+    "parking", "check_in_help", "check_out_help", "house_rules",
+    "booking_question", "other"
+]
+
+def route_message(msg: str) -> Dict[str, Any]:
+    """
+    Returns { "summary": str, "primary_intent": PrimaryIntent, "secondary": [..] }.
+    JSON-only. No chain-of-thought.
+    """
+    if not _router_client:
+        # simple fallback: keywordy but with strong negatives
+        text = msg.lower()
+        if any(k in text for k in ["restaurant", "eat", "dinner", "breakfast", "coffee", "food"]) \
+           and not any(k in text for k in ["trash", "garbage", "disabled", "elevator", "access", "portal"]):
+            intent = "food_recs"
+        elif any(k in text for k in ["trash", "garbage", "bins"]):
+            intent = "trash_help"
+        elif any(k in text for k in ["disabled", "wheelchair", "elevator", "accessible", "accessibility"]):
+            intent = "accessibility"
+        else:
+            intent = "other"
+        return {"summary": msg[:280], "primary_intent": intent, "secondary": []}
+
+    sys = (
+        "You are an intent router for short guest messages to a vacation rental host. "
+        "You MUST return concise JSON with fields: summary, primary_intent, secondary. "
+        "Primary intents: arrival_update, trash_help, accessibility, food_recs, parking, "
+        "check_in_help, check_out_help, house_rules, booking_question, other. "
+        "Rules: infer intent from the whole message, not keywords alone. "
+        "If a guest mentions trash or accessibility, those beat food_recs. "
+        "If multiple intents exist, choose the most urgent practical one as primary."
+    )
+    user = f"Guest message:\n{msg}\n\nReturn JSON only."
+
+    resp = _router_client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+        temperature=0
+    )
+    out = resp.choices[0].message.content or "{}"
+    try:
+        data = json.loads(out)
+    except Exception:
+        data = {"summary": msg[:280], "primary_intent": "other", "secondary": []}
+    return {
+        "summary": data.get("summary", msg[:280]),
+        "primary_intent": data.get("primary_intent", "other"),
+        "secondary": data.get("secondary", []),
+    }
 
 # --------------------------- Config / Env ---------------------------
 
