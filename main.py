@@ -21,6 +21,7 @@ from utils import (
     fetch_hostaway_reservation,
     fetch_hostaway_conversation,
     clean_ai_reply,
+    make_suggested_reply,
 )
 
 from db import init_db as db_init
@@ -544,19 +545,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
-    local_recs_api: List[Dict[str, Any]] = []
-    try:
-        if lat is not None and lng is not None and should_fetch_local_recs(guest_msg):
-            local_recs_api = build_local_recs(lat, lng, guest_msg)
-    except Exception as e:
-        logging.warning(f"Local recs fetch failed: {e}")
-        local_recs_api = []
-    meta_for_ai["local_recs_api"] = local_recs_api
-
-    ai_json, _unused = ac_compose(guest_message=guest_msg, conversation_history=conversation_history, meta=meta_for_ai)
-    ai_reply_raw = ai_json.get("reply", "") or ""
-    ai_reply = ai_reply_raw if (ai_json.get("intent") or "").lower() == "food_recs" else clean_ai_reply(ai_reply_raw)
-    detected_intent = ai_json.get("intent", "other")
+    context_for_reply = {"location": {"lat": lat, "lng": lng}}
+    ai_reply, detected_intent = make_suggested_reply(guest_msg, context_for_reply)
 
     try:
         log_ai_exchange(
