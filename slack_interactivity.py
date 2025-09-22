@@ -340,10 +340,14 @@ def _background_improve_and_update(
         error_message = "OpenAI key not configured; showing your original text."
     else:
         sys = (
-            "You edit messages for a vacation-rental host. "
-            "Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis. "
-            "Style: concise, casual, informal, easy to understand."
+          "You edit messages for a vacation-rental host. "
+          "Read the ENTIRE guest message. Do not introduce topics the guest didn’t ask about. "
+          "If the guest mentions trash, accessibility, parking, check-in/out, or codes, focus on that. "
+          "Only include dining or local recommendations if the guest explicitly asks for places to eat/drink. "
+          "Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis. "
+          "Style: concise, casual, easy to understand."
         )
+
         user = (
             "Guest message:\n"
             f"{guest_msg}\n\n"
