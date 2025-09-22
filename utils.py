@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime, timedelta, date as _date
 from difflib import get_close_matches
 from typing import Any, Dict, List, Optional, Tuple, Literal
+from places import should_fetch_local_recs, build_local_recs
 
 import requests
 from openai import OpenAI
@@ -68,6 +69,97 @@ def route_message(msg: str) -> Dict[str, Any]:
         "primary_intent": data.get("primary_intent", "other"),
         "secondary": data.get("secondary", []),
     }
+
+def make_suggested_reply(guest_message: str, context: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Returns (reply_text, detected_intent).
+    - Routes the message to get an intent
+    - Optionally fetches local POIs if intent == 'food_recs'
+    - Calls OpenAI with strict guardrails
+    - Cleans/sanitizes the reply so it doesn't apologize or go off-topic
+    """
+    # 1) Route
+    routing = route_message(guest_message)
+    intent: str = routing.get("primary_intent", "other")
+
+    # 2) Only allow POI injection for food_recs
+    local_recs: List[Dict[str, Any]] = []
+    try:
+        if intent == "food_recs" and should_fetch_local_recs(guest_message):
+            lat = (context.get("location") or {}).get("lat")
+            lng = (context.get("location") or {}).get("lng")
+            if lat is not None and lng is not None:
+                local_recs = build_local_recs(lat, lng, guest_message)[:4]
+    except Exception as e:
+        logging.warning(f"[make_suggested_reply] local recs failed: {e}")
+        local_recs = []
+
+    # 3) Draft with strict guardrails
+    sys = (
+        "You write short replies to guests for a vacation rental. "
+        "ALWAYS read the entire message; do not fixate on a single keyword. "
+        "If the message mentions trash or accessibility, address that first. "
+        "If two actionable items exist, address both briefly. "
+        "Do not pivot to unrelated topics. No greetings, no sign-offs, no emojis. "
+        "Be concrete and concise."
+    )
+    facts = {
+        "intent": intent,
+        "recs_count": len(local_recs),
+        "recs": local_recs,
+    }
+    user = (
+        f"GUEST_MESSAGE:\n{guest_message}\n\n"
+        f"FACTS_JSON:\n{json.dumps(facts, ensure_ascii=False)}\n\n"
+        "Write the reply text ONLY (no labels). Use bullets only if listing steps or multiple options."
+    )
+
+    reply_text = ""
+    if openai_client:
+        try:
+            resp = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+                temperature=0.2,
+            )
+            reply_text = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            logging.error(f"[make_suggested_reply] OpenAI error: {e}")
+
+    # Heuristic fallback if model failed/disabled
+    if not reply_text:
+        if intent == "trash_help":
+            reply_text = (
+                "Thanks for flagging that. Please use the bins by the driveway; if they’re full, tie bags and place them next to the cans. "
+                "Pickup is early morning—we’ll notify the service if overflow continues."
+            )
+        elif intent == "accessibility":
+            reply_text = (
+                "Thanks for checking. We don’t have a freight elevator. If you need step-free access, "
+                "I can share the most accessible route and nearby options."
+            )
+        elif intent == "food_recs" and local_recs:
+            lines = []
+            for r in local_recs[:3]:
+                name = r.get("name") or "Option"
+                rating = r.get("rating")
+                reviews = r.get("reviews")
+                approx = r.get("approx_time") or r.get("approx_distance")
+                bits = [name]
+                if rating: bits.append(f"{rating}★")
+                if reviews: bits.append(f"({reviews})")
+                if approx: bits.append(f"~{approx}")
+                lines.append("- " + " ".join(bits))
+            reply_text = "Nearby picks:\n" + "\n".join(lines) if lines else "A few nearby spots look good."
+        else:
+            reply_text = "Got it—happy to help. Can you share a bit more detail so I can point you the right way?"
+
+    # Final tidy & guardrails
+    reply_text = clean_ai_reply(reply_text)
+    reply_text = sanitize_ai_reply(reply_text, guest_message)
+
+    return reply_text, intent
+
 
 # --------------------------- Config / Env ---------------------------
 
