@@ -604,33 +604,66 @@ def _looks_informational(text: str) -> bool:
         return False
     return True
 
+# --- Off-topic dining heuristics (add near your other regex constants) ---
+DINING_WORDS = re.compile(r"\b(restaurant|restaurants|eat|dinner|lunch|breakfast|coffee|cafe|caf\u00e9|bar|brewery|bistro)\b", re.I)
+BLOCKING_TOPICS = re.compile(r"\b(trash|garbage|bin[s]?|dumpster|disabled|wheelchair|elevator|accessib|ramp|portal|code|lock|door\s*code|check[- ]?in|check[- ]?out|parking|park|driveway|garage)\b", re.I)
+# Bullet lines that look like local recs (begin with -/• and contain dining words)
+DINING_BULLET = re.compile(r"(?im)^\s*[-•]\s.*\b(restaurant|breakfast|coffee|cafe|bar|brewery|bistro|pizza|taco|sushi|steak|italian|thai|mexican)\b.*$")
+
 def sanitize_ai_reply(reply: str, guest_msg: str) -> str:
     """
-    Conservative scrub (does NOT inject or replace with canned text):
-    - Remove apologies/cleaner offers only when guest did NOT report an issue.
-    - Whitespace tidy.
+    Conservative scrub, layered:
+      1) If the guest asked about a *blocking* operational topic (trash, access, parking, etc.),
+         strip dining bullets and dining-y filler from the reply.
+      2) If the reply contains bulleted dining recs but the guest didn't mention dining at all,
+         strip just those dining bullets.
+      3) Remove unprompted apologies & cleaner offers when the guest didn't report an issue.
+      4) Whitespace tidy.
+    Never inject new content; only remove.
     """
     if not reply:
         return reply
 
-    out = reply
+    r = reply.strip()
+    g = (guest_msg or "").lower()
 
-    # 1) Block unprompted apologies
+    # --- 1) Block dining when the guest asked an operational question ---
+    if BLOCKING_TOPICS.search(g):
+        # remove dining-looking bullet lines
+        r = re.sub(DINING_BULLET, "", r).strip()
+        # remove short “nearby picks” one-liners
+        r = re.sub(r"(?is)\b(nearby|local)\s+(picks|spots|places)\b.*?$", "", r).strip()
+
+    # --- 2) If reply has dining bullets but guest didn't ask about dining, drop them ---
+    if DINING_BULLET.search(r) and not DINING_WORDS.search(g):
+        r = re.sub(DINING_BULLET, "", r).strip()
+
+    # ---------- Keep your prior “unprompted apology / cleaner offer” guardrails ----------
+    ISSUE_TRIGGERS = [
+        "dirty","unclean","mess","messy","bugs","roaches","ants","mold","leak","broken","smell","stain",
+        "hair","not clean","cleaning issue","trash","disgust","filthy","soiled","problem","issue","complain"
+    ]
+    def _looks_like_issue(text: str) -> bool:
+        t = (text or "").lower()
+        return any(k in t for k in ISSUE_TRIGGERS)
+
+    # Block unprompted apologies
     if not _looks_like_issue(guest_msg):
-        out = re.sub(r"(?is)\b(i\s*am|i'?m)\s*sorry\b.*?(?:[\.\!\n]|$)", "", out).strip()
+        r = re.sub(r"(?is)\b(i\s*am|i'?m|we\s*are|we'?re)\s*sorry\b.*?(?:[.!?\n]|$)", "", r).strip()
 
-    # 2) Block unprompted cleaner offers
+    # Block unprompted cleaner offers
     if not _looks_like_issue(guest_msg):
         kept = []
-        for line in out.splitlines():
+        for line in r.splitlines():
             if re.search(r"(?i)(send|schedule|have)\s+(?:the\s+)?(cleaner|housekeep|maid|cleaning)\b", line):
                 continue
             kept.append(line)
-        out = "\n".join(kept).strip()
+        r = "\n".join(kept).strip()
 
-    # 3) Gentle whitespace tidy
-    out = re.sub(r"\n{3,}", "\n\n", out).strip()
-    return out
+    # --- 4) Gentle whitespace tidy ---
+    r = re.sub(r"\n{3,}", "\n\n", r).strip()
+    return r
+
 
 
 # --------------------------- Learning DB ---------------------------
