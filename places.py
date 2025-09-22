@@ -3,6 +3,20 @@ import os
 import logging
 from typing import List, Dict, Any, Optional
 import requests
+import re
+
+FOOD_POS = re.compile(r"\b(restaurant|eat|dinner|lunch|breakfast|coffee|cafe|brunch|bar|brewery|pizza|sushi)\b", re.I)
+FOOD_NEG_HARD = re.compile(r"\b(trash|garbage|bin[s]?|disabled|wheelchair|elevator|accessib|ramp|portal|code|lock|check[- ]?in|check[- ]?out|parking)\b", re.I)
+
+def should_fetch_local_recs(msg: str) -> bool:
+    text = (msg or "").strip()
+    if not text:
+        return False
+    if FOOD_NEG_HARD.search(text):
+        return False  # other intents beat food
+    # require an explicit positive
+    return bool(FOOD_POS.search(text))
+
 
 PLACES_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 DM_KEY = os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY") or PLACES_KEY
