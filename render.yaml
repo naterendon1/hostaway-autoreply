@@ -30,6 +30,11 @@ services:
         value: C12345678
       - key: OPENAI_MODEL
         value: gpt-4o-mini
+      # --- rollout flags ---
+      - key: SMART_AUTOREPLY
+        value: "1"         # enable smart layer
+      - key: SHADOW_MODE
+        value: "1"         # compute smart reply but DO NOT send it
       - key: HOSTAWAY_API_BASE
         value: https://api.hostaway.com/v1
       - key: LEARNING_DB_PATH
