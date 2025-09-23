@@ -3,14 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import os, json, re
 
-"""
-AmenitiesIndex: builds a comprehensive, queryable facts index from Hostaway listing.result.
-- Captures ALL scalar fields from listing.result into meta.
-- Normalizes listingAmenities by (id|name) with optional external mapping via AMENITY_ID_MAP_PATH.
-- Captures bed types, images, and customFieldValues.
-- Provides search over keys/values/synonyms with a lightweight scorer.
-"""
-
 def _load_id_map(path_env: str) -> Dict[int, str]:
     p = os.getenv(path_env, "").strip()
     if not p:
@@ -26,7 +18,6 @@ def _load_id_map(path_env: str) -> Dict[int, str]:
                 except Exception:
                     continue
         elif isinstance(data, list):
-            # allow [{"id":2,"name":"Wi-Fi"}, ...]
             for item in data:
                 try:
                     out[int(item.get("id"))] = str(item.get("name"))
@@ -91,12 +82,12 @@ class AmenitiesIndex:
     def __init__(self, listing_result: Dict[str, Any]):
         self.raw: Dict[str, Any] = listing_result or {}
         self.amenities: Dict[str, bool] = {}
-        self.amenity_labels: Dict[str, str] = {}   # canonical_key -> display label
+        self.amenity_labels: Dict[str, str] = {}
         self.meta: Dict[str, Any] = {}
         self.bed_types: Dict[str, int] = {}
         self.images: List[Dict[str, Any]] = []
         self.custom_fields: Dict[str, Any] = {}
-        self._corpus: List[Tuple[str, str, str]] = []  # (key, label, valueText) for search
+        self._corpus: List[Tuple[str, str, str]] = []
 
         self._ingest_meta_scalars()
         self._ingest_times_wifi_pets_parking_text()
@@ -106,14 +97,10 @@ class AmenitiesIndex:
         self._ingest_custom_fields()
         self._build_corpus()
 
-    # -------- ingestion ----------
-
     def _ingest_meta_scalars(self) -> None:
         for k, v in (self.raw or {}).items():
             if _is_scalar(v):
                 self.meta[k] = v
-            # keep nested address dict as-is (accessed elsewhere)
-        # friendly accessors
         self.meta["check_in_start"] = _hhmm_from_24h(self.raw.get("checkInTimeStart"))
         self.meta["check_in_end"] = _hhmm_from_24h(self.raw.get("checkInTimeEnd"))
         self.meta["check_out_time"] = _hhmm_from_24h(self.raw.get("checkOutTime"))
@@ -122,7 +109,6 @@ class AmenitiesIndex:
         if (self.raw.get("wifiUsername") or self.raw.get("wifiPassword")):
             self.amenities["wifi"] = True
             self.amenity_labels.setdefault("wifi", "Wi-Fi")
-        # pets
         desc_blob = " ".join(_norm_text(self.raw.get(k)) for k in ("description","houseRules","specialInstruction")).lower()
         mp = self.raw.get("maxPetsAllowed")
         if mp is not None:
@@ -137,7 +123,6 @@ class AmenitiesIndex:
         if "pets allowed" in desc_blob or "pet friendly" in desc_blob:
             self.amenities["pets_allowed"] = True
             self.amenity_labels.setdefault("pets_allowed", "Pets allowed")
-        # parking hints
         if any(w in desc_blob for w in ("parking","garage","driveway")):
             self.amenities.setdefault("parking", True)
             self.amenity_labels.setdefault("parking", "Parking")
@@ -168,9 +153,7 @@ class AmenitiesIndex:
                 continue
             label = None
             if bt_id is not None:
-                label = _BEDTYPE_ID_NAME.get(int(bt_id))
-                if not label:
-                    label = f"Bed type {int(bt_id)}"
+                label = _BEDTYPE_ID_NAME.get(int(bt_id)) or f"Bed type {int(bt_id)}"
             self.bed_types[label or "Bed"] = self.bed_types.get(label or "Bed", 0) + qty
 
     def _ingest_images(self) -> None:
@@ -189,39 +172,31 @@ class AmenitiesIndex:
 
     def _ingest_custom_fields(self) -> None:
         for cf in (self.raw.get("customFieldValues") or []):
-            key = _slug(str(cf.get("name") or cf.get("key") or cf.get("id") or "custom"))
+            key = re.sub(r"[^a-z0-9]+","_", str(cf.get("name") or cf.get("key") or cf.get("id") or "custom").lower()).strip("_")
             val = cf.get("value")
             if key:
                 self.custom_fields[key] = val
 
     def _build_corpus(self) -> None:
-        # index amenities
         for key, val in (self.amenities or {}).items():
             label = self.amenity_labels.get(key, key.replace("_"," ").title())
             vtxt = "yes" if val else "no"
             self._corpus.append((f"amenity:{key}", label, vtxt))
-            # add synonyms
             for syn_key, syns in _SYN_MAP.items():
                 if syn_key == key:
                     for s in syns:
                         self._corpus.append((f"amenity:{key}", s, vtxt))
-        # meta scalars
         for k, v in (self.meta or {}).items():
             if _is_scalar(v):
                 self._corpus.append((f"meta:{_slug(k)}", k, _norm_text(v)))
-        # bed types
         for name, qty in (self.bed_types or {}).items():
             self._corpus.append((f"bedtype:{_slug(name)}", name, str(qty)))
-        # custom fields
         for k, v in (self.custom_fields or {}).items():
             self._corpus.append((f"custom:{_slug(k)}", k, _norm_text(v)))
-        # images captions
         for im in self.images:
             cap = _norm_text(im.get("caption"))
             if cap:
                 self._corpus.append(("image:caption", "image", cap))
-
-    # -------- API ----------
 
     def supports(self, key_or_name: str) -> Optional[bool]:
         k = _canonical_from_name(key_or_name)
@@ -249,7 +224,6 @@ class AmenitiesIndex:
             "custom_fields": self.custom_fields,
         }
 
-    # Simple scorer: matches on tokens across key/label/value
     def search(self, query: str, topk: int = 5) -> List[Dict[str, str]]:
         q = _norm_text(query).lower()
         if not q:
