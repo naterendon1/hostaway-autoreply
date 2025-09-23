@@ -9,6 +9,7 @@ from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Body
 from pydantic import BaseModel
+from ai_switch import get_ai_reply  # feature-flagged switch
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -546,16 +547,18 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
     context_for_reply = {"location": {"lat": lat, "lng": lng}}
-    from ai_switch import get_ai_reply
+
+    # === NEW: get reply via switch and ensure ai_reply is defined ===
     final_reply, detected_intent = get_ai_reply(
         guest_message=guest_msg,
         context_for_reply=context_for_reply,
         history=conversation_history or [],
-        meta_for_ai=meta_for_ai,                # if you have extra reservation/listing context
+        meta_for_ai=meta_for_ai,
         conversation_id=str(conv_id) if conv_id else None,
-)
+    )
+    ai_reply = final_reply  # ensure defined before any usage
 
-
+    # Safe analytics logging (must never crash webhook)
     try:
         log_ai_exchange(
             conversation_id=str(conv_id) if conv_id else None,
