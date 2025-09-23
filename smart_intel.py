@@ -229,3 +229,183 @@ def make_reply_smart(guest_message: str, meta_context: Dict[str, Any], history: 
             "requires_calendar_check": intent_info["requires_calendar_check"],
         },
     }
+
+ENHANCED_SYSTEM_PROMPT = """You are a vacation rental host assistant.
+
+CONTEXT:
+- Use journey stage (pre-arrival, during stay, post-checkout)
+- Respect reservation timing and property limitations
+
+STYLE:
+- Match guest formality; use contractions for casual tone
+- Keep it concise (1–3 sentences unless steps are needed)
+
+PRIORITIES: 1) Urgent/safety first 2) Answer specifically with concrete facts 3) Add only relevant context 4) Provide next steps
+
+NEVER:
+- Promise unavailable services
+- Repeat the guest’s words
+- Use placeholders like “[insert …]” or generic templates
+- If info is missing in FACTS_JSON, say you don’t have it rather than using placeholders
+"""
+
+def _fmt_yes_no(v: Optional[bool]) -> str:
+    if v is True: return "Yes"
+    if v is False: return "No"
+    return "I don’t have that info"
+
+def _amen_from_ctx(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    ai = ctx.get("amenities_index") or {}
+    if not isinstance(ai, dict): return {"amenities":{}, "meta":{}}
+    return {"amenities": ai.get("amenities") or {}, "meta": ai.get("meta") or {}}
+
+def _amen_supports(ai: Dict[str, Any], key: str) -> Optional[bool]:
+    am = ai.get("amenities") or {}
+    k = key.lower()
+    if k in am: return bool(am[k])
+    # try a few common aliases
+    aliases = {
+        "wifi": ["wifi","wi-fi","internet"],
+        "parking": ["parking","garage","driveway"],
+        "pool": ["pool","swimming_pool"],
+        "hot_tub": ["hot_tub","jacuzzi","spa"],
+        "ac": ["ac","air_conditioning"],
+        "pets_allowed": ["pets_allowed","pet_friendly"],
+        "washer": ["washer","washing_machine"],
+        "dryer": ["dryer","tumble_dryer"],
+        "dishwasher": ["dishwasher"],
+        "elevator": ["elevator","lift"],
+        "ev_charger": ["ev_charger","ev_charging"],
+        "crib": ["crib","pack_n_play"],
+        "gym": ["gym","fitness"],
+        "balcony": ["balcony","terrace","patio"],
+        "grill": ["grill","bbq","barbecue"],
+        "tv": ["tv","smart_tv","television"],
+    }
+    for canon, keys in aliases.items():
+        if k == canon or k in keys:
+            for kk in keys+[canon]:
+                if kk in am: return bool(am[kk])
+    return None
+
+def _amen_value(ai: Dict[str, Any], key: str) -> Any:
+    return (ai.get("meta") or {}).get(key)
+
+# Direct answers for amenity/capacity/time/policy Qs
+def _direct_amenity_answer(message: str, ctx: Dict[str, Any]) -> Optional[str]:
+    t = re.sub(r"\s+", " ", (message or "").lower())
+
+    ai = _amen_from_ctx(ctx)
+    def yesno(k: str) -> str: return _fmt_yes_no(_amen_supports(ai, k))
+
+    # Counts
+    if re.search(r"\b(bedroom|bedrooms)\b", t):
+        b = _amen_value(ai, "bedrooms")
+        if b is not None: return f"The home has {int(b)} bedrooms."
+    if re.search(r"\b(bathroom|bathrooms)\b", t):
+        b = _amen_value(ai, "bathrooms")
+        if b is not None: return f"It has {int(b)} bathrooms."
+    if re.search(r"\b\b(bed|beds)\b", t):
+        b = _amen_value(ai, "beds")
+        if b is not None: return f"There are {int(b)} beds."
+    if re.search(r"\b(guest|capacity|max (guest|people|occupancy))\b", t):
+        cap = _amen_value(ai, "max_guests")
+        if cap is not None: return f"The maximum occupancy is {int(cap)} guests."
+
+    # Times
+    if re.search(r"\b(check[ -]?in|arrival)\b", t):
+        start = _amen_value(ai, "check_in_start")
+        end = _amen_value(ai, "check_in_end")
+        if start and end: return f"Check-in is between {start} and {end}."
+        if start: return f"Check-in starts at {start}."
+        if end: return f"Check-in ends at {end}."
+    if re.search(r"\b(check[ -]?out|departure)\b", t):
+        out = _amen_value(ai, "check_out_time")
+        if out: return f"Check-out is at {out}."
+
+    # WiFi
+    if re.search(r"\b(wifi|wi-?fi|internet|ssid|password)\b", t):
+        has_wifi = _amen_supports(ai, "wifi")
+        ssid = _amen_value(ai, "wifi_username")
+        pw = _amen_value(ai, "wifi_password")
+        if has_wifi:
+            if ssid or pw:
+                parts = []
+                if ssid: parts.append(f"SSID: {ssid}")
+                if pw: parts.append(f"Password: {pw}")
+                return "Wi-Fi is available. " + " ".join(parts)
+            return "Wi-Fi is available."
+        return "Wi-Fi isn’t listed for this property."
+
+    # Common amenities yes/no
+    if re.search(r"\b(parking|garage|driveway)\b", t):
+        return f"Parking: {yesno('parking')}."
+    if re.search(r"\b(pool|swimming pool)\b", t):
+        return f"Pool: {yesno('pool')}."
+    if re.search(r"\b(hot tub|jacuzzi|spa)\b", t):
+        return f"Hot tub: {yesno('hot_tub')}."
+    if re.search(r"\b(air ?conditioning|a\.?c\.?|ac)\b", t):
+        return f"Air conditioning: {yesno('ac')}."
+    if re.search(r"\b(pet|dog|cat)\b", t):
+        yn = _amen_supports(ai, "pets_allowed")
+        if yn is True: return "Yes, the property is pet-friendly."
+        if yn is False: return "Sorry, pets aren’t allowed."
+        return "I don’t have pet policy info for this listing."
+
+    # Policies
+    if re.search(r"\b(cancel(lation)? policy)\b", t):
+        pol = _amen_value(ai, "cancellation_policy")
+        if pol: return f"The cancellation policy is: {pol}."
+        return "I don’t have the cancellation policy in the listing data."
+
+    # Room/bathroom types, size
+    if re.search(r"\b(room type|entire home|private room|shared room)\b", t):
+        rt = _amen_value(ai, "room_type")
+        if rt: return f"Room type: {rt.replace('_',' ')}."
+    if re.search(r"\b(bathroom type|private bathroom|shared bathroom)\b", t):
+        bt = _amen_value(ai, "bathroom_type")
+        if bt: return f"Bathroom type: {bt}."
+    if re.search(r"\b(square (meter|metre|feet)|size|area)\b", t):
+        sm = _amen_value(ai, "square_meters")
+        if sm: return f"Approximate size: {int(sm)} m²."
+
+    # Generic “do you have X” → try fuzzy amenity check
+    m = re.search(r"do you have (.+)", t) or re.search(r"is there (.+)", t)
+    if m:
+        q = m.group(1)
+        # naive fuzzy: test known keys
+        for key in ("wifi","parking","pool","hot_tub","ac","washer","dryer","dishwasher","tv","gym","elevator","grill","balcony","crib","ev_charger","pets_allowed"):
+            if any(k in q for k in key.replace("_"," ").split()):
+                v = _amen_supports(ai, key)
+                return f"{key.replace('_',' ').title()}: {_fmt_yes_no(v)}."
+    return None
+
+def compose_reply(guest_message: str, ctx: Dict[str, Any], intent_info: Dict[str, Any]) -> str:
+    # Post-checkout gratitude override
+    if re.search(r"\b(thank you|thanks|appreciate)\b", (guest_message or "").lower()) and \
+       (ctx.get("journey_stage") == "post_checkout" or re.search(r"\b(locked|lockbox|checked out|check-?out)\b", (guest_message or "").lower())):
+        return "Thanks so much for staying with us—glad to host you! Safe travels, and if you have feedback, I’d love to hear it."
+
+    # NEW: amenity/capacity/policy direct answer
+    da = _direct_amenity_answer(guest_message, ctx)
+    if da:
+        return da
+
+    # LLM fallback (now with full amenities index)
+    facts = {
+        "intent": intent_info,
+        "journey_stage": ctx.get("journey_stage"),
+        "property_profile": ctx.get("property_context"),
+        "property_details": ctx.get("property_details"),
+        "amenities_index": ctx.get("amenities_index"),
+        "nearby": ctx.get("nearby"),
+    }
+    user = (f"GUEST_MESSAGE:\n{guest_message}\n\n"
+            f"FACTS_JSON:\n{json.dumps(facts, ensure_ascii=False)}\n\n"
+            "Write ONLY the reply. Use concrete facts from FACTS_JSON if present. "
+            "Never write placeholders like '[insert …]'.")
+    reply = _chat_text(ENHANCED_SYSTEM_PROMPT, user)
+    if reply: return reply
+
+    # Final minimal fallback
+    return "Happy to help—what else would you like to know about the home or the area?"
