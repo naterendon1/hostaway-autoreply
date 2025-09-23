@@ -9,7 +9,6 @@ from datetime import date, datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Body
 from pydantic import BaseModel
-from ai_switch import get_ai_reply  # feature-flagged switch
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -35,6 +34,8 @@ from db import (
     log_message_event,
     log_ai_exchange,
 )
+
+from ai_switch import get_ai_reply  # <- single import
 
 # ---------- App & logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -493,29 +494,43 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     msg_status = pretty_status(d.get("status") or "sent")
     channel_pretty = channel_label_from(channel_id, communication_type)
 
+    # ========== NEW AMENITIES/DETAILS CONTEXT BLOCK ==========
     listing_obj = fetch_hostaway_listing(listing_id)
-    addr_raw = (listing_obj or {}).get("result", {}).get("address") or "Address unavailable"
+    listing_result = (listing_obj or {}).get("result", {}) or {}
+
+    # NEW: build amenity index from Hostaway
+    from amenities_index import AmenitiesIndex
+    amen_index = AmenitiesIndex(listing_result)
+
+    # Address string (unchanged)
+    addr_raw = listing_result.get("address") or "Address unavailable"
     if isinstance(addr_raw, dict):
         property_address = (
-            ", ".join(
-                str(addr_raw.get(k, "")).strip()
-                for k in ["address","city","state","zip","country"] if addr_raw.get(k)
-            ) or "Address unavailable"
+            ", ".join(str(addr_raw.get(k, "")).strip()
+                      for k in ["address","city","state","zip","country"] if addr_raw.get(k)) or "Address unavailable"
         )
     else:
         property_address = str(addr_raw)
 
-    loc_res = (listing_obj or {}).get("result", {}) or {}
-    lat = loc_res.get("latitude") or loc_res.get("lat")
-    lng = loc_res.get("longitude") or loc_res.get("lng")
-
+    # Preserve lat/lng and tz
+    lat = listing_result.get("latitude") or listing_result.get("lat")
+    lng = listing_result.get("longitude") or listing_result.get("lng")
     listing_cfg = load_listing_config(listing_id)
-    tz_name = loc_res.get("timeZone") or loc_res.get("timezone") \
+    tz_name = listing_result.get("timeZone") or listing_result.get("timezone") \
         or (listing_cfg.get("property_profile") or {}).get("timezone") or None
 
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
 
+    # Optional nearby recs (your helpers)
+    nearby_recs = None
+    try:
+        if should_fetch_local_recs(guest_msg) and lat and lng:
+            nearby_recs = build_local_recs({"lat": lat, "lng": lng}, max_results=5)
+    except Exception as e:
+        logging.warning("Nearby recs fetch failed: %s", e)
+
+    # conversation history (unchanged)
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
@@ -531,6 +546,24 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "pet_deposit_refundable": pet_policy.get("pet_deposit_refundable"),
     }
 
+    # NEW: expose property_details from amenity index too
+    property_details = {
+        "address": property_address,
+        "bedrooms": amen_index.value("bedrooms"),
+        "bathrooms": amen_index.value("bathrooms"),
+        "beds": amen_index.value("beds"),
+        "max_guests": amen_index.value("max_guests"),
+        "square_meters": amen_index.value("square_meters"),
+        "room_type": amen_index.value("room_type"),
+        "bathroom_type": amen_index.value("bathroom_type"),
+        "check_in_start": amen_index.value("check_in_start"),
+        "check_in_end": amen_index.value("check_in_end"),
+        "check_out_time": amen_index.value("check_out_time"),
+        "cancellation_policy": amen_index.value("cancellation_policy"),
+        "wifi_username": amen_index.value("wifi_username"),
+        "wifi_password": amen_index.value("wifi_password"),
+    }
+
     meta_for_ai: Dict[str, Any] = {
         "listing_id": (str(listing_id) if listing_id is not None else ""),
         "listing_map_id": listing_id,
@@ -540,15 +573,19 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "reservation_status": (res.get("status") or "").strip(),
         "timezone": tz_name,
         "property_profile": property_profile,
+        "property_details": property_details,
+        "amenities_index": amen_index.to_api(),        # <<< pass full normalized index
         "policies": policies,
         "access": access,
         "location": {"lat": lat, "lng": lng},
+        "nearby": {"items": nearby_recs or []},
     }
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
     context_for_reply = {"location": {"lat": lat, "lng": lng}}
+    # =========================================================
 
-    # === NEW: get reply via switch and ensure ai_reply is defined ===
+    # === get reply via switch and ensure ai_reply is defined ===
     final_reply, detected_intent = get_ai_reply(
         guest_message=guest_msg,
         context_for_reply=context_for_reply,
@@ -558,7 +595,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     )
     ai_reply = final_reply  # ensure defined before any usage
 
-    # Safe analytics logging (must never crash webhook)
     try:
         log_ai_exchange(
             conversation_id=str(conv_id) if conv_id else None,
