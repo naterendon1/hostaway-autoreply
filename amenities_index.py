@@ -1,194 +1,232 @@
 # path: amenities_index.py
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
-import re
+import os, json, re
 
-# Optional mapping if your account provides amenityId->name. Leave empty if unknown.
-# You can fill a few critical ones you use often; unknown IDs will be kept as "amenity_123".
-AMENITY_ID_TO_NAME: Dict[int, str] = {
-    # 2: "Wi-Fi",
-    # 3: "Parking",
-    # ... add if you have the mapping from Hostaway
-}
+"""
+AmenitiesIndex: builds a comprehensive, queryable facts index from Hostaway listing.result.
+- Captures ALL scalar fields from listing.result into meta.
+- Normalizes listingAmenities by (id|name) with optional external mapping via AMENITY_ID_MAP_PATH.
+- Captures bed types, images, and customFieldValues.
+- Provides search over keys/values/synonyms with a lightweight scorer.
+"""
 
-# Common synonyms → canonical keys
-_AMENITY_SYNONYMS = {
-    "wifi": {"wifi", "wi fi", "wi-fi", "internet"},
-    "parking": {"parking", "garage", "driveway"},
-    "pool": {"pool", "swimming pool"},
-    "hot_tub": {"hot tub", "jacuzzi", "spa"},
-    "ac": {"ac", "a/c", "air conditioning", "aircon"},
-    "heating": {"heating", "heater", "heat"},
-    "kitchen": {"kitchen", "full kitchen"},
-    "washer": {"washer", "washing machine", "laundry"},
-    "dryer": {"dryer", "tumble dryer", "laundry"},
+def _load_id_map(path_env: str) -> Dict[int, str]:
+    p = os.getenv(path_env, "").strip()
+    if not p:
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        out: Dict[int, str] = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    out[int(k)] = str(v)
+                except Exception:
+                    continue
+        elif isinstance(data, list):
+            # allow [{"id":2,"name":"Wi-Fi"}, ...]
+            for item in data:
+                try:
+                    out[int(item.get("id"))] = str(item.get("name"))
+                except Exception:
+                    pass
+        return out
+    except Exception:
+        return {}
+
+_AMENITY_ID_NAME = _load_id_map("AMENITY_ID_MAP_PATH")
+_BEDTYPE_ID_NAME = _load_id_map("BEDTYPE_ID_MAP_PATH")
+
+_SYN_MAP = {
+    "wifi": {"wifi","wi fi","wi-fi","internet"},
+    "parking": {"parking","garage","driveway"},
+    "pool": {"pool","swimming pool"},
+    "hot_tub": {"hot tub","jacuzzi","spa"},
+    "ac": {"ac","a/c","air conditioning","aircon"},
+    "heating": {"heating","heater","heat"},
+    "kitchen": {"kitchen","full kitchen"},
+    "washer": {"washer","washing machine","laundry"},
+    "dryer": {"dryer","tumble dryer","laundry"},
     "dishwasher": {"dishwasher"},
-    "tv": {"tv", "television", "smart tv"},
-    "pets_allowed": {"pets", "pet friendly", "dogs", "cats"},
-    "gym": {"gym", "fitness"},
-    "elevator": {"elevator", "lift"},
-    "balcony": {"balcony", "terrace", "patio"},
-    "grill": {"grill", "bbq", "barbecue"},
-    "crib": {"crib", "pack n play", "pack-and-play"},
-    "ev_charger": {"ev charger", "ev charging", "electric vehicle charger"},
-}
-
-# Bed type IDs → human-friendly labels (extend as you learn your account’s IDs)
-BEDTYPE_ID_TO_NAME: Dict[int, str] = {
-    1: "King bed", 2: "Queen bed", 3: "Double bed", 4: "Single bed",
-    5: "Sofa bed", 6: "Bunk bed", 7: "Futon", 8: "Crib",
-    33: "Air mattress",  # example from your sample
-    # Add/adjust to match your Hostaway account if it differs
+    "tv": {"tv","television","smart tv"},
+    "pets_allowed": {"pets","pet friendly","dogs","cats"},
+    "gym": {"gym","fitness"},
+    "elevator": {"elevator","lift"},
+    "balcony": {"balcony","terrace","patio"},
+    "grill": {"grill","bbq","barbecue"},
+    "crib": {"crib","pack n play","pack-and-play"},
+    "ev_charger": {"ev charger","ev charging","electric vehicle charger"},
 }
 
 def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (s or "").lower()).strip("_")
 
-def _canonicalize_name(raw_name: str) -> str:
+def _norm_text(s: Any) -> str:
+    return re.sub(r"\s+", " ", str(s or "")).strip()
+
+def _canonical_from_name(raw_name: str) -> str:
     s = re.sub(r"[^a-z0-9]+", " ", (raw_name or "").lower()).strip()
-    for key, syns in _AMENITY_SYNONYMS.items():
+    for key, syns in _SYN_MAP.items():
         if s in syns or any(tok in s for tok in syns):
             return key
     return _slug(s) or "unknown"
 
-def _canonicalize_id(amenity_id: int) -> Tuple[str, str]:
-    # returns canonical_key, display_name
-    name = AMENITY_ID_TO_NAME.get(int(amenity_id))
-    if name:
-        canon = _canonicalize_name(name)
-        return canon, name
-    # unknown id → create stable key
-    return f"amenity_{int(amenity_id)}", f"amenity_{int(amenity_id)}"
-
-def _bool(v: Any) -> Optional[bool]:
-    if isinstance(v, bool): return v
-    if v in (0, 1): return bool(v)
-    if isinstance(v, str):
-        t = v.strip().lower()
-        if t in {"true","yes","1"}: return True
-        if t in {"false","no","0"}: return False
-    return None
-
-def _int(v: Any) -> Optional[int]:
-    try:
-        if v is None or v == "": return None
-        return int(float(v))
-    except Exception:
-        return None
-
-def _hhmm_from_24h(hour: Optional[int]) -> Optional[str]:
-    if hour is None: return None
+def _hhmm_from_24h(hour: Any) -> Optional[str]:
     try:
         h = int(hour)
     except Exception:
         return None
-    if not (0 <= h <= 23): return None
-    ampm = "AM" if h < 12 else "PM"
-    hr = h % 12 or 12
-    return f"{hr}:00 {ampm}"
+    if 0 <= h <= 23:
+        ampm = "AM" if h < 12 else "PM"
+        hr = h % 12 or 12
+        return f"{hr}:00 {ampm}"
+    return None
+
+def _is_scalar(v: Any) -> bool:
+    return isinstance(v, (str, int, float, bool)) or v is None
 
 class AmenitiesIndex:
-    """
-    Build a normalized amenity + facts index from Hostaway listing.result.
-    Exposes:
-      - amenities: Dict[canonical_key, bool]
-      - meta: Dict of concrete values (counts/times/policies/wifi/etc.)
-      - bed_types: Dict[label, int]
-      - images: List[{caption, url, sort}]
-    """
-
-    def __init__(self, result: Dict[str, Any]):
-        self.raw = result or {}
-
-        # Amenity booleans and meta facts
+    def __init__(self, listing_result: Dict[str, Any]):
+        self.raw: Dict[str, Any] = listing_result or {}
         self.amenities: Dict[str, bool] = {}
+        self.amenity_labels: Dict[str, str] = {}   # canonical_key -> display label
         self.meta: Dict[str, Any] = {}
+        self.bed_types: Dict[str, int] = {}
+        self.images: List[Dict[str, Any]] = []
+        self.custom_fields: Dict[str, Any] = {}
+        self._corpus: List[Tuple[str, str, str]] = []  # (key, label, valueText) for search
 
-        # Counts/capacity
-        self.meta["bedrooms"] = _int(self.raw.get("bedroomsNumber"))
-        self.meta["bathrooms"] = _int(self.raw.get("bathroomsNumber"))
-        self.meta["beds"] = _int(self.raw.get("bedsNumber"))
-        self.meta["max_guests"] = _int(self.raw.get("personCapacity") or self.raw.get("guestsIncluded"))
+        self._ingest_meta_scalars()
+        self._ingest_times_wifi_pets_parking_text()
+        self._ingest_listing_amenities()
+        self._ingest_bed_types()
+        self._ingest_images()
+        self._ingest_custom_fields()
+        self._build_corpus()
 
-        # Times/policies
+    # -------- ingestion ----------
+
+    def _ingest_meta_scalars(self) -> None:
+        for k, v in (self.raw or {}).items():
+            if _is_scalar(v):
+                self.meta[k] = v
+            # keep nested address dict as-is (accessed elsewhere)
+        # friendly accessors
         self.meta["check_in_start"] = _hhmm_from_24h(self.raw.get("checkInTimeStart"))
-        self.meta["check_in_end"]   = _hhmm_from_24h(self.raw.get("checkInTimeEnd"))
+        self.meta["check_in_end"] = _hhmm_from_24h(self.raw.get("checkInTimeEnd"))
         self.meta["check_out_time"] = _hhmm_from_24h(self.raw.get("checkOutTime"))
-        self.meta["cancellation_policy"] = (self.raw.get("cancellationPolicy") or "").strip() or None
 
-        # WiFi details
-        self.meta["wifi_username"] = (self.raw.get("wifiUsername") or "").strip() or None
-        self.meta["wifi_password"] = (self.raw.get("wifiPassword") or "").strip() or None
-        if self.meta["wifi_username"] or self.meta["wifi_password"]:
+    def _ingest_times_wifi_pets_parking_text(self) -> None:
+        if (self.raw.get("wifiUsername") or self.raw.get("wifiPassword")):
             self.amenities["wifi"] = True
-
-        # Pets from explicit/maxPetsAllowed or text
-        pets_allowed_explicit = self.raw.get("maxPetsAllowed")
-        if pets_allowed_explicit is not None:
+            self.amenity_labels.setdefault("wifi", "Wi-Fi")
+        # pets
+        desc_blob = " ".join(_norm_text(self.raw.get(k)) for k in ("description","houseRules","specialInstruction")).lower()
+        mp = self.raw.get("maxPetsAllowed")
+        if mp is not None:
             try:
-                self.amenities["pets_allowed"] = int(pets_allowed_explicit) > 0
+                self.amenities["pets_allowed"] = int(mp) > 0
             except Exception:
-                self.amenities["pets_allowed"] = bool(pets_allowed_explicit)
-
-        desc_blob = " ".join(str(self.raw.get(k) or "") for k in ("description","houseRules","specialInstruction")).lower()
+                self.amenities["pets_allowed"] = bool(mp)
+            self.amenity_labels.setdefault("pets_allowed", "Pets allowed")
         if "no pets" in desc_blob or "pets not allowed" in desc_blob:
             self.amenities["pets_allowed"] = False
+            self.amenity_labels.setdefault("pets_allowed", "Pets allowed")
         if "pets allowed" in desc_blob or "pet friendly" in desc_blob:
             self.amenities["pets_allowed"] = True
-
-        # Parking heuristic if not set by amenity list
-        if any(w in desc_blob for w in ("parking", "garage", "driveway")):
+            self.amenity_labels.setdefault("pets_allowed", "Pets allowed")
+        # parking hints
+        if any(w in desc_blob for w in ("parking","garage","driveway")):
             self.amenities.setdefault("parking", True)
+            self.amenity_labels.setdefault("parking", "Parking")
 
-        # listingAmenities: can be objects with amenityId OR name
+    def _ingest_listing_amenities(self) -> None:
         for item in (self.raw.get("listingAmenities") or []):
-            amenity_id = item.get("amenityId")
             name = item.get("name") or item.get("amenityName")
+            amenity_id = item.get("amenityId")
             if name:
-                key = _canonicalize_name(name)
+                key = _canonical_from_name(name)
                 self.amenities[key] = True
+                self.amenity_labels.setdefault(key, name.strip())
             elif amenity_id is not None:
-                key, _ = _canonicalize_id(int(amenity_id))
+                disp = _AMENITY_ID_NAME.get(int(amenity_id), f"amenity_{int(amenity_id)}")
+                key = _canonical_from_name(disp)
                 self.amenities[key] = True
+                self.amenity_labels.setdefault(key, disp)
 
-        # Images
-        self.images: List[Dict[str, Any]] = []
+    def _ingest_bed_types(self) -> None:
+        for bt in (self.raw.get("listingBedTypes") or []):
+            bt_id = bt.get("bedTypeId")
+            qty = bt.get("quantity")
+            try:
+                qty = int(qty)
+            except Exception:
+                qty = 0
+            if qty <= 0:
+                continue
+            label = None
+            if bt_id is not None:
+                label = _BEDTYPE_ID_NAME.get(int(bt_id))
+                if not label:
+                    label = f"Bed type {int(bt_id)}"
+            self.bed_types[label or "Bed"] = self.bed_types.get(label or "Bed", 0) + qty
+
+    def _ingest_images(self) -> None:
         for im in (self.raw.get("listingImages") or []):
             cap = im.get("caption") or im.get("airbnbCaption") or im.get("vrboCaption") or ""
-            self.images.append({
-                "caption": cap,
-                "url": im.get("url"),
-                "sort": _int(im.get("sortOrder")) or 0,
-            })
+            url = im.get("url")
+            if not url:
+                continue
+            sort = 0
+            try:
+                sort = int(im.get("sortOrder") or 0)
+            except Exception:
+                pass
+            self.images.append({"caption": cap, "url": url, "sort": sort})
         self.images.sort(key=lambda x: x["sort"])
 
-        # Bed types
-        self.bed_types: Dict[str, int] = {}
-        for bt in (self.raw.get("listingBedTypes") or []):
-            bt_id = _int(bt.get("bedTypeId"))
-            qty = _int(bt.get("quantity")) or 0
-            if not bt_id or qty <= 0:
-                continue
-            label = BEDTYPE_ID_TO_NAME.get(bt_id, f"Bed type {bt_id}")
-            self.bed_types[label] = self.bed_types.get(label, 0) + qty
+    def _ingest_custom_fields(self) -> None:
+        for cf in (self.raw.get("customFieldValues") or []):
+            key = _slug(str(cf.get("name") or cf.get("key") or cf.get("id") or "custom"))
+            val = cf.get("value")
+            if key:
+                self.custom_fields[key] = val
 
-        # Location/meta extras
-        self.meta["address"] = self.raw.get("address") or None
-        self.meta["city"] = self.raw.get("city") or None
-        self.meta["state"] = self.raw.get("state") or None
-        self.meta["country"] = self.raw.get("country") or None
-        self.meta["square_meters"] = _int(self.raw.get("squareMeters"))
-        self.meta["room_type"] = self.raw.get("roomType")  # entire_home/private_room/shared_room
-        self.meta["bathroom_type"] = self.raw.get("bathroomType")  # private/shared
+    def _build_corpus(self) -> None:
+        # index amenities
+        for key, val in (self.amenities or {}).items():
+            label = self.amenity_labels.get(key, key.replace("_"," ").title())
+            vtxt = "yes" if val else "no"
+            self._corpus.append((f"amenity:{key}", label, vtxt))
+            # add synonyms
+            for syn_key, syns in _SYN_MAP.items():
+                if syn_key == key:
+                    for s in syns:
+                        self._corpus.append((f"amenity:{key}", s, vtxt))
+        # meta scalars
+        for k, v in (self.meta or {}).items():
+            if _is_scalar(v):
+                self._corpus.append((f"meta:{_slug(k)}", k, _norm_text(v)))
+        # bed types
+        for name, qty in (self.bed_types or {}).items():
+            self._corpus.append((f"bedtype:{_slug(name)}", name, str(qty)))
+        # custom fields
+        for k, v in (self.custom_fields or {}).items():
+            self._corpus.append((f"custom:{_slug(k)}", k, _norm_text(v)))
+        # images captions
+        for im in self.images:
+            cap = _norm_text(im.get("caption"))
+            if cap:
+                self._corpus.append(("image:caption", "image", cap))
 
-    # Query helpers
-    def supports(self, key: str) -> Optional[bool]:
-        k = _slug(key)
-        if k in self.amenities: return bool(self.amenities[k])
-        # try synonyms
-        for canon, syns in _AMENITY_SYNONYMS.items():
-            if k == canon or k.replace("_"," ") in syns or k in syns:
-                return bool(self.amenities.get(canon))
+    # -------- API ----------
+
+    def supports(self, key_or_name: str) -> Optional[bool]:
+        k = _canonical_from_name(key_or_name)
+        if k in self.amenities:
+            return bool(self.amenities[k])
         return None
 
     def value(self, key: str) -> Any:
@@ -204,7 +242,32 @@ class AmenitiesIndex:
     def to_api(self) -> Dict[str, Any]:
         return {
             "amenities": self.amenities,
+            "amenity_labels": self.amenity_labels,
             "meta": self.meta,
             "bed_types": self.bed_types,
             "images": self.images,
+            "custom_fields": self.custom_fields,
         }
+
+    # Simple scorer: matches on tokens across key/label/value
+    def search(self, query: str, topk: int = 5) -> List[Dict[str, str]]:
+        q = _norm_text(query).lower()
+        if not q:
+            return []
+        toks = [t for t in re.split(r"[^a-z0-9]+", q) if t]
+        if not toks:
+            return []
+        scored: List[Tuple[float, Tuple[str,str,str]]] = []
+        for key, label, val in self._corpus:
+            text = f"{label} {val}".lower()
+            score = 0.0
+            for t in toks:
+                if t and t in text:
+                    score += 1.0 + (0.5 if t in (label.lower()) else 0.0)
+            if score > 0:
+                scored.append((score, (key, label, val)))
+        scored.sort(key=lambda x: -x[0])
+        out = []
+        for s, (k, l, v) in scored[:topk]:
+            out.append({"key": k, "label": l, "value": v})
+        return out
