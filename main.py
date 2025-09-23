@@ -35,7 +35,7 @@ from db import (
     log_ai_exchange,
 )
 
-from ai_switch import get_ai_reply  # <- single import
+from ai_switch import get_ai_reply  # switch that returns (reply, intent)
 
 # ---------- App & logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -48,13 +48,13 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")
 SHOW_NEW_GUEST_TAG = os.getenv("SHOW_NEW_GUEST_TAG", "0") in ("1", "true", "True", "yes", "YES")
 DEBUG_CONVERSATION = os.getenv("DEBUG_CONVERSATION", "0") in ("1", "true", "True", "yes", "YES")
-SLACK_SKIP_READS = os.getenv("SLACK_SKIP_READS", "1") in ("1", "true", "True", "yes", "YES")  # default: no read scopes
+SLACK_SKIP_READS = os.getenv("SLACK_SKIP_READS", "1") in ("1", "true", "True", "yes", "YES")
 
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
     "OPENAI_API_KEY",
-    "SLACK_CHANNEL",        # MUST be channel ID: C…/G…
+    "SLACK_CHANNEL",
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
 ]
@@ -74,17 +74,13 @@ def _ensure_bot_in_channel(client: WebClient, channel_id: str) -> None:
     try:
         client.conversations_join(channel=channel_id)
     except SlackApiError:
-        pass  # private or already joined
+        pass
 
 def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, Any]], text: str) -> bool:
-    """
-    Post only when we have a Slack channel ID (no read scopes).
-    """
     chan_id = (_SLACK_CHANNEL_ID or (channel_hint or "").strip())
     if not _hint_is_id(chan_id):
         logging.error(
-            "SLACK_CHANNEL must be a Slack channel ID (starts with 'C' or 'G'). "
-            "Current value=%r. Fix: set SLACK_CHANNEL to the Channel ID from Slack → Channel details → About → Channel ID.",
+            "SLACK_CHANNEL must be a Slack channel ID (starts with 'C' or 'G'). Current value=%r.",
             channel_hint,
         )
         return False
@@ -416,6 +412,36 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: str | None = None
     date: str | None = None
 
+# Robust listing_id derivation
+def _derive_listing_id(payload_data: Dict[str, Any], reservation_obj: Dict[str, Any], conv_obj: Dict[str, Any]) -> Optional[int]:
+    lid = payload_data.get("listingMapId") or payload_data.get("listingId")
+    if isinstance(lid, int):
+        return lid
+    try:
+        if lid and str(lid).isdigit():
+            return int(lid)
+    except Exception:
+        pass
+
+    res_res = (reservation_obj or {}).get("result") or {}
+    for k in ("listingMapId", "listingId", "propertyId"):
+        v = res_res.get(k)
+        if v:
+            try:
+                return int(v)
+            except Exception:
+                continue
+
+    conv_res = (conv_obj or {}).get("result") or {}
+    for k in ("listingMapId", "listingId"):
+        v = conv_res.get(k)
+        if v:
+            try:
+                return int(v)
+            except Exception:
+                continue
+    return None
+
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
@@ -441,40 +467,30 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     conv_id = d.get("conversationId")
     reservation_id = d.get("reservationId")
-    listing_id = d.get("listingMapId")
     guest_id = d.get("userId", "")
     communication_type = d.get("communicationType", "channel")
     channel_id = d.get("channelId")
 
-    try:
-        log_message_event(
-            direction="inbound",
-            provider="hostaway",
-            conversation_id=str(conv_id) if conv_id else None,
-            reservation_id=str(reservation_id) if reservation_id else None,
-            listing_id=str(listing_id) if listing_id else None,
-            guest_id=str(guest_id) if guest_id else None,
-            channel=channel_label_from(channel_id, communication_type),
-            payload={"guest_message": guest_msg, "raw": d},
-        )
-    except Exception as e:
-        logging.warning(f"message logging failed: {e}")
-
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res = reservation.get("result", {}) or {}
-
-    guest_name = res.get("guestFirstName", "Guest")
-    guest_email = res.get("guestEmail") or None
 
     convo_obj = fetch_hostaway_conversation(conv_id) or {}
     if DEBUG_CONVERSATION:
         try: logging.info("[DEBUG] Full conversation object: %s", json.dumps(convo_obj, indent=2))
         except Exception: pass
     convo_res = convo_obj.get("result", {}) or {}
-    if convo_res: logging.info("✅ Conversation %s fetched with messages.", convo_res.get("id"))
+    if convo_res:
+        logging.info("✅ Conversation %s fetched with messages.", convo_res.get("id"))
+
+    # Derive listing_id robustly
+    listing_id = _derive_listing_id(d, reservation, convo_obj)
+    if listing_id is None:
+        logging.error("❌ listing_id missing; amenities lookup disabled. payload keys=%s res=%s conv=%s",
+                      list(d.keys()), bool(res), bool(convo_res))
+
+    guest_name = res.get("guestFirstName", "Guest")
+    guest_email = res.get("guestEmail") or convo_res.get("guestEmail") or convo_res.get("recipientEmail") or None
     guest_photo = convo_res.get("recipientPicture") or convo_res.get("guestPicture") or res.get("guestPicture") or None
-    if not guest_email:
-        guest_email = convo_res.get("guestEmail") or convo_res.get("recipientEmail")
 
     returning_tag = ""
     if guest_email:
@@ -494,15 +510,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     msg_status = pretty_status(d.get("status") or "sent")
     channel_pretty = channel_label_from(channel_id, communication_type)
 
-    # ========== NEW AMENITIES/DETAILS CONTEXT BLOCK ==========
-    listing_obj = fetch_hostaway_listing(listing_id)
+    # ========== Amenities/details context ==========
+    listing_obj = fetch_hostaway_listing(listing_id) if listing_id is not None else {}
     listing_result = (listing_obj or {}).get("result", {}) or {}
 
-    # NEW: build amenity index from Hostaway
     from amenities_index import AmenitiesIndex
     amen_index = AmenitiesIndex(listing_result)
 
-    # Address string (unchanged)
     addr_raw = listing_result.get("address") or "Address unavailable"
     if isinstance(addr_raw, dict):
         property_address = (
@@ -512,7 +526,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         property_address = str(addr_raw)
 
-    # Preserve lat/lng and tz
     lat = listing_result.get("latitude") or listing_result.get("lat")
     lng = listing_result.get("longitude") or listing_result.get("lng")
     listing_cfg = load_listing_config(listing_id)
@@ -522,7 +535,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
 
-    # Optional nearby recs (your helpers)
     nearby_recs = None
     try:
         if should_fetch_local_recs(guest_msg) and lat and lng:
@@ -530,7 +542,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     except Exception as e:
         logging.warning("Nearby recs fetch failed: %s", e)
 
-    # conversation history (unchanged)
     msgs = []
     if "result" in convo_obj and "conversationMessages" in convo_obj["result"]:
         msgs = convo_obj["result"]["conversationMessages"] or []
@@ -546,22 +557,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "pet_deposit_refundable": pet_policy.get("pet_deposit_refundable"),
     }
 
-    # NEW: expose property_details from amenity index too
     property_details = {
         "address": property_address,
-        "bedrooms": amen_index.value("bedrooms"),
-        "bathrooms": amen_index.value("bathrooms"),
-        "beds": amen_index.value("beds"),
-        "max_guests": amen_index.value("max_guests"),
-        "square_meters": amen_index.value("square_meters"),
-        "room_type": amen_index.value("room_type"),
-        "bathroom_type": amen_index.value("bathroom_type"),
+        "bedrooms": amen_index.value("bedroomsNumber") or amen_index.value("bedrooms"),
+        "bathrooms": amen_index.value("bathroomsNumber") or amen_index.value("bathrooms"),
+        "beds": amen_index.value("bedsNumber") or amen_index.value("beds"),
+        "max_guests": amen_index.value("personCapacity") or amen_index.value("guestsIncluded") or amen_index.value("max_guests"),
+        "square_meters": amen_index.value("squareMeters"),
+        "room_type": amen_index.value("roomType"),
+        "bathroom_type": amen_index.value("bathroomType"),
         "check_in_start": amen_index.value("check_in_start"),
         "check_in_end": amen_index.value("check_in_end"),
         "check_out_time": amen_index.value("check_out_time"),
-        "cancellation_policy": amen_index.value("cancellation_policy"),
-        "wifi_username": amen_index.value("wifi_username"),
-        "wifi_password": amen_index.value("wifi_password"),
+        "cancellation_policy": amen_index.value("cancellationPolicy") or amen_index.value("cancellation_policy"),
+        "wifi_username": amen_index.value("wifiUsername") or amen_index.value("wifi_username"),
+        "wifi_password": amen_index.value("wifiPassword") or amen_index.value("wifi_password"),
     }
 
     meta_for_ai: Dict[str, Any] = {
@@ -574,7 +584,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "timezone": tz_name,
         "property_profile": property_profile,
         "property_details": property_details,
-        "amenities_index": amen_index.to_api(),        # <<< pass full normalized index
+        "amenities_index": amen_index.to_api(),
         "policies": policies,
         "access": access,
         "location": {"lat": lat, "lng": lng},
@@ -583,9 +593,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
     context_for_reply = {"location": {"lat": lat, "lng": lng}}
-    # =========================================================
 
-    # === get reply via switch and ensure ai_reply is defined ===
+    # ---------- AI reply (ensure ai_reply defined) ----------
     final_reply, detected_intent = get_ai_reply(
         guest_message=guest_msg,
         context_for_reply=context_for_reply,
@@ -593,7 +602,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         meta_for_ai=meta_for_ai,
         conversation_id=str(conv_id) if conv_id else None,
     )
-    ai_reply = final_reply  # ensure defined before any usage
+    ai_reply = final_reply
+
+    try:
+        log_message_event(
+            direction="inbound",
+            provider="hostaway",
+            conversation_id=str(conv_id) if conv_id else None,
+            reservation_id=str(reservation_id) if reservation_id else None,
+            listing_id=str(listing_id) if listing_id is not None else None,
+            guest_id=str(guest_id) if guest_id else None,
+            channel=channel_label_from(channel_id, communication_type),
+            payload={"guest_message": guest_msg, "raw": d},
+        )
+    except Exception as e:
+        logging.warning(f"message logging failed: {e}")
 
     try:
         log_ai_exchange(
