@@ -546,7 +546,15 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
     context_for_reply = {"location": {"lat": lat, "lng": lng}}
-    ai_reply, detected_intent = make_suggested_reply(guest_msg, context_for_reply)
+    from ai_switch import get_ai_reply
+    final_reply, detected_intent = get_ai_reply(
+        guest_message=guest_msg,
+        context_for_reply=context_for_reply,
+        history=conversation_history or [],
+        meta_for_ai=meta_for_ai,                # if you have extra reservation/listing context
+        conversation_id=str(conv_id) if conv_id else None,
+)
+
 
     try:
         log_ai_exchange(
