@@ -824,3 +824,45 @@ def detect_intent(message: str) -> str:
     except Exception as e:
         logging.error(f"Intent detection failed: {e}")
         return "other"
+
+def _looks_like_issue(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(w in t for w in (
+        "broken","leak","flood","no power","no heat","gas","smoke","locked out",
+        "emergency","urgent","didn't work","doesn't work","not working","bugs","dirty",
+        "infestation","water heater","pipe burst","no wifi","wifi down","internet down"
+    ))
+
+def _guest_is_upset(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(w in t for w in ("upset","angry","frustrated","disappointed","annoyed","mad","bad experience","complain","not happy"))
+
+def clean_ai_reply(reply: str, guest_msg: str, ctx: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Context-aware sanitizer:
+    - Remove placeholders and template artifacts.
+    - Keep natural hospitality; allow brief apologies when there's an issue.
+    - Keep replies short (<= 3 sentences).
+    """
+    r = (reply or "").strip()
+
+    # Hard bans: placeholders / braces
+    r = re.sub(r"\[[^\]]+\]", "", r)
+    r = re.sub(r"\{[^}]+\}", "", r)
+    r = re.sub(r"\s{2,}", " ", r).strip()
+
+    issue = _looks_like_issue(guest_msg) or _guest_is_upset(guest_msg)
+
+    # Tone tweaks only when not an issue: soften corporate phrases
+    if not issue:
+        r = re.sub(r"(?i)\bwe\s+apologize\b", "Sorry", r)
+        r = re.sub(r"(?i)\bper\s+our\s+policy\b", "As a heads-up", r)
+
+    # Collapse to ~3 sentences max
+    parts = re.split(r"(?<=[.!?])\s+", r)
+    if len(parts) > 3:
+        r = " ".join(parts[:3]).strip()
+
+    # Clean spacing artifacts
+    r = r.replace(" ,", ",").replace(" .", ".").strip()
+    return r
