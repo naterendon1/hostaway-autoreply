@@ -1,4 +1,4 @@
-# path: utils.py — consolidated & fixed
+# path: utils.py
 
 import os
 import re
@@ -13,14 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple, Literal
 import requests
 from openai import OpenAI
 
-# Local helpers
 from places import should_fetch_local_recs, build_local_recs
 
-# --------------------------- Env & OpenAI clients ---------------------------
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-_router_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-openai_client = _router_client  # use the same key for reply-gen
+# --------------------------- Config / Env ---------------------------
 
 HOSTAWAY_API_BASE = os.getenv("HOSTAWAY_API_BASE", "https://api.hostaway.com/v1")
 HOSTAWAY_CLIENT_ID = os.getenv("HOSTAWAY_CLIENT_ID")
@@ -28,23 +23,22 @@ HOSTAWAY_CLIENT_SECRET = os.getenv("HOSTAWAY_CLIENT_SECRET")
 
 LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+if not OPENAI_API_KEY:
+    logging.warning("OPENAI_API_KEY missing; intent classification and drafting may be disabled.")
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY") or ""
 GOOGLE_DISTANCE_MATRIX_API_KEY = os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY") or ""
 
 if not HOSTAWAY_CLIENT_ID or not HOSTAWAY_CLIENT_SECRET:
     logging.warning("HOSTAWAY client env vars are missing; API calls will fail.")
-
-if not OPENAI_API_KEY:
-    logging.warning("OPENAI_API_KEY missing; intent classification will be disabled.")
-
 if not GOOGLE_API_KEY:
     logging.info("GOOGLE_PLACES_API_KEY not set; places features disabled.")
-
 if not GOOGLE_DISTANCE_MATRIX_API_KEY:
     logging.info("GOOGLE_DISTANCE_MATRIX_API_KEY not set; distance/time features disabled.")
 
-
-# --------------------------- Intent routing ---------------------------
+# --------------------------- Routing ---------------------------
 
 PrimaryIntent = Literal[
     "arrival_update", "trash_help", "accessibility", "food_recs",
@@ -57,15 +51,14 @@ def route_message(msg: str) -> Dict[str, Any]:
     Returns { "summary": str, "primary_intent": PrimaryIntent, "secondary": [..] }.
     JSON-only. No chain-of-thought.
     """
-    if not _router_client:
-        # simple fallback: keywordy but with strong negatives
+    if not openai_client:
         text = (msg or "").lower()
-        if any(k in text for k in ["restaurant", "eat", "dinner", "breakfast", "coffee", "food"]) \
-           and not any(k in text for k in ["trash", "garbage", "disabled", "elevator", "access", "portal"]):
+        if any(k in text for k in ["restaurant","eat","dinner","breakfast","coffee","food"]) \
+           and not any(k in text for k in ["trash","garbage","disabled","elevator","access","portal"]):
             intent = "food_recs"
-        elif any(k in text for k in ["trash", "garbage", "bins"]):
+        elif any(k in text for k in ["trash","garbage","bins"]):
             intent = "trash_help"
-        elif any(k in text for k in ["disabled", "wheelchair", "elevator", "accessible", "accessibility"]):
+        elif any(k in text for k in ["disabled","wheelchair","elevator","accessible","accessibility"]):
             intent = "accessibility"
         else:
             intent = "other"
@@ -73,80 +66,218 @@ def route_message(msg: str) -> Dict[str, Any]:
 
     sys = (
         "You are an intent router for short guest messages to a vacation rental host. "
-        "You MUST return concise JSON with fields: summary, primary_intent, secondary. "
+        "Return concise JSON with fields: summary, primary_intent, secondary. "
         "Primary intents: arrival_update, trash_help, accessibility, food_recs, parking, "
         "check_in_help, check_out_help, house_rules, booking_question, other. "
-        "Rules: infer intent from the whole message, not keywords alone. "
-        "If a guest mentions trash or accessibility, those beat food_recs. "
-        "If multiple intents exist, choose the most urgent practical one as primary."
+        "Infer intent from the whole message; safety/ops beats food."
     )
     user = f"Guest message:\n{msg}\n\nReturn JSON only."
-
     try:
-        resp = _router_client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[{"role":"system","content":sys},{"role":"user","content":user}],
             temperature=0
         )
-        out = resp.choices[0].message.content or "{}"
-        data = json.loads(out)
+        data = json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
-        logging.error(f"[router] {e}")
-        data = {"summary": msg[:280], "primary_intent": "other", "secondary": []}
-
+        logging.warning(f"[route_message] router fallback: {e}")
+        data = {}
     return {
-        "summary": data.get("summary", msg[:280]),
+        "summary": data.get("summary", (msg or "")[:280]),
         "primary_intent": data.get("primary_intent", "other"),
         "secondary": data.get("secondary", []),
     }
 
+# --------------------------- Text normalization & sanitizer ---------------------------
 
-# --------------------------- Drafting core ---------------------------
+BANNED_PHRASES = [
+    "thank you for your patience",
+    "we apologize for any inconvenience",
+    "kindly note",
+    "please be advised",
+    "sincerely,",
+    "best regards",
+]
+
+_CONTRACTIONS = [
+    (r"\bdo not\b", "don't"),
+    (r"\bdoes not\b", "doesn't"),
+    (r"\bdid not\b", "didn't"),
+    (r"\bit is\b", "it's"),
+    (r"\bwe are\b", "we're"),
+    (r"\bwe will\b", "we'll"),
+    (r"\bwe have\b", "we've"),
+    (r"\byou are\b", "you're"),
+    (r"\bthat is\b", "that's"),
+    (r"\bthere is\b", "there's"),
+    (r"\bI will\b", "I'll"),
+    (r"\bI have\b", "I've"),
+    (r"\bcannot\b", "can't"),
+]
+
+def _preserve_case(src: str, repl: str) -> str:
+    return repl[:1].upper() + repl[1:] if src[:1].isupper() else repl
+
+def _apply_contractions(txt: str) -> str:
+    s = txt
+    for pattern, repl in _CONTRACTIONS:
+        s = re.sub(pattern, lambda m: _preserve_case(m.group(0), repl), s, flags=re.IGNORECASE)
+    return s
+
+def _looks_like_issue(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in (
+        "dirty","unclean","mess","messy","bugs","roaches","ants","mold","leak","broken","smell","stain",
+        "hair","not clean","cleaning issue","trash","disgust","filthy","soiled","problem","issue","complain",
+        "no power","no heat","gas","smoke","locked out","emergency","urgent"
+    ))
+
+def _guest_is_upset(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(w in t for w in ("upset","angry","frustrated","disappointed","annoyed","mad","bad experience","complain","not happy"))
+
+# Unified cleaner: keeps backwards compatibility (guest_msg optional)
+def clean_ai_reply(text: str, guest_msg: Optional[str] = None, ctx: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Gentle normalizer + light tone fixes:
+    - Normalize punctuation, trim placeholders, remove sign-offs/boilerplate.
+    - Apply contractions, tidy whitespace.
+    - If guest_msg provided: allow brief apologies only when an issue is detected.
+    - Keep <= ~3 sentences when long.
+    """
+    if not isinstance(text, str):
+        return ""
+    s = text
+
+    # Remove obvious placeholders/template artifacts
+    s = re.sub(r"\[[^\]]+\]", "", s)
+    s = re.sub(r"\{[^}]+\}", "", s)
+
+    # Smart punctuation & invisible spaces
+    s = s.translate(str.maketrans({
+        "–": "—", "‒": "—",
+        "“": '"', "”": '"', "„": '"',
+        "’": "'", "‘": "'",
+        "…": "...",
+        "\u00A0": " ", "\u2009": " ", "\u200A": " ", "\u202F": " ",
+        "\u200B": "", "\u2060": "", "\uFEFF": "",
+    }))
+
+    # Spacing & list detection
+    is_listy = bool(re.search(r"(^|\n)\s*[-•]\s+", s))
+    s = re.sub(r"\s*—\s*", " — ", s)
+    if not is_listy:
+        s = re.sub(r"(?<!\d)\.(?!\d)\s*", ". ", s)
+        s = re.sub(r"(?<!\d),(?!\d)\s*", ", ", s)
+        s = re.sub(r"\s*([!?;:])\s*", r"\1 ", s)
+        s = re.sub(r"\s{2,}", " ", s)
+    else:
+        s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r" \n", "\n", s)
+
+    # Remove sign-offs and banned boilerplate
+    for bad in [r"\bBest regards,?", r"\bBest,?", r"\bSincerely,?", r"\bAll the best,?", r"\bCheers,?", r"\bKind regards,?"]:
+        s = re.sub(bad, "", s, flags=re.IGNORECASE)
+    low = s.lower()
+    for p in BANNED_PHRASES:
+        idx = low.find(p)
+        if idx != -1:
+            s = s[:idx].strip()
+            break
+
+    # Tone tweaks with context (optional)
+    issue = _looks_like_issue(guest_msg or "") or _guest_is_upset(guest_msg or "")
+    if not issue:
+        s = re.sub(r"(?i)\bwe\s+apologize\b", "Sorry", s)
+        s = re.sub(r"(?i)\bper\s+our\s+policy\b", "As a heads-up", s)
+
+    # Trim to ~3 sentences when very long
+    parts = re.split(r"(?<=[.!?])\s+", s)
+    if len(parts) > 3 and not is_listy:
+        s = " ".join(parts[:3]).strip()
+
+    # Final tidy
+    s = _apply_contractions(s)
+    s = s.replace(" ,", ",").replace(" .", ".").strip()
+    if not is_listy:
+        s = s.rstrip(". ").strip()
+    return s
+
+# Dining strip for off-topic messages
+DINING_WORDS = re.compile(r"\b(restaurant|restaurants|eat|dinner|lunch|breakfast|coffee|cafe|caf\u00e9|bar|brewery|bistro)\b", re.I)
+BLOCKING_TOPICS = re.compile(r"\b(trash|garbage|bin[s]?|dumpster|disabled|wheelchair|elevator|accessib|ramp|portal|code|lock|door\s*code|check[- ]?in|check[- ]?out|parking|park|driveway|garage)\b", re.I)
+DINING_BULLET  = re.compile(r"(?im)^\s*[-•]\s.*\b(restaurant|breakfast|coffee|cafe|bar|brewery|bistro|pizza|taco|sushi|steak|italian|thai|mexican)\b.*$")
+
+def sanitize_ai_reply(reply: str, guest_msg: str) -> str:
+    if not reply:
+        return reply
+    r = reply.strip()
+    g = (guest_msg or "").lower()
+
+    # 1) Block dining when guest asked ops/safety topics
+    if BLOCKING_TOPICS.search(g):
+        r = re.sub(DINING_BULLET, "", r).strip()
+        r = re.sub(r"(?is)\b(nearby|local)\s+(picks|spots|places)\b.*?$", "", r).strip()
+
+    # 2) If dining bullets exist but guest didn’t ask dining, drop them
+    if DINING_BULLET.search(r) and not DINING_WORDS.search(g):
+        r = re.sub(DINING_BULLET, "", r).strip()
+
+    # 3) Block unprompted apologies / cleaner offer unless an issue
+    if not _looks_like_issue(guest_msg):
+        r = re.sub(r"(?is)\b(i\s*am|i'?m|we\s*are|we'?re)\s*sorry\b.*?(?:[.!?\n]|$)", "", r).strip()
+        kept = []
+        for line in r.splitlines():
+            if re.search(r"(?i)(send|schedule|have)\s+(?:the\s+)?(cleaner|housekeep|maid|cleaning)\b", line):
+                continue
+            kept.append(line)
+        r = "\n".join(kept).strip()
+
+    r = re.sub(r"\n{3,}", "\n\n", r).strip()
+    return r
+
+# --------------------------- make_suggested_reply ---------------------------
 
 def make_suggested_reply(guest_message: str, context: Dict[str, Any]) -> Tuple[str, str]:
     """
     Returns (reply_text, detected_intent).
-    - Routes the message to get an intent
-    - Optionally fetches local POIs if intent == 'food_recs'
-    - Calls OpenAI with strict guardrails
-    - Normalizes & sanitizes reply
     """
-    # 1) Route
     routing = route_message(guest_message)
     intent: str = routing.get("primary_intent", "other")
 
-    # 2) Only allow POI injection for food_recs
+    # Local POIs only for food_recs; handle multiple signatures of build_local_recs
     local_recs: List[Dict[str, Any]] = []
     try:
         if intent == "food_recs" and should_fetch_local_recs(guest_message):
-            lat = (context.get("location") or {}).get("lat")
-            lng = (context.get("location") or {}).get("lng")
+            loc = (context.get("location") or {})
+            lat = loc.get("lat"); lng = loc.get("lng")
             if lat is not None and lng is not None:
-                # build_local_recs signature varies by your file; this is the common one:
-                local_recs = build_local_recs(lat, lng, guest_message)[:4]
+                try:
+                    # common signature #1: (coords_dict [, limit])
+                    local_recs = build_local_recs({"lat": lat, "lng": lng}, 4) or []
+                except TypeError:
+                    try:
+                        # alt signature #2: (lat, lng, query) -> list
+                        local_recs = (build_local_recs(lat, lng, guest_message) or [])[:4]
+                    except Exception:
+                        local_recs = []
     except Exception as e:
         logging.warning(f"[make_suggested_reply] local recs failed: {e}")
         local_recs = []
 
-    # 3) Draft with strict guardrails
     sys = (
         "You write short replies to guests for a vacation rental. "
         "ALWAYS read the entire message; do not fixate on a single keyword. "
-        "If the message mentions trash or accessibility, address that first. "
-        "If two actionable items exist, address both briefly. "
-        "Do not pivot to unrelated topics. No greetings, no sign-offs, no emojis. "
+        "If the message mentions trash, access, parking, or safety—answer that first. "
+        "Address multiple actionable items briefly. No greetings, no sign-offs, no emojis. "
         "Be concrete and concise."
     )
-    facts = {
-        "intent": intent,
-        "recs_count": len(local_recs),
-        "recs": local_recs,
-    }
+    facts = {"intent": intent, "recs_count": len(local_recs), "recs": local_recs}
     user = (
         f"GUEST_MESSAGE:\n{guest_message}\n\n"
         f"FACTS_JSON:\n{json.dumps(facts, ensure_ascii=False)}\n\n"
-        "Write the reply text ONLY (no labels). Use bullets only if listing steps or multiple options."
+        "Write the reply text ONLY (no labels). Use bullets only for steps or multiple options."
     )
 
     reply_text = ""
@@ -161,7 +292,6 @@ def make_suggested_reply(guest_message: str, context: Dict[str, Any]) -> Tuple[s
         except Exception as e:
             logging.error(f"[make_suggested_reply] OpenAI error: {e}")
 
-    # Heuristic fallback if model failed/disabled
     if not reply_text:
         if intent == "trash_help":
             reply_text = (
@@ -189,42 +319,16 @@ def make_suggested_reply(guest_message: str, context: Dict[str, Any]) -> Tuple[s
         else:
             reply_text = "Got it—happy to help. Can you share a bit more detail so I can point you the right way?"
 
-    # Final tidy & guardrails
-    reply_text = normalize_ai_text(reply_text)
+    # Final tidy & guardrails (guest_message passed!)
+    reply_text = clean_ai_reply(reply_text, guest_message)
     reply_text = sanitize_ai_reply(reply_text, guest_message)
-
     return reply_text, intent
-
-
-# --------------------------- Access / Policy extractors ---------------------------
-
-def can_share_access(meta: dict, today: Optional[_date] = None) -> bool:
-    """
-    Only allow sharing access codes for confirmed bookings (new/modified)
-    and within a short window before check-in (<= 2 days by default).
-    """
-    today = today or _date.today()
-    status = (meta.get("reservation_status") or "").strip().lower()
-    if status not in {"new", "modified"}:
-        return False
-
-    ci_raw = meta.get("check_in")
-    if not ci_raw:
-        return False
-    try:
-        ci = _date.fromisoformat(str(ci_raw)[:10])
-    except Exception:
-        return False
-
-    return (ci - today).days <= 2
-
 
 # --------------------------- Hostaway auth/cache ---------------------------
 
 _HOSTAWAY_TOKEN_CACHE: Dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 
 def get_hostaway_access_token() -> Optional[str]:
-    global _HOSTAWAY_TOKEN_CACHE
     now = time.time()
     if _HOSTAWAY_TOKEN_CACHE["access_token"] and now < _HOSTAWAY_TOKEN_CACHE["expires_at"]:
         return _HOSTAWAY_TOKEN_CACHE["access_token"]
@@ -247,7 +351,6 @@ def get_hostaway_access_token() -> Optional[str]:
     except Exception as e:
         logging.error(f"❌ Hostaway token error: {e}")
         return None
-
 
 # --------------------------- Hostaway API helpers ---------------------------
 
@@ -324,8 +427,7 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_
         logging.error(f"❌ Send error: {e}")
         return False
 
-
-# --------------------------- Google Places / Distance ---------------------------
+# --------------------------- Distance helpers (kept) ---------------------------
 
 DISTANCE_TRIGGERS = [
     "how far", "distance to", "distance from", "how long to", "drive to",
@@ -352,7 +454,7 @@ def resolve_place_textsearch(query: str, lat: Optional[float] = None, lng: Optio
     params: Dict[str, Any] = {"key": GOOGLE_API_KEY, "query": query}
     if lat and lng:
         params["location"] = f"{lat},{lng}"
-        params["radius"] = 30000  # bias within ~30km
+        params["radius"] = 30000
     try:
         resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
@@ -395,252 +497,6 @@ def get_distance_drive_time(origin_lat: float, origin_lng: float, destination: s
     except Exception as e:
         logging.error(f"[DISTANCE] Matrix error: {e}")
         return f"Sorry, there was a problem calculating distance to {destination}."
-
-def haversine_fallback_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    from math import radians, sin, cos, asin, sqrt
-    R = 6371.0
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    return 2 * R * asin(sqrt(a))
-
-def detect_place_type(msg: str) -> Tuple[Optional[str], Optional[str]]:
-    mapping = {
-        "restaurant": "restaurant", "restaurants": "restaurant",
-        "bar": "bar", "bars": "bar",
-        "club": "night_club", "clubs": "night_club",
-        "grocery": "supermarket", "supermarket": "supermarket",
-        "shopping": "shopping_mall",
-        "things to do": "tourist_attraction",
-        "coffee": "cafe",
-        "breakfast": "restaurant", "lunch": "restaurant", "dinner": "restaurant",
-        "liquor": "liquor_store",
-    }
-    msgl = (msg or "").lower()
-    for k, v in mapping.items():
-        if k in msgl:
-            return v, k
-    return None, None
-
-def search_google_places(query: str, lat: Optional[float], lng: Optional[float], radius: int = 4000, type_hint: Optional[str] = None) -> List[Dict[str, Any]]:
-    if not (GOOGLE_API_KEY and lat and lng):
-        return []
-    endpoint = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    params: Dict[str, Any] = {"key": GOOGLE_API_KEY, "location": f"{lat},{lng}", "radius": radius, "keyword": query}
-    VALID_TYPES = {"restaurant", "bar", "night_club", "supermarket", "shopping_mall", "tourist_attraction", "cafe", "liquor_store"}
-    if type_hint in VALID_TYPES:
-        params["type"] = type_hint
-    try:
-        resp = requests.get(endpoint, params=params, timeout=10)
-        resp.raise_for_status()
-        results = resp.json().get("results", [])[:5]
-        return [{"name": r.get("name"), "address": r.get("vicinity"), "rating": r.get("rating")} for r in results]
-    except Exception as e:
-        logging.error(f"[PLACES] Nearby error: {e}")
-        return []
-
-def build_places_summary_block(places: List[Dict[str, Any]], query: Optional[str] = None) -> str:
-    if not places:
-        return ""
-    lines = []
-    if query:
-        lines.append(f"Search results for '{query}':")
-    for p in places:
-        if p.get("rating"):
-            lines.append(f"- {p['name']} ({p['address']}, rating {p['rating']})")
-        else:
-            lines.append(f"- {p['name']} ({p['address']})")
-    return "\n".join(lines)
-
-
-# --------------------------- Text normalization ---------------------------
-
-BANNED_PHRASES = [
-    "thank you for your patience",
-    "we apologize for any inconvenience",
-    "kindly note",
-    "please be advised",
-    "sincerely,",
-    "best regards",
-]
-
-_CONTRACTIONS = [
-    (r"\bdo not\b", "don't"),
-    (r"\bdoes not\b", "doesn't"),
-    (r"\bdid not\b", "didn't"),
-    (r"\bit is\b", "it's"),
-    (r"\bwe are\b", "we're"),
-    (r"\bwe will\b", "we'll"),
-    (r"\bwe have\b", "we've"),
-    (r"\byou are\b", "you're"),
-    (r"\bthat is\b", "that's"),
-    (r"\bthere is\b", "there's"),
-    (r"\bI will\b", "I'll"),
-    (r"\bI have\b", "I've"),
-    (r"\bcannot\b", "can't"),
-]
-
-def _preserve_case(src: str, repl: str) -> str:
-    return repl[:1].upper() + repl[1:] if src[:1].isupper() else repl
-
-def _apply_contractions(txt: str) -> str:
-    s = txt
-    for pattern, repl in _CONTRACTIONS:
-        s = re.sub(pattern, lambda m: _preserve_case(m.group(0), repl), s, flags=re.IGNORECASE)
-    return s
-
-def normalize_ai_text(text: str) -> str:
-    """
-    Gentle normalizer for AI drafts:
-    - Normalize smart punctuation & invisible spaces.
-    - Keep lists intact; light spacing around punctuation.
-    - Remove sign-offs and banned boilerplate.
-    - Apply contractions.
-    - Avoid semantic changes.
-    """
-    if not isinstance(text, str):
-        return ""
-
-    s = text.translate(str.maketrans({
-        "–": "—", "‒": "—",
-        "“": '"', "”": '"', "„": '"',
-        "’": "'", "‘": "'",
-        "…": "...",
-        "\u00A0": " ", "\u2009": " ", "\u200A": " ", "\u202F": " ",
-        "\u200B": "", "\u2060": "", "\uFEFF": "",
-    }))
-
-    is_listy = bool(re.search(r"(^|\n)\s*[-•]\s+", s))
-    s = re.sub(r"\s*—\s*", " — ", s)
-
-    if not is_listy:
-        s = re.sub(r"(?<!\d)\.(?!\d)\s*", ". ", s)   # periods not in decimals
-        s = re.sub(r"(?<!\d),(?!\d)\s*", ", ", s)    # commas not in thousands
-        s = re.sub(r"\s*([!?;:])\s*", r"\1 ", s)
-        s = re.sub(r"\s{2,}", " ", s)
-    else:
-        s = re.sub(r"[ \t]+", " ", s)
-
-    s = re.sub(r" \n", "\n", s)
-
-    for bad in [r"\bBest regards,?", r"\bBest,?", r"\bSincerely,?", r"\bAll the best,?", r"\bCheers,?", r"\bKind regards,?"]:
-        s = re.sub(bad, "", s, flags=re.IGNORECASE)
-
-    low = s.lower()
-    for p in BANNED_PHRASES:
-        idx = low.find(p)
-        if idx != -1:
-            s = s[:idx].strip()
-            break
-
-    s = _apply_contractions(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    if not is_listy:
-        s = s.rstrip(". ").strip()
-    return s
-
-
-# --------------------------- Reply sanitizer (context-aware) ---------------------------
-
-_ISSUE_TRIGGERS = [
-    "dirty", "unclean", "mess", "messy", "bugs", "roaches", "ants", "mold",
-    "leak", "broken", "smell", "stain", "hair", "not clean", "cleaning issue",
-    "trash", "disgust", "filthy", "soiled",
-]
-
-def _looks_like_issue(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in _ISSUE_TRIGGERS)
-
-def _looks_informational(text: str) -> bool:
-    """
-    True if guest is just stating plans or excitement, not asking for anything.
-    Heuristic only; we DO NOT change content based on this in sanitizer anymore.
-    """
-    t = (text or "").strip().lower()
-    if "?" in t:
-        return False
-    if any(kw in t for kw in ["can you", "could you", "please", "send", "need", "what time", "how do", "where do"]):
-        return False
-    return True
-
-# --- Off-topic dining heuristics (add near your other regex constants) ---
-DINING_WORDS = re.compile(r"\b(restaurant|restaurants|eat|dinner|lunch|breakfast|coffee|cafe|caf\u00e9|bar|brewery|bistro)\b", re.I)
-BLOCKING_TOPICS = re.compile(r"\b(trash|garbage|bin[s]?|dumpster|disabled|wheelchair|elevator|accessib|ramp|portal|code|lock|door\s*code|check[- ]?in|check[- ]?out|parking|park|driveway|garage)\b", re.I)
-# Bullet lines that look like local recs (begin with -/• and contain dining words)
-DINING_BULLET = re.compile(r"(?im)^\s*[-•]\s.*\b(restaurant|breakfast|coffee|cafe|bar|brewery|bistro|pizza|taco|sushi|steak|italian|thai|mexican)\b.*$")
-
-def sanitize_ai_reply(reply: str, guest_msg: str) -> str:
-    """
-    Conservative scrub, layered:
-      1) If the guest asked about a *blocking* operational topic (trash, access, parking, etc.),
-         strip dining bullets and dining-y filler from the reply.
-      2) If the reply contains bulleted dining recs but the guest didn't mention dining at all,
-         strip just those dining bullets.
-      3) Remove unprompted apologies & cleaner offers when the guest didn't report an issue.
-      4) Whitespace tidy.
-    Never inject new content; only remove.
-    """
-    if not reply:
-        return reply
-
-    r = reply.strip()
-    g = (guest_msg or "").lower()
-
-    # --- 1) Block dining when the guest asked an operational question ---
-    if BLOCKING_TOPICS.search(g):
-        # remove dining-looking bullet lines
-        r = re.sub(DINING_BULLET, "", r).strip()
-        # remove short “nearby picks” one-liners
-        r = re.sub(r"(?is)\b(nearby|local)\s+(picks|spots|places)\b.*?$", "", r).strip()
-
-    # --- 2) If reply has dining bullets but guest didn't ask about dining, drop them ---
-    if DINING_BULLET.search(r) and not DINING_WORDS.search(g):
-        r = re.sub(DINING_BULLET, "", r).strip()
-
-    # Block unprompted apologies
-    if not _looks_like_issue(guest_msg):
-        r = re.sub(r"(?is)\b(i\s*am|i'?m|we\s*are|we'?re)\s*sorry\b.*?(?:[.!?\n]|$)", "", r).strip()
-
-    # Block unprompted cleaner offers
-    if not _looks_like_issue(guest_msg):
-        kept = []
-        for line in r.splitlines():
-            if re.search(r"(?i)(send|schedule|have)\s+(?:the\s+)?(cleaner|housekeep|maid|cleaning)\b", line):
-                continue
-            kept.append(line)
-        r = "\n".join(kept).strip()
-
-    # --- 4) Gentle whitespace tidy ---
-    r = re.sub(r"\n{3,}", "\n\n", r).strip()
-    return r
-
-# Optional: if you still want a context-aware cleaner callable elsewhere (not used by make_suggested_reply)
-def contextual_clean_ai_reply(reply: str, guest_msg: str, ctx: Optional[Dict[str, Any]] = None) -> str:
-    """
-    Backward/optional: placeholders removal + brief tone tweaks + cap sentences (≤3).
-    Prefer using: normalize_ai_text(...) then sanitize_ai_reply(...).
-    """
-    r = (reply or "").strip()
-    # Hard bans: placeholders / braces
-    r = re.sub(r"\[[^\]]+\]", "", r)
-    r = re.sub(r"\{[^}]+\}", "", r)
-    r = re.sub(r"\s{2,}", " ", r).strip()
-
-    issue = _looks_like_issue(guest_msg)
-    if not issue:
-        r = re.sub(r"(?i)\bwe\s+apologize\b", "Sorry", r)
-        r = re.sub(r"(?i)\bper\s+our\s+policy\b", "As a heads-up", r)
-
-    # Collapse to ~3 sentences max
-    parts = re.split(r"(?<=[.!?])\s+", r)
-    if len(parts) > 3:
-        r = " ".join(parts[:3]).strip()
-
-    # Clean spacing artifacts
-    r = r.replace(" ,", ",").replace(" .", ".").strip()
-    return r
-
 
 # --------------------------- Learning DB ---------------------------
 
@@ -757,7 +613,6 @@ def retrieve_learned_answer(guest_message: str, listing_id: Any, guest_id: Optio
         logging.error(f"❌ Retrieval error: {e}")
         return None
 
-
 # --------------------------- Optional intent (OpenAI) ---------------------------
 
 INTENT_LABELS = [
@@ -774,9 +629,6 @@ INTENT_LABELS = [
 ]
 
 def detect_intent(message: str) -> str:
-    """
-    Simple classifier using OpenAI; returns one of INTENT_LABELS (lowercased), or 'other' on failure.
-    """
     if not openai_client:
         return "other"
     system_prompt = (
