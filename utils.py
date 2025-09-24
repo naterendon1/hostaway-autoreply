@@ -250,18 +250,11 @@ def make_suggested_reply(guest_message: str, context: Dict[str, Any]) -> Tuple[s
     local_recs: List[Dict[str, Any]] = []
     try:
         if intent == "food_recs" and should_fetch_local_recs(guest_message):
-            loc = (context.get("location") or {})
-            lat = loc.get("lat"); lng = loc.get("lng")
+            lat = (context.get("location") or {}).get("lat")
+            lng = (context.get("location") or {}).get("lng")
             if lat is not None and lng is not None:
-                try:
-                    # common signature #1: (coords_dict [, limit])
-                    local_recs = build_local_recs({"lat": lat, "lng": lng}, 4) or []
-                except TypeError:
-                    try:
-                        # alt signature #2: (lat, lng, query) -> list
-                        local_recs = (build_local_recs(lat, lng, guest_message) or [])[:4]
-                    except Exception:
-                        local_recs = []
+                # FIX: build_local_recs signature (no max_results kw)
+                local_recs = build_local_recs(lat, lng, guest_message)[:4]
     except Exception as e:
         logging.warning(f"[make_suggested_reply] local recs failed: {e}")
         local_recs = []
