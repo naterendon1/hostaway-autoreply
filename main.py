@@ -10,7 +10,6 @@ from datetime import date, datetime
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Body
 from pydantic import BaseModel
 
-# AI switch (smart/legacy)
 from ai_switch import get_ai_reply
 
 from slack_sdk import WebClient
@@ -47,13 +46,13 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-token")
 SHOW_NEW_GUEST_TAG = os.getenv("SHOW_NEW_GUEST_TAG", "0") in ("1", "true", "True", "yes", "YES")
 DEBUG_CONVERSATION = os.getenv("DEBUG_CONVERSATION", "0") in ("1", "true", "True", "yes", "YES")
-SLACK_SKIP_READS = os.getenv("SLACK_SKIP_READS", "1") in ("1", "true", "True", "yes", "YES")  # default: no read scopes
+SLACK_SKIP_READS = os.getenv("SLACK_SKIP_READS", "1") in ("1", "true", "True", "yes", "YES")
 
 REQUIRED_ENV_VARS = [
     "HOSTAWAY_CLIENT_ID",
     "HOSTAWAY_CLIENT_SECRET",
     "OPENAI_API_KEY",
-    "SLACK_CHANNEL",        # MUST be channel ID: C…/G…
+    "SLACK_CHANNEL",
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
 ]
@@ -73,17 +72,13 @@ def _ensure_bot_in_channel(client: WebClient, channel_id: str) -> None:
     try:
         client.conversations_join(channel=channel_id)
     except SlackApiError:
-        pass  # private or already joined
+        pass
 
 def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, Any]], text: str) -> bool:
-    """
-    Post only when we have a Slack channel ID (no read scopes).
-    """
     chan_id = (_SLACK_CHANNEL_ID or (channel_hint or "").strip())
     if not _hint_is_id(chan_id):
         logging.error(
-            "SLACK_CHANNEL must be a Slack channel ID (starts with 'C' or 'G'). "
-            "Current value=%r. Fix: set SLACK_CHANNEL to the Channel ID from Slack → Channel details → About → Channel ID.",
+            "SLACK_CHANNEL must be a Slack channel ID (starts with 'C' or 'G'). Current=%r.",
             channel_hint,
         )
         return False
@@ -101,23 +96,21 @@ def _post_to_slack(client: WebClient, channel_hint: str, blocks: List[Dict[str, 
                 logging.error(f"Slack retry failed: {getattr(e2, 'response', {}).data if hasattr(e2,'response') else e2}")
                 return False
         if err == "channel_not_found":
-            logging.error("Slack error channel_not_found. Verify channel ID and workspace.")
+            logging.error("Slack error channel_not_found.")
             return False
         if err == "is_archived":
             logging.error("Slack channel is archived.")
             return False
         if err == "rate_limited":
             retry_after = 1
-            try:
-                retry_after = int(e.response.headers.get("Retry-After", "1"))
-            except Exception:
-                pass
+            try: retry_after = int(e.response.headers.get("Retry-After","1"))
+            except Exception: pass
             time.sleep(max(retry_after, 1))
             try:
                 client.chat_postMessage(channel=chan_id, blocks=blocks, text=text)
                 return True
             except SlackApiError as e3:
-                logging.error(f"Slack rate-limit retry failed: {getattr(e3, 'response', {}).data if hasattr(e3,'response') else e3}")
+                logging.error(f"Slack rate-limit retry failed: {getattr(e3,'response', {}).data if hasattr(e3,'response') else e3}")
                 return False
         logging.error(f"Slack send error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}")
         return False
@@ -497,7 +490,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     listing_obj = fetch_hostaway_listing(listing_id)
     listing_result = (listing_obj or {}).get("result", {}) or {}
 
-    # Amenity index (normalized) for AI use
     try:
         from amenities_index import AmenitiesIndex
         amen_index = AmenitiesIndex(listing_result)
@@ -508,7 +500,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
             def to_api(self): return {}
         amen_index = _NullIdx()
 
-    # Address string
     addr_raw = listing_result.get("address") or "Address unavailable"
     if isinstance(addr_raw, dict):
         property_address = (
@@ -518,7 +509,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     else:
         property_address = str(addr_raw)
 
-    # Preserve lat/lng and tz
     lat = listing_result.get("latitude") or listing_result.get("lat")
     lng = listing_result.get("longitude") or listing_result.get("lng")
     listing_cfg = load_listing_config(listing_id)
@@ -528,18 +518,21 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     access = extract_access_details(listing_obj, reservation)
     pet_policy = extract_pet_policy(listing_obj)
 
-    # Optional nearby recs
+    # Optional nearby recs (no max_results kw)
     nearby_recs = None
     try:
         if should_fetch_local_recs(guest_msg) and lat and lng:
             try:
-                nearby_recs = build_local_recs({"lat": lat, "lng": lng}, 5)  # try (coords, limit)
+                nearby_recs = build_local_recs({"lat": lat, "lng": lng})
             except TypeError:
-                nearby_recs = build_local_recs({"lat": lat, "lng": lng})    # fallback (coords-only)
+                # alt signatures
+                try:
+                    nearby_recs = build_local_recs(lat, lng)
+                except Exception:
+                    nearby_recs = []
     except Exception as e:
         logging.warning("Nearby recs fetch failed: %s", e)
 
-    # ---------- META FOR AI ----------
     property_profile = {"checkin_time":"4:00 PM","checkout_time":"11:00 AM"}
     policies = {
         "pets_allowed": pet_policy.get("pets_allowed"),
@@ -579,11 +572,36 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "location": {"lat": lat, "lng": lng},
         "nearby": {"items": nearby_recs or []},
     }
+
+    def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
+        out = dict(meta)
+        prof = dict(out.get("property_profile") or {})
+        if isinstance(cfg.get("property_profile"), dict):
+            prof.update({k: v for k, v in cfg["property_profile"].items() if v is not None})
+        out["property_profile"] = prof
+        pol = dict(out.get("policies") or {})
+        if isinstance(cfg.get("policies"), dict):
+            pol.update({k: v for k, v in cfg["policies"].items() if v is not None})
+        if "pets_allowed" in cfg:
+            pol["pets_allowed"] = cfg.get("pets_allowed")
+        out["policies"] = pol
+        acc = dict(out.get("access") or {})
+        if isinstance(cfg.get("access_and_arrival"), dict):
+            for k, v in cfg["access_and_arrival"].items():
+                if v is not None:
+                    acc[k] = v
+        out["access"] = acc
+        if isinstance(cfg.get("house_rules"), dict): out["house_rules"] = cfg["house_rules"]
+        if isinstance(cfg.get("amenities_and_quirks"), dict): out["amenities_and_quirks"] = cfg["amenities_and_quirks"]
+        if isinstance(cfg.get("safety_and_emergencies"), dict): out["safety_and_emergencies"] = cfg["safety_and_emergencies"]
+        if isinstance(cfg.get("core_identity"), dict): out["core_identity"] = cfg["core_identity"]
+        if isinstance(cfg.get("upsells"), dict): out["upsells"] = cfg["upsells"]
+        return out
+
     meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
 
     context_for_reply = {"location": {"lat": lat, "lng": lng}}
 
-    # ---------- AI REPLY (smart/legacy switch) ----------
     final_reply, detected_intent = get_ai_reply(
         guest_message=guest_msg,
         context_for_reply=context_for_reply,
@@ -595,9 +613,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         meta_for_ai=meta_for_ai,
         conversation_id=str(conv_id) if conv_id else None,
     )
-    ai_reply = final_reply  # <<< IMPORTANT: use this name throughout below
+    ai_reply = final_reply  # IMPORTANT
 
-    # ---------- LOGGING ----------
     try:
         log_ai_exchange(
             conversation_id=str(conv_id) if conv_id else None,
@@ -615,7 +632,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     except Exception as e:
         logging.warning(f"ai exchange logging failed: {e}")
 
-    # ---------- SLACK MESSAGE ----------
     us_check_in = format_us_date(check_in); us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
 
@@ -631,7 +647,8 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     logging.info("button_meta: %s", json.dumps(button_meta, indent=2))
 
     header_text = (
-        f"*{channel_pretty} message* from *{guest_name}*{returning_tag}\n"
+        f"*{channel_pretty} message* from *{guest_name}*"
+        f"{' • Returning guest!' if guest_email and guest_email.strip() else ''}\n"
         f"Property: *{property_address}*\n"
         f"Dates: *{us_check_in} → {us_check_out}*\n"
         f"Guests: *{guest_count}* | Res: *{res_status_pretty}* | Price: *{total_price_str}*"
@@ -659,7 +676,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     ])
 
     blocks = [
-        header_block,
+        {"type":"section","text":{"type":"mrkdwn","text": header_text}},
         {"type":"section","text":{"type":"mrkdwn","text": f"> {guest_msg}"}},
         {"type":"section","text":{"type":"mrkdwn","text": f"*Suggested Reply:*\n>{ai_reply}"}},
         {"type":"context","elements":[{"type":"mrkdwn","text": f"*Intent:* {detected_intent}  •  *Trip:* {phase}  •  *Msg:* {msg_status}"}]},
@@ -688,9 +705,9 @@ def _startup() -> None:
         logging.info("Using SLACK_CHANNEL as ID: %s", _SLACK_CHANNEL_ID)
     else:
         if SLACK_SKIP_READS:
-            logging.error("SLACK_CHANNEL is a name but reads are disabled. Set SLACK_CHANNEL to the Channel ID (C…/G…).")
+            logging.error("SLACK_CHANNEL is a name but reads are disabled. Set it to the Channel ID (C…/G…).")
         else:
-            logging.info("SLACK_SKIP_READS is off, but name-based resolution is disabled in this build. Provide a Channel ID.")
+            logging.info("SLACK_SKIP_READS is off; name-based resolution disabled in this build. Provide a Channel ID.")
 
 @app.get("/ping")
 def ping():
