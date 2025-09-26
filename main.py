@@ -10,7 +10,7 @@ from datetime import date, datetime
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Body
 from pydantic import BaseModel
 
-from ai_switch import get_ai_reply
+from smart_intel import generate_reply
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -602,18 +602,23 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     context_for_reply = {"location": {"lat": lat, "lng": lng}}
 
-    final_reply, detected_intent = get_ai_reply(
-        guest_message=guest_msg,
-        context_for_reply=context_for_reply,
-        history=[
-            {"role":"guest" if m.get("isIncoming") else "host", "text": m.get("body","")}
+# --- Build context for generate_reply ---
+    context_dict = {
+        "guest_name": guest_name,
+        "check_in_date": check_in,
+        "check_out_date": check_out,
+        "listing_info": meta_for_ai,  # includes property, policies, etc.
+        "reservation": res,
+        "history": [
+            {"role": "guest" if m.get("isIncoming") else "host", "text": m.get("body", "")}
             for m in (convo_res.get("conversationMessages") or [])[-MAX_THREAD_MESSAGES:]
             if m.get("body")
-        ],
-        meta_for_ai=meta_for_ai,
-        conversation_id=str(conv_id) if conv_id else None,
-    )
-    ai_reply = final_reply  # IMPORTANT
+        ]
+    }
+
+# --- Generate AI reply using smart_intel.py ---
+ai_reply = generate_reply(guest_msg, context_dict)
+detected_intent = "general"  # Or null/empty for now unless you later add intent detection
 
     try:
         log_ai_exchange(
