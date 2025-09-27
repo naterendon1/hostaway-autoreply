@@ -2,18 +2,17 @@ import os
 import json
 import logging
 from typing import Optional, Dict, Any, List
+from slack_sdk import WebClient
 from datetime import datetime
-from places import build_local_recs, should_fetch_local_recs
-
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-from slack_sdk import WebClient
 
+from slack_interactivity import router as slack_router
 from smart_intel import generate_reply
 from utils import fetch_hostaway_listing, fetch_hostaway_reservation, fetch_hostaway_conversation
 from db import already_processed, mark_processed, log_ai_exchange
-from slack_interactivity import router as slack_router
+from places import build_local_recs, should_fetch_local_recs  # ✅ NEW
 
 app = FastAPI()
 
@@ -66,7 +65,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     reservation_id = data.get("reservationId")
     listing_id = data.get("listingMapId")
 
-    # Fetch context
+    # Fetch context from Hostaway
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res_data = reservation.get("result", {})
     guest_name = res_data.get("guestFirstName", "Guest")
@@ -98,14 +97,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "house_rules": listing_data.get("houseRules"),
     }
 
-    # Google-powered nearby places
+    # ✅ Google-powered nearby places
     lat = listing_data.get("lat")
     lng = listing_data.get("lng")
-
     nearby_places = []
     if should_fetch_local_recs(guest_message):
         nearby_places = build_local_recs(lat, lng, guest_message)
 
+    # Context for AI
     context = {
         "guest_name": guest_name,
         "check_in_date": check_in,
@@ -113,9 +112,10 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "listing_info": structured_listing_info,
         "reservation": res_data,
         "history": history,
-        "nearby_places": nearby_places
+        "nearby_places": nearby_places  # ✅ Pass to AI
     }
 
+    # Generate AI reply
     ai_reply = generate_reply(guest_message, context)
     log_ai_exchange(
         conversation_id=str(conv_id),
@@ -124,7 +124,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         intent="general"
     )
 
-    # Format Slack display values
+    # Format Slack message
     checkin_fmt = datetime.strptime(check_in, "%Y-%m-%d").strftime("%m-%d-%Y") if check_in else "N/A"
     checkout_fmt = datetime.strptime(check_out, "%Y-%m-%d").strftime("%m-%d-%Y") if check_out else "N/A"
 
@@ -134,23 +134,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     guest_count = res_data.get("numberOfGuests") or res_data.get("adults") or "?"
     platform = res_data.get("platform", "Unknown")
     property_name = listing_data.get("name") or listing_data.get("internalListingName") or "Unknown Property"
-
-    meta_payload = {
-        "conv_id": conv_id,
-        "guest_message": guest_message,
-        "guest_name": guest_name,
-        "reply": ai_reply,
-        "ai_suggestion": ai_reply,
-        "type": "email",
-        "status": res_data.get("status", "N/A"),
-        "check_in": checkin_fmt,
-        "check_out": checkout_fmt,
-        "guest_count": guest_count,
-        "channel_pretty": platform,
-        "property_address": structured_listing_info["address"],
-        "listing_id": listing_id,
-        "guest_id": res_data.get("guestId"),
-    }
 
     blocks = [
         {
@@ -182,24 +165,45 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send"},
                     "style": "primary",
-                    "action_id": "send",  # matches slack_interactivity.py
-                    "value": json.dumps(meta_payload)
+                    "action_id": "send",  # ✅ matches slack_interactivity
+                    "value": json.dumps({
+                        "conv_id": conv_id,
+                        "guest_message": guest_message,
+                        "ai_suggestion": ai_reply,
+                        "listing_id": listing_id,
+                        "guest_name": guest_name,
+                        "status": res_data.get("status", "N/A"),
+                        "check_in": checkin_fmt,
+                        "check_out": checkout_fmt,
+                        "guest_count": guest_count,
+                        "property_address": listing_data.get("address"),
+                    })
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Edit"},
-                    "action_id": "edit",  # matches slack_interactivity.py
-                    "value": json.dumps(meta_payload)
+                    "action_id": "edit",
+                    "value": json.dumps({
+                        "guest_name": guest_name,
+                        "guest_message": guest_message,
+                        "ai_suggestion": ai_reply,
+                        "listing_id": listing_id,
+                        "conv_id": conv_id,
+                        "status": res_data.get("status", "N/A"),
+                        "check_in": checkin_fmt,
+                        "check_out": checkout_fmt,
+                        "guest_count": guest_count,
+                        "property_address": listing_data.get("address"),
+                    })
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send Guest Portal"},
-                    "action_id": "send_guest_portal",  # matches slack_interactivity.py
+                    "action_id": "send_guest_portal",
                     "value": json.dumps({
                         "conv_id": conv_id,
-                        "guest_portal_url": res_data.get("guestPortalUrl"),
                         "status": res_data.get("status", "N/A"),
-                        "channel": SLACK_CHANNEL,
+                        "guest_portal_url": res_data.get("guestPortalUrl")
                     })
                 }
             ]
