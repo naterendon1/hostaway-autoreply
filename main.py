@@ -666,8 +666,9 @@ except Exception as e:
         logging.error("Slack post failed; marked processed to avoid retries. Check SLACK_CHANNEL and bot membership.")
         return {"status": "ok"}
 
-        mark_processed(event_key)
-        return {"status": "ok"}
+    mark_processed(event_key)
+    return {"status": "ok"}
+
 
 # ---------- Startup & health ----------
 @app.on_event("startup")
