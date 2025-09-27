@@ -4,7 +4,7 @@ import logging
 from typing import Optional, Dict, Any, List
 from slack_sdk.models.blocks import SectionBlock, ActionsBlock, ButtonElement
 from datetime import datetime
-from slack_interactivity import router as slack_router
+import slack_interactivity
 
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
