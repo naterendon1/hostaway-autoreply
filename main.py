@@ -2,18 +2,16 @@ import os
 import json
 import logging
 from typing import Optional, Dict, Any, List
-from slack_sdk.models.blocks import SectionBlock, ActionsBlock, ButtonElement
 from datetime import datetime
-from slack_interactivity import router as slack_router
 
-
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
 from slack_sdk import WebClient
 
 from smart_intel import generate_reply
 from utils import fetch_hostaway_listing, fetch_hostaway_reservation, fetch_hostaway_conversation
-from db import already_processed, mark_processed, log_message_event, log_ai_exchange
+from db import already_processed, mark_processed, log_ai_exchange
+from slack_interactivity import router as slack_router
 
 app = FastAPI()
 
@@ -115,7 +113,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         intent="general"
     )
 
-    # Format and build Slack blocks here
+    # Format Slack display values
     checkin_fmt = datetime.strptime(check_in, "%Y-%m-%d").strftime("%m-%d-%Y") if check_in else "N/A"
     checkout_fmt = datetime.strptime(check_out, "%Y-%m-%d").strftime("%m-%d-%Y") if check_out else "N/A"
 
@@ -125,6 +123,23 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     guest_count = res_data.get("numberOfGuests") or res_data.get("adults") or "?"
     platform = res_data.get("platform", "Unknown")
     property_name = listing_data.get("name") or listing_data.get("internalListingName") or "Unknown Property"
+
+    meta_payload = {
+        "conv_id": conv_id,
+        "guest_message": guest_message,
+        "guest_name": guest_name,
+        "reply": ai_reply,
+        "ai_suggestion": ai_reply,
+        "type": "email",
+        "status": res_data.get("status", "N/A"),
+        "check_in": checkin_fmt,
+        "check_out": checkout_fmt,
+        "guest_count": guest_count,
+        "channel_pretty": platform,
+        "property_address": structured_listing_info["address"],
+        "listing_id": listing_id,
+        "guest_id": res_data.get("guestId"),
+    }
 
     blocks = [
         {
@@ -156,28 +171,24 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send"},
                     "style": "primary",
-                    "action_id": "send_reply",
-                    "value": json.dumps({
-                        "conversation_id": conv_id,
-                        "reply_text": ai_reply
-                    })
+                    "action_id": "send",  # matches slack_interactivity.py
+                    "value": json.dumps(meta_payload)
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Edit"},
-                    "action_id": "open_edit_modal",
-                    "value": json.dumps({
-                        "guest_name": guest_name,
-                        "guest_message": guest_message,
-                        "draft_text": ai_reply
-                    })
+                    "action_id": "edit",  # matches slack_interactivity.py
+                    "value": json.dumps(meta_payload)
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send Guest Portal"},
-                    "action_id": "send_guest_portal",
+                    "action_id": "send_guest_portal",  # matches slack_interactivity.py
                     "value": json.dumps({
-                        "conversation_id": conv_id
+                        "conv_id": conv_id,
+                        "guest_portal_url": res_data.get("guestPortalUrl"),
+                        "status": res_data.get("status", "N/A"),
+                        "channel": SLACK_CHANNEL,
                     })
                 }
             ]
@@ -188,9 +199,9 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     mark_processed(event_key)
     return {"status": "ok"}
 
-
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
-    
+
+# ✅ include Slack interactivity router
 app.include_router(slack_router, prefix="/slack")
