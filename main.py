@@ -2,6 +2,8 @@ import os
 import json
 import logging
 from typing import Optional, Dict, Any, List
+from slack_sdk.models.blocks import SectionBlock, ActionsBlock, ButtonElement
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
@@ -111,48 +113,69 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         intent="general"
     )
 
-    # Slack formatting
-    address = listing_data.get("address", "Unknown address")
-    checkin_fmt = check_in or "N/A"
-    checkout_fmt = check_out or "N/A"
-    guest_count = res_data.get("numberOfGuests", "N/A")
-    price_str = res_data.get("payoutAmount", "N/A")
-    communication_type = data.get("type", "message").capitalize()
+    # Format and build Slack blocks here
+    checkin_fmt = datetime.strptime(check_in, "%Y-%m-%d").strftime("%m-%d-%Y") if check_in else "N/A"
+    checkout_fmt = datetime.strptime(check_out, "%Y-%m-%d").strftime("%m-%d-%Y") if check_out else "N/A"
 
-    header_text = (
-        f"*{communication_type}* from *{guest_name}*\n"
-        f"Property: *{address}*\n"
-        f"Dates: *{checkin_fmt} → {checkout_fmt}*\n"
-        f"Guests: *{guest_count}* | Res: *{res_data.get('status', 'N/A')}* | Price: *${price_str}*"
-    )
+    price = res_data.get("grandTotalPrice") or res_data.get("totalPrice") or res_data.get("price") or "N/A"
+    price_str = f"${float(price):,.2f}" if isinstance(price, (int, float, str)) and str(price).replace('.', '', 1).isdigit() else "$N/A"
+
+    guest_count = res_data.get("numberOfGuests") or res_data.get("adults") or "?"
+    platform = res_data.get("platform", "Unknown")
+    property_name = listing_data.get("name") or listing_data.get("internalListingName") or "Unknown Property"
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Guest says:*\n{guest_message}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n{ai_reply}"}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*✉️ Message from {guest_name}*\n"
+                    f"🏡 *Property:* {property_name}\n"
+                    f"📅 *Dates:* {checkin_fmt} → {checkout_fmt}\n"
+                    f"👥 *Guests:* {guest_count} | Res: *{res_data.get('status', 'N/A')}* | "
+                    f"Price: *{price_str}* | Platform: *{platform}*\n\n"
+                    f"💬 *Message:* {guest_message}"
+                )
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"💡 *Suggested Reply:*\n{ai_reply}"
+            }
+        },
         {
             "type": "actions",
+            "block_id": "action_buttons",
             "elements": [
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send"},
                     "style": "primary",
-                    "action_id": "send_message",
-                    "value": json.dumps({"conv_id": conv_id})
+                    "action_id": "send_reply",
+                    "value": json.dumps({
+                        "conversation_id": conv_id,
+                        "reply_text": ai_reply
+                    })
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Edit"},
-                    "action_id": "edit_message",
-                    "value": json.dumps({"conv_id": conv_id, "suggestion": ai_reply})
+                    "action_id": "open_edit_modal",
+                    "value": json.dumps({
+                        "guest_name": guest_name,
+                        "guest_message": guest_message,
+                        "draft_text": ai_reply
+                    })
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send Guest Portal"},
-                    "action_id": "send_portal",
+                    "action_id": "send_guest_portal",
                     "value": json.dumps({
-                        "conv_id": conv_id,
-                        "url": res_data.get("guestPortalUrl", "")
+                        "conversation_id": conv_id
                     })
                 }
             ]
@@ -162,6 +185,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     post_to_slack(blocks)
     mark_processed(event_key)
     return {"status": "ok"}
+
 
 @app.get("/ping")
 def ping():
