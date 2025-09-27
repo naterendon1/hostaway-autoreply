@@ -4,6 +4,7 @@ import logging
 from typing import Optional, Dict, Any, List
 from slack_sdk.models.blocks import SectionBlock, ActionsBlock, ButtonElement
 from datetime import datetime
+from slack_interactivity import router as slack_router
 
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
@@ -191,5 +192,4 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 def ping():
     return {"status": "ok"}
 
-from slack_interactivity import router as slack_router
-app.include_router(slack_router, prefix="/slack")
+app.include_router(slack_interactivity.router, prefix="/slack")
