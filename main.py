@@ -190,3 +190,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
+from slack_interactivity import router as slack_router
+app.include_router(slack_router, prefix="/slack")
