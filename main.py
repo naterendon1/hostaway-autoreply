@@ -17,7 +17,6 @@ from slack_sdk.errors import SlackApiError
 
 from places import should_fetch_local_recs, build_local_recs
 from slack_interactivity import router as slack_router
-from assistant_core import compose_reply as ac_compose
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
