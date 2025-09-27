@@ -572,35 +572,6 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "nearby": {"items": nearby_recs or []},
     }
 
-    def apply_listing_config_to_meta(meta: Dict, cfg: Dict) -> Dict:
-        out = dict(meta)
-        prof = dict(out.get("property_profile") or {})
-        if isinstance(cfg.get("property_profile"), dict):
-            prof.update({k: v for k, v in cfg["property_profile"].items() if v is not None})
-        out["property_profile"] = prof
-        pol = dict(out.get("policies") or {})
-        if isinstance(cfg.get("policies"), dict):
-            pol.update({k: v for k, v in cfg["policies"].items() if v is not None})
-        if "pets_allowed" in cfg:
-            pol["pets_allowed"] = cfg.get("pets_allowed")
-        out["policies"] = pol
-        acc = dict(out.get("access") or {})
-        if isinstance(cfg.get("access_and_arrival"), dict):
-            for k, v in cfg["access_and_arrival"].items():
-                if v is not None:
-                    acc[k] = v
-        out["access"] = acc
-        if isinstance(cfg.get("house_rules"), dict): out["house_rules"] = cfg["house_rules"]
-        if isinstance(cfg.get("amenities_and_quirks"), dict): out["amenities_and_quirks"] = cfg["amenities_and_quirks"]
-        if isinstance(cfg.get("safety_and_emergencies"), dict): out["safety_and_emergencies"] = cfg["safety_and_emergencies"]
-        if isinstance(cfg.get("core_identity"), dict): out["core_identity"] = cfg["core_identity"]
-        if isinstance(cfg.get("upsells"), dict): out["upsells"] = cfg["upsells"]
-        return out
-
-    meta_for_ai = apply_listing_config_to_meta(meta_for_ai, listing_cfg)
-
-    context_for_reply = {"location": {"lat": lat, "lng": lng}}
-
 # --- Build context for generate_reply ---
     context_dict = {
         "guest_name": guest_name,
