@@ -619,7 +619,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 ai_reply = generate_reply(guest_msg, context_dict)
 detected_intent = "general"  # Or null/empty for now unless you later add intent detection
 
-    try:
+        try:
         log_ai_exchange(
             conversation_id=str(conv_id) if conv_id else None,
             guest_message=guest_msg,
