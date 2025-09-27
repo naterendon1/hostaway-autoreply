@@ -20,6 +20,7 @@ from utils import (
     clean_ai_reply,
     sanitize_ai_reply,
 )
+from smart_intel import generate_reply
 from places import should_fetch_local_recs, build_local_recs
 from db import record_event  # <-- analytics
 
