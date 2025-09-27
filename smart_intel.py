@@ -1,10 +1,9 @@
 from __future__ import annotations
 import os
-import re
-import json
 import logging
-from typing import Any, Dict, List, Optional
-from datetime import datetime, date
+from typing import Any, Dict
+from datetime import datetime
+import re
 
 try:
     from openai import OpenAI
@@ -13,113 +12,80 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-# ---- Configuration ----
+# --- Config ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-USE_LEARNING = True  # Turn off if you don't want saved answers
 
-# ---- Utilities ----
+# --- Main reply entry point ---
 
-def _today() -> date:
-    return datetime.utcnow().date()
+def generate_reply(message: str, context: Dict[str, Any]) -> str:
+    """
+    Generate a warm, helpful reply using GPT-4o and listing context.
+    """
+    if not message.strip():
+        return "Could you share a bit more so I can help?"
 
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", text.strip().lower())
+    # Compose full prompt
+    prompt = _compose_prompt(message, context)
+
+    # Run OpenAI
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0.6,
+            messages=[
+                {"role": "system", "content": _system_prompt()},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        text = (response.choices[0].message.content or "").strip()
+        return _finalize_reply(text)
+    except Exception as e:
+        log.warning(f"[generate_reply] OpenAI error: {e}")
+        return "Thanks for reaching out! Let me know how I can help."
+
+# --- Prompt building ---
+
+def _system_prompt() -> str:
+    return (
+        "You're a helpful, friendly assistant for a vacation rental host. "
+        "Your job is to reply kindly, clearly, and informatively to guest questions. "
+        "Be warm, brief, and personal. If you don’t know something, offer to find out."
+    )
+
+def _compose_prompt(message: str, context: Dict[str, Any]) -> str:
+    guest_name = context.get("guest_name") or "the guest"
+    check_in = context.get("check_in_date") or "N/A"
+    check_out = context.get("check_out_date") or "N/A"
+    listing = context.get("listing_info", {})
+    location = listing.get("location", "an amazing place")
+    beds = listing.get("beds", "some comfy beds")
+    highlights = listing.get("highlights", "")
+    activities = listing.get("activities", "")
+
+    return (
+        f"Guest message:\n{message.strip()}\n\n"
+        f"Guest name: {guest_name}\n"
+        f"Check-in: {check_in}, Check-out: {check_out}\n"
+        f"Location: {location}\n"
+        f"Beds: {beds}\n"
+        f"Highlights: {highlights}\n"
+        f"Activities nearby: {activities}\n\n"
+        "Write a friendly, helpful reply."
+    )
+
+# --- Final cleanup ---
+
+def _finalize_reply(text: str) -> str:
+    text = _strip_placeholders(text)
+    if not re.match(r"^(hi|hey|hello)\b", text, re.I):
+        text = "Hey! " + text
+    if not text.endswith((".", "!", "?")):
+        text += "."
+    return text
 
 def _strip_placeholders(text: str) -> str:
     text = re.sub(r"\[[^\]]+\]", "", text)
     text = re.sub(r"\{[^}]+\}", "", text)
     return re.sub(r"\s{2,}", " ", text).strip()
-
-# ---- Main Reply Generator ----
-
-def generate_reply(message: str, context: Dict[str, Any]) -> str:
-    """
-    Main function to generate a reply to a guest message.
-    Uses OpenAI GPT-4o with fallback logic and optional learning.
-    """
-    message = message.strip()
-    if not message:
-        return "Can you share a bit more? I’ll help however I can."
-
-    # 1. Check for saved answer (learning memory)
-    if USE_LEARNING:
-        saved = _check_memory(message, context)
-        if saved:
-            return _finalize_reply(saved, context)
-
-    # 2. Try OpenAI draft
-    ai_draft = _llm_reply(message, context)
-    if ai_draft:
-        return _finalize_reply(ai_draft, context)
-
-    # 3. Fallback reply
-    return _finalize_reply("Happy to help — just let me know what you need!", context)
-
-# ---- OpenAI Call ----
-
-def _llm_reply(message: str, context: Dict[str, Any]) -> str:
-    if not (OpenAI and OPENAI_API_KEY):
-        return ""
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        system_prompt = _load_prompt("system_reply.txt")
-        user_payload = _build_prompt_payload(message, context)
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_payload},
-            ],
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as e:
-        log.warning(f"[llm_reply_error] {e}")
-        return ""
-
-# ---- Prompt Construction ----
-
-def _build_prompt_payload(message: str, context: Dict[str, Any]) -> str:
-    payload = {
-        "message": message,
-        "guest_name": context.get("guest_name"),
-        "check_in": context.get("check_in_date"),
-        "check_out": context.get("check_out_date"),
-        "listing_info": context.get("listing_info", {}),
-        "reservation": context.get("reservation", {}),
-        "history": context.get("history", []),
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
-
-def _load_prompt(filename: str) -> str:
-    path = os.path.join("prompts", filename)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return "You are a helpful assistant for vacation rental guests. Be friendly, brief, and accurate."
-
-# ---- Learning Memory Stub ----
-
-def _check_memory(message: str, context: Dict[str, Any]) -> Optional[str]:
-    """
-    TODO: Implement your saved-reply logic here (from SQLite or JSON)
-    Return a saved string reply if a match is found.
-    """
-    return None  # Placeholder for now
-
-# ---- Final Touches ----
-
-def _finalize_reply(text: str, context: Dict[str, Any]) -> str:
-    """
-    Cleans up and formats the reply text before returning.
-    """
-    if not text:
-        return "Let me know how I can help!"
-    text = _strip_placeholders(text)
-    if not re.match(r"^(hi|hey|hello)\b", text, re.I):
-        text = "Hey! " + text
-    if not re.search(r"[.!?]$", text):
-        text += "."
-    return text
