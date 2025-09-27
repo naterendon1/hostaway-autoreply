@@ -1,49 +1,32 @@
-
-# ✅ FULL main.py with Smart AI, Slack buttons, real Hostaway data
 import os
 import json
 import logging
 from typing import Optional, Dict, Any, List
+
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
 from smart_intel import generate_reply
 from utils import (
     fetch_hostaway_listing,
     fetch_hostaway_reservation,
-    fetch_hostaway_conversation,
+    fetch_hostaway_conversation
 )
-from amenities_index import AmenitiesIndex
-from db import (
-    already_processed,
-    mark_processed,
-    log_message_event,
-    log_ai_exchange,
-)
+from db import already_processed, mark_processed, log_message_event, log_ai_exchange
 
+# ---------- Setup ----------
 app = FastAPI()
+logging.basicConfig(level=logging.INFO)
 
-# ENV
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
 MAX_THREAD_MESSAGES = 10
 
-logging.basicConfig(level=logging.INFO)
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
-# Slack helpers
-def post_to_slack(blocks: List[Dict[str, Any]], text: str = "New guest message") -> bool:
-    if not SLACK_CHANNEL or not SLACK_BOT_TOKEN:
-        logging.error("Slack config missing")
-        return False
-    client = WebClient(token=SLACK_BOT_TOKEN)
-    try:
-        client.chat_postMessage(channel=SLACK_CHANNEL, blocks=blocks, text=text)
-        return True
-    except Exception as e:
-        logging.error(f"Slack error: {e}")
-        return False
-
-# Webhook payload model
+# ---------- Models ----------
 class HostawayUnifiedWebhook(BaseModel):
     object: str
     event: str
@@ -53,6 +36,24 @@ class HostawayUnifiedWebhook(BaseModel):
     listingName: Optional[str] = None
     date: Optional[str] = None
 
+
+# ---------- Slack Helper ----------
+def post_to_slack(blocks: List[Dict[str, Any]], text: str = "New guest message") -> bool:
+    if not SLACK_CHANNEL or not SLACK_BOT_TOKEN:
+        logging.error("Slack config missing")
+        return False
+    try:
+        slack_client.chat_postMessage(channel=SLACK_CHANNEL, blocks=blocks, text=text)
+        return True
+    except SlackApiError as e:
+        logging.error(f"Slack error: {e.response['error']}")
+        return False
+    except Exception as e:
+        logging.error(f"Slack unknown error: {e}")
+        return False
+
+
+# ---------- Main Webhook ----------
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     if payload.event != "message.received" or payload.object != "conversationMessage":
@@ -60,6 +61,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     data = payload.data
     event_key = f"{payload.object}:{payload.event}:{data.get('id') or data.get('conversationId')}"
+
     if already_processed(event_key):
         return {"status": "duplicate"}
 
@@ -71,45 +73,43 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     conv_id = data.get("conversationId")
     reservation_id = data.get("reservationId")
     listing_id = data.get("listingMapId")
-    guest_id = data.get("userId")
-    communication_type = data.get("communicationType", "channel")
+    communication_type = data.get("type", "Message").lower()
 
-    # Fetch data
+    # ---------- Context ----------
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res_data = reservation.get("result", {})
+
     guest_name = res_data.get("guestFirstName", "Guest")
+    guest_count = res_data.get("numberOfGuests", "N/A")
     check_in = res_data.get("arrivalDate")
     check_out = res_data.get("departureDate")
-    guest_count = res_data.get("numberOfGuests", "N/A")
-    total_price = res_data.get("totalPrice")
-    guest_portal_url = res_data.get("guestPortalUrl", "")
-    currency = res_data.get("currency", "USD")
-
-    conversation = fetch_hostaway_conversation(conv_id) or {}
-    messages = conversation.get("result", {}).get("conversationMessages", [])[-MAX_THREAD_MESSAGES:]
-    history = [{"role": "guest" if m.get("isIncoming") else "host", "text": m.get("body", "")} for m in messages if m.get("body")]
+    price_str = res_data.get("payoutAmount", "N/A")
 
     listing = fetch_hostaway_listing(listing_id) or {}
     listing_data = listing.get("result", {})
-    amenities = AmenitiesIndex(listing_data)
+    address = listing_data.get("address", {}).get("address1", "Unknown address")
 
-    # Address
-    addr_raw = listing_data.get("address", "N/A")
-    if isinstance(addr_raw, dict):
-        address = ", ".join([str(addr_raw.get(k, "")) for k in ["address", "city", "state", "zip", "country"] if addr_raw.get(k)])
-    else:
-        address = str(addr_raw)
+    conversation = fetch_hostaway_conversation(conv_id) or {}
+    messages = conversation.get("result", {}).get("conversationMessages", [])[-MAX_THREAD_MESSAGES:]
+    history = [
+        {"role": "guest" if m.get("isIncoming") else "host", "text": m.get("body", "")}
+        for m in messages if m.get("body")
+    ]
+
+    checkin_fmt = check_in or "?"
+    checkout_fmt = check_out or "?"
 
     context = {
         "guest_name": guest_name,
-        "check_in_date": check_in,
-        "check_out_date": check_out,
+        "check_in_date": checkin_fmt,
+        "check_out_date": checkout_fmt,
+        "guest_count": guest_count,
         "listing_info": listing_data,
         "reservation": res_data,
         "history": history
     }
 
-    # AI reply
+    # ---------- AI Suggestion ----------
     ai_reply = generate_reply(guest_message, context)
     log_ai_exchange(
         conversation_id=str(conv_id),
@@ -118,63 +118,32 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         intent="general"
     )
 
-    # Slack block formatting
-    checkin_fmt = check_in or "N/A"
-    checkout_fmt = check_out or "N/A"
-    price_str = f"${float(total_price):,.2f}" if total_price else "N/A"
-
-    header_text = (
-        f"*{communication_type.title()} message* from *{guest_name}*
-"
-        f"Property: *{address}*
-"
-        f"Dates: *{checkin_fmt} → {checkout_fmt}*
-"
-        f"Guests: *{guest_count}* | Res: *{res_data.get('status', 'N/A')}* | Price: *{price_str}*"
-    )
-
-    button_meta = {
-        "conv_id": conv_id,
-        "listing_id": listing_id,
-        "guest_id": guest_id,
-        "guest_name": guest_name,
-        "guest_message": guest_message,
-        "ai_suggestion": ai_reply,
-        "check_in": check_in,
-        "check_out": check_out,
-        "guest_count": guest_count,
-        "status": res_data.get("status"),
-        "channel_pretty": communication_type.title(),
-        "property_address": address,
-        "price": price_str,
-        "guest_portal_url": guest_portal_url
-    }
-
-    actions = [
-        {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "value": json.dumps({**button_meta, "action": "send"}), "action_id": "send"},
-        {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "value": json.dumps({**button_meta, "action": "edit"}), "action_id": "edit"},
-    ]
-
-    if guest_portal_url:
-        actions.append({
-            "type": "button",
-            "style": "primary",
-            "text": {"type": "plain_text", "text": "🔗 Send guest portal"},
-            "value": json.dumps({**button_meta, "action": "send_guest_portal"}),
-            "action_id": "send_guest_portal"
-        })
+    # ---------- Slack Blocks ----------
+    summary_text = f"""
+*{communication_type.title()} message* from *{guest_name}!*
+Property: *{address}*
+Dates: *{checkin_fmt} → {checkout_fmt}*
+Guests: *{guest_count}* | Res: *{res_data.get('status', 'N/A')}* | Price: *{price_str}*
+""".strip()
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_message}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*
-{ai_reply}"}},
-        {"type": "actions", "elements": actions}
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary_text}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Message:* {guest_message}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Suggested Reply:*\n{ai_reply}"}},
+        {
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "✅ Send"}, "action_id": "send_ai_reply", "style": "primary"},
+                {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"}, "action_id": "edit_ai_reply"},
+                {"type": "button", "text": {"type": "plain_text", "text": "🔗 Send Guest Portal"}, "action_id": "send_portal_link"},
+            ]
+        }
     ]
 
     post_to_slack(blocks)
     mark_processed(event_key)
     return {"status": "ok"}
+
 
 @app.get("/ping")
 def ping():
