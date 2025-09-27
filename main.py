@@ -3,6 +3,8 @@ import json
 import logging
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from places import build_local_recs, should_fetch_local_recs
+
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -96,6 +98,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "house_rules": listing_data.get("houseRules"),
     }
 
+    # Google-powered nearby places
+    lat = listing_data.get("lat")
+    lng = listing_data.get("lng")
+
+    nearby_places = []
+    if should_fetch_local_recs(guest_message):
+        nearby_places = build_local_recs(lat, lng, guest_message)
+
     context = {
         "guest_name": guest_name,
         "check_in_date": check_in,
@@ -103,6 +113,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         "listing_info": structured_listing_info,
         "reservation": res_data,
         "history": history,
+        "nearby_places": nearby_places
     }
 
     ai_reply = generate_reply(guest_message, context)
