@@ -87,7 +87,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 
     listing = fetch_hostaway_listing(listing_id) or {}
     listing_data = listing.get("result", {})
-    address = listing_data.get("address", {}).get("address1", "Unknown address")
+    address_info = listing_data.get("address", {})
+    if isinstance(address_info, dict):
+        address = address_info.get("address1", "Unknown address")
+    elif isinstance(address_info, str):
+        address = address_info
+    else:
+        address = "Unknown address"
 
     conversation = fetch_hostaway_conversation(conv_id) or {}
     messages = conversation.get("result", {}).get("conversationMessages", [])[-MAX_THREAD_MESSAGES:]
