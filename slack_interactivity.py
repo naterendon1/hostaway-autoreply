@@ -724,7 +724,9 @@ async def slack_actions(
             inject_local_recs(meta)
 
             # the suggested text to send (fallbacks in order)
-            reply_text = (meta.get("reply") or meta.get("ai_suggestion") or "").strip()
+            context = meta.copy()
+            guest_msg = context.pop("guest_message", "")
+            reply_text = generate_reply(guest_msg, context)
 
             if not reply_text or not meta.get("conv_id"):
                 # best-effort hint in the thread if something is missing
