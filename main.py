@@ -619,22 +619,22 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
 ai_reply = generate_reply(guest_msg, context_dict)
 detected_intent = "general"  # Or null/empty for now unless you later add intent detection
 
-    try:
-        log_ai_exchange(
-            conversation_id=str(conv_id) if conv_id else None,
-            guest_message=guest_msg,
-            ai_suggestion=ai_reply,
-            intent=detected_intent,
-            meta={
-                "listing_id": listing_id, "reservation_id": reservation_id,
-                "policies": meta_for_ai.get("policies"), "access": meta_for_ai.get("access"),
-                "timezone": meta_for_ai.get("timezone"),
-                "property_details": property_details,
-                "amenities_index_keys": list((meta_for_ai.get("amenities_index") or {}).keys()),
-            },
-        )
-    except Exception as e:
-        logging.warning(f"ai exchange logging failed: {e}")
+try:
+    log_ai_exchange(
+        conversation_id=str(conv_id) if conv_id else None,
+        guest_message=guest_msg,
+        ai_suggestion=ai_reply,
+        intent=detected_intent,
+        meta={
+            "listing_id": listing_id, "reservation_id": reservation_id,
+            "policies": meta_for_ai.get("policies"), "access": meta_for_ai.get("access"),
+            "timezone": meta_for_ai.get("timezone"),
+            "property_details": property_details,
+            "amenities_index_keys": list((meta_for_ai.get("amenities_index") or {}).keys()),
+        },
+    )
+except Exception as e:
+    logging.warning(f"ai exchange logging failed: {e}")
 
     us_check_in = format_us_date(check_in); us_check_out = format_us_date(check_out)
     phase = trip_phase(check_in, check_out)
