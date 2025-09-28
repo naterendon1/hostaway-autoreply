@@ -602,6 +602,7 @@ async def slack_actions(
     payload: Dict[str, Any] = json.loads(payload_raw)
 
     logging.info("🎯 /slack/actions hit")
+    logging.info(f"🧪 Slack action payload: {json.dumps(payload, indent=2)}")
     ptype = payload.get("type")
 
     # ---------- Block actions ----------
