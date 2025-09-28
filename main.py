@@ -132,8 +132,29 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     price_str = f"${float(price):,.2f}" if isinstance(price, (int, float, str)) and str(price).replace('.', '', 1).isdigit() else "$N/A"
 
     guest_count = res_data.get("numberOfGuests") or res_data.get("adults") or "?"
-    platform = res_data.get("platform", "Unknown")
-    property_name = listing_data.get("name") or listing_data.get("internalListingName") or "Unknown Property"
+    # --- Platform Name Mapping ---
+    channel_map = {
+        2018: "Airbnb",
+        2002: "Vrbo",
+        2005: "Booking.com",
+        2007: "Expedia",
+        2009: "Vrbo (iCal)",
+        2010: "Vrbo (iCal)",
+        2000: "Direct",
+        2013: "Booking Engine",
+        2015: "Custom iCal",
+        2016: "Tripadvisor (iCal)",
+        2017: "WordPress",
+        2019: "Marriott",
+        2020: "Partner",
+        2021: "GDS",
+        2022: "Google",
+    }
+    channel_id = res_data.get("channelId")
+    platform = channel_map.get(channel_id, "Unknown")
+
+    # Use address instead of property name
+    property_address = listing_data.get("address") or "Unknown Address"
 
     blocks = [
         {
@@ -142,11 +163,11 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                 "type": "mrkdwn",
                 "text": (
                     f"*✉️ Message from {guest_name}*\n"
-                    f"🏡 *Property:* {property_name}\n"
+                    f"🏡 *Property:* {property_address}\n"
                     f"📅 *Dates:* {checkin_fmt} → {checkout_fmt}\n"
                     f"👥 *Guests:* {guest_count} | Res: *{res_data.get('status', 'N/A')}* | "
                     f"Price: *{price_str}* | Platform: *{platform}*\n\n"
-                    f"💬 *Message:* {guest_message}"
+                    f"{guest_message}"  # <-- no label like "Message:"
                 )
             }
         },
@@ -165,35 +186,20 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send"},
                     "style": "primary",
-                    "action_id": "send",  # ✅ matches slack_interactivity
+                    "action_id": "send_reply",
                     "value": json.dumps({
-                        "conv_id": conv_id,
-                        "guest_message": guest_message,
-                        "ai_suggestion": ai_reply,
-                        "listing_id": listing_id,
-                        "guest_name": guest_name,
-                        "status": res_data.get("status", "N/A"),
-                        "check_in": checkin_fmt,
-                        "check_out": checkout_fmt,
-                        "guest_count": guest_count,
-                        "property_address": listing_data.get("address"),
+                        "conversation_id": conv_id,
+                        "reply_text": ai_reply
                     })
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Edit"},
-                    "action_id": "edit",
+                    "action_id": "open_edit_modal",
                     "value": json.dumps({
                         "guest_name": guest_name,
                         "guest_message": guest_message,
-                        "ai_suggestion": ai_reply,
-                        "listing_id": listing_id,
-                        "conv_id": conv_id,
-                        "status": res_data.get("status", "N/A"),
-                        "check_in": checkin_fmt,
-                        "check_out": checkout_fmt,
-                        "guest_count": guest_count,
-                        "property_address": listing_data.get("address"),
+                        "draft_text": ai_reply
                     })
                 },
                 {
@@ -201,14 +207,13 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
                     "text": {"type": "plain_text", "text": "Send Guest Portal"},
                     "action_id": "send_guest_portal",
                     "value": json.dumps({
-                        "conv_id": conv_id,
-                        "status": res_data.get("status", "N/A"),
-                        "guest_portal_url": res_data.get("guestPortalUrl")
+                        "conversation_id": conv_id
                     })
                 }
             ]
         }
     ]
+
 
     post_to_slack(blocks)
     mark_processed(event_key)
