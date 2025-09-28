@@ -124,20 +124,20 @@ def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
         "elements": [
             {
                 "type": "button",
-                "action_id": "send",  # ✅ correct (router expects 'send')
+                "action_id": "send",  # ✅ correct
                 "text": {"type": "plain_text", "text": "Send", "emoji": True},
                 "style": "primary",
                 "value": json.dumps(send_value, ensure_ascii=False),
             },
             {
                 "type": "button",
-                "action_id": "edit",  # ✅ correct (router expects 'edit')
+                "action_id": "edit",  # ✅ correct
                 "text": {"type": "plain_text", "text": "Edit", "emoji": True},
                 "value": json.dumps(edit_value, ensure_ascii=False),
             },
             {
                 "type": "button",
-                "action_id": "send_guest_portal",  # ✅ correct (router has a handler)
+                "action_id": "send_guest_portal",
                 "text": {"type": "plain_text", "text": "Send Guest Portal", "emoji": True},
                 "value": json.dumps(portal_value, ensure_ascii=False),
             },
@@ -174,6 +174,15 @@ def _build_message_blocks(guest_message: str, ai_reply: str, meta: Dict[str, Any
     blocks.append(_build_action_row(meta, ai_reply))
     return blocks
 
+def _get_listing_lat_lng(listing: Dict[str, Any]) -> (Optional[float], Optional[float]):
+    # Hostaway typically uses latitude/longitude on the listing or inside 'address'
+    lat = listing.get("latitude") or (listing.get("address") or {}).get("lat")
+    lng = listing.get("longitude") or (listing.get("address") or {}).get("lng")
+    try:
+        return (float(lat), float(lng)) if lat is not None and lng is not None else (None, None)
+    except Exception:
+        return (None, None)
+
 def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
     """
     Pull conversation, reservation, and listing context to enrich the Slack card and AI reply.
@@ -191,11 +200,14 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         or "Guest"
     )
 
-    # Compact message history for AI
+    # Compact message history for AI context
     history = []
     for msg in (conversation.get("messages") or []):
         role = "guest" if (msg.get("senderType") == "guest") else "host"
         history.append({"role": role, "text": msg.get("body", "")})
+
+    # Lat/Lng (if available) for local recs / distance
+    lat, lng = _get_listing_lat_lng(listing)
 
     meta: Dict[str, Any] = {
         "conv_id": conversation_id,
@@ -210,6 +222,8 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         "channel_pretty": (conversation.get("channelName") or listing.get("name") or "New guest message"),
         "property_name": listing.get("name"),
         "property_address": (listing.get("address") or {}).get("address1"),
+        "latitude": lat,
+        "longitude": lng,
     }
 
     # If any portal URL exists, pass it through for the "send_guest_portal" handler
@@ -218,14 +232,19 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
             meta["guest_portal_url"] = reservation.get(k)
             break
 
-    nearby = build_local_recs(listing) if should_fetch_local_recs(listing) else []
+    # Local recs bundle only when the guest asks about local things AND we have coordinates
+    nearby_bundle: List[Dict[str, Any]] = []
+    # (We’ll decide using the guest_message later inside the webhook.)
 
     ai_ctx: Dict[str, Any] = {
         "guest_name": guest_name,
         "listing_info": listing or {},
         "reservation": reservation or {},
         "history": history[-8:],  # keep prompt small
-        "nearby_places": nearby or [],
+        "nearby_places": nearby_bundle,  # may be replaced below once we see the message
+        "property_address": meta["property_address"],
+        "latitude": lat,
+        "longitude": lng,
     }
     return meta | {"_ai_ctx": ai_ctx}
 
@@ -258,8 +277,14 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     meta = _collect_context_from_hostaway(int(conv_id))
     meta["guest_message"] = guest_message
 
-    # Generate AI suggestion
+    # Inject local recs bundle if the message is about local stuff and we have coords
+    lat = meta.get("latitude")
+    lng = meta.get("longitude")
     ai_ctx = meta.get("_ai_ctx", {})
+    if should_fetch_local_recs(guest_message) and lat is not None and lng is not None:
+        ai_ctx["nearby_places"] = build_local_recs(lat, lng, guest_message)
+
+    # Generate AI suggestion (sync)
     ai_reply = generate_reply(guest_message, ai_ctx) if guest_message else "Thanks for your message! I’ll get back to you shortly."
 
     # Optional log
