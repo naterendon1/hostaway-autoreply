@@ -5,7 +5,7 @@ import re
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple, List
 
 # OpenAI client (1.x)
 try:
@@ -13,13 +13,12 @@ try:
     _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     _use_client = True
 except Exception:
-    # Fallback to raw HTTPS if needed later
     _openai_client = None
     _use_client = False
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Distance helper from places.py (single-destination)
+# Distance helper from places.py (supports origin as address OR (lat,lng))
 from places import get_drive_distance_duration
 
 # ---- Small, fast "reply planner" -------------------------------------------------
@@ -39,7 +38,6 @@ def _parse_iso_date(s: Optional[str]) -> Optional[datetime]:
 
 def infer_stay_phase(check_in: Optional[str], check_out: Optional[str], *, now: Optional[datetime] = None) -> str:
     """Return 'pre_arrival' | 'in_stay' | 'post_stay' | 'unknown'."""
-    # Use server clock; your server is in UTC, but we only compare by date.
     now = now or datetime.now(timezone.utc)
     ci = _parse_iso_date(check_in)
     co = _parse_iso_date(check_out)
@@ -63,8 +61,31 @@ def normalize_destination(text: str) -> Optional[str]:
     Add any venues you care about here.
     """
     t = (text or "")
+    # COTA
+    if re.search(r"\b(cota|c\.?o\.?t\.?a\.?|circuit\s+of\s+the\s+americas)\b", t, re.I):
+        return "Circuit of the Americas, Austin, TX"
+    # H-E-B Center
     if re.search(r"\bheb\b.*center\b", t, re.I):
         return "H-E-B Center at Cedar Park, TX"
+    return None
+
+def pick_origin(ctx: Dict[str, Any]) -> Optional[Tuple[str, Optional[Tuple[float,float]]]]:
+    """
+    Returns a tuple (address_or_empty, coords_or_none).
+    - If address exists, returns (address, None)
+    - Else if coords exist, returns ("", (lat, lng))
+    - Else returns None
+    """
+    address = ctx.get("property_address") \
+        or ((ctx.get("listing_info") or {}).get("address") or {}).get("address1")
+
+    lat = ctx.get("latitude")
+    lng = ctx.get("longitude")
+    has_coords = isinstance(lat, (int, float)) and isinstance(lng, (int, float))
+    if address:
+        return (address, None)
+    if has_coords:
+        return ("", (float(lat), float(lng)))  # origin can be coords
     return None
 
 # ---- Prompt scaffolding ----------------------------------------------------------
@@ -104,12 +125,32 @@ def _few_shots() -> list[dict]:
             "content": json.dumps({
                 "guest_message": "How far is the arena?",
                 "facts": {"phase":"pre_arrival"},
-                "missing": ["property_address","destination"]
+                "missing": ["destination"]
             })
         },
         {
             "role": "assistant",
-            "content": "Happy to help! Could you confirm the property address and the arena’s full name? I’ll check drive time right away."
+            "content": "Happy to help! What’s the arena’s full name? I’ll check the drive time right away."
+        },
+        # Kids activities with nearby_places
+        {
+            "role": "user",
+            "content": json.dumps({
+                "guest_message": "Any fun things for kids nearby?",
+                "facts": {
+                    "phase":"in_stay",
+                    "nearby_places":[
+                        {"label":"Family-friendly","places":[
+                            {"name":"Austin Nature & Science Center","vicinity":"301 Nature Center Dr","distance_text":"3.1 mi","duration_text":"9 mins"},
+                            {"name":"Thinkery","vicinity":"1830 Simond Ave","distance_text":"5.2 mi","duration_text":"14 mins"}
+                        ]}
+                    ]
+                }
+            })
+        },
+        {
+            "role": "assistant",
+            "content": "A couple of close kid-friendly spots: Austin Nature & Science Center (≈9 mins) and Thinkery (≈14 mins). Want more ideas or directions?"
         },
     ]
 
@@ -122,9 +163,10 @@ Always:
   * in_stay: check-in ≤ today ≤ check-out
   * post_stay: today > check-out
 - If phase is post_stay, speak in past tense and thank them. Never say “enjoy the rest of your stay”.
-- If the guest asks for distance/time and a distance fact is provided, include it succinctly.
-- If address or destination is missing for a distance question, ask for exactly the missing fields (one concise question).
-- If local recommendations are provided, optionally include 2–3 strong picks with distance/time (if present).
+- For distance/time questions:
+  * If a distance fact is provided, include it succinctly (miles + minutes).
+  * If destination is recognized but distance is missing, ask for one missing input at most.
+- If local recommendations are provided (nearby_places), suggest up to 2–3 strong picks, including distance/time if present.
 - Never invent prices, addresses, or policies. Be brief and useful.
 
 {style}
@@ -155,7 +197,11 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
     property_name = ctx.get("listing_info", {}).get("name") or ctx.get("property_name")
     guest_count = ctx.get("guest_count") or ctx.get("reservation", {}).get("numberOfGuests")
     status = ctx.get("status") or ctx.get("reservation", {}).get("status")
-    nearby_places = ctx.get("nearby_places") or []
+    nearby_places: List[Dict[str, Any]] = ctx.get("nearby_places") or []
+
+    lat = ctx.get("latitude")
+    lng = ctx.get("longitude")
+    has_coords = isinstance(lat, (int, float)) and isinstance(lng, (int, float))
 
     # Compute stay phase
     phase = infer_stay_phase(check_in, check_out)
@@ -163,17 +209,29 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
     # Distance intent
     distance = None
     missing = []
+
     if detect_distance_intent(guest_message):
         destination = normalize_destination(guest_message)
-        if not property_address:
-            missing.append("property_address")
+
+        # Determine origin: address or coords
+        origin_sel = pick_origin(ctx)
         if not destination:
             missing.append("destination")
-        if not missing:
-            # Try single-destination drive time (address→place)
-            distance = get_drive_distance_duration(property_address, destination)
+        if origin_sel is None:
+            # Neither address nor coords available
+            missing.append("property_location")
 
-    # Facts payload for the model
+        # Try to compute distance if we have enough
+        if destination and origin_sel is not None:
+            addr, coords = origin_sel
+            if coords:
+                # Use coords as origin
+                distance = get_drive_distance_duration(coords, destination)
+            else:
+                # Use address as origin
+                distance = get_drive_distance_duration(addr, destination)
+
+    # Prepare facts for the model
     facts: Dict[str, Any] = {
         "phase": phase,
         "property_name": property_name,
@@ -186,14 +244,19 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
     if distance:
         facts["distance"] = distance
     if nearby_places:
-        # Keep it light; model can pick 2–3 if useful
+        # Provide up to 3 bundles; model will choose 2–3 total items
         facts["nearby_places"] = nearby_places[:3]
+
+    # If we have coords but no address, let the model know origin was resolved (so it won't ask for it)
+    if has_coords and not property_address:
+        facts["origin_resolved"] = "coords"
 
     user_payload = {
         "guest_message": guest_message,
         "facts": facts,
     }
     if missing:
+        # Only include truly missing pieces (destination when unrecognized, property_location when neither addr nor coords)
         user_payload["missing"] = missing
 
     system = SYSTEM_TEMPLATE.format(today=datetime.now().date(), style=STYLE)
@@ -213,8 +276,7 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
     except Exception as e:
         logging.warning(f"OpenAI call failed: {e}")
 
-    # Fallback: minimal safe response if the model call fails
-    # Use phase for a sensible default
+    # Fallback if the model call fails
     if phase == "post_stay":
         return "Thanks so much for staying with us—glad to hear everything went well! Safe travels home."
     return "Thanks for your message! I’ll take a look and follow up shortly."
