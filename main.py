@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-# Local modules in your repo
+# Local modules
 from slack_interactivity import router as slack_router
 from smart_intel import generate_reply
 from utils import (
@@ -21,21 +21,21 @@ from utils import (
 )
 from places import build_local_recs, should_fetch_local_recs
 
-# Optional: if you have these helpers; otherwise fall back to no-ops.
+# Optional DB helpers (fallback to no-ops if absent)
 try:
     from db import already_processed, mark_processed, log_ai_exchange  # type: ignore
 except Exception:  # pragma: no cover
-    def already_processed(_k: str) -> bool:
+    def already_processed(_k: str) -> bool:  # type: ignore
         return False
-    def mark_processed(_k: str) -> None:
+    def mark_processed(_k: str) -> None:  # type: ignore
         pass
-    def log_ai_exchange(*_args, **_kwargs) -> None:
+    def log_ai_exchange(*_args, **_kwargs) -> None:  # type: ignore
         pass
 
 # ---------------- Config ----------------
 logging.basicConfig(level=logging.INFO)
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-DEFAULT_SLACK_CHANNEL = os.getenv("SLACK_CHANNEL_ID")  # fallback if you don't route per-listing
+DEFAULT_SLACK_CHANNEL = os.getenv("SLACK_CHANNEL_ID")
 ENV = os.getenv("ENV", "dev")
 
 slack_client: Optional[WebClient] = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
@@ -89,14 +89,13 @@ def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
       - action_id "send_guest_portal" expects conv_id and (optionally) guest_portal_url/status
     """
     base_meta = {
-        # Common
         "conv_id": meta.get("conv_id"),
         "guest_message": meta.get("guest_message", ""),
         "guest_name": meta.get("guest_name", "Guest"),
         "listing_id": meta.get("listing_id"),
         "guest_id": meta.get("guest_id"),
-        "status": meta.get("status"),              # e.g., confirmed/new/etc.
-        "type": meta.get("type", "email"),         # if your downstream uses this
+        "status": meta.get("status"),
+        "type": meta.get("type", "email"),
         "check_in": meta.get("check_in"),
         "check_out": meta.get("check_out"),
         "location": meta.get("location"),
@@ -104,15 +103,15 @@ def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
         "sent_label": meta.get("sent_label", "message sent"),
     }
 
-    # Send button payload (the handler will generate from context; ai_suggestion is a helpful fallback)
+    # Send payload (router can also regenerate; include ai_suggestion as fallback)
     send_value = dict(base_meta)
     send_value["ai_suggestion"] = ai_reply
 
-    # Edit button payload
+    # Edit payload
     edit_value = dict(base_meta)
     edit_value["draft"] = ai_reply
 
-    # Guest portal button payload
+    # Guest Portal payload
     portal_value = dict(base_meta)
     if meta.get("guest_portal_url"):
         portal_value["guest_portal_url"] = meta["guest_portal_url"]
@@ -123,20 +122,20 @@ def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
         "elements": [
             {
                 "type": "button",
-                "action_id": "send",  # ✅ correct id
+                "action_id": "send",  # ✅ correct
                 "text": {"type": "plain_text", "text": "Send", "emoji": True},
                 "style": "primary",
                 "value": json.dumps(send_value, ensure_ascii=False),
             },
             {
                 "type": "button",
-                "action_id": "edit",  # ✅ correct id
+                "action_id": "edit",  # ✅ correct
                 "text": {"type": "plain_text", "text": "Edit", "emoji": True},
                 "value": json.dumps(edit_value, ensure_ascii=False),
             },
             {
                 "type": "button",
-                "action_id": "send_guest_portal",  # ✅ handler exists in your router
+                "action_id": "send_guest_portal",  # ✅ handler exists
                 "text": {"type": "plain_text", "text": "Send Guest Portal", "emoji": True},
                 "value": json.dumps(portal_value, ensure_ascii=False),
             },
@@ -184,6 +183,9 @@ def _build_message_blocks(guest_message: str, ai_reply: str, meta: Dict[str, Any
     return blocks
 
 def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
+    """
+    Pull conversation, reservation, and listing context to enrich the Slack card and AI reply.
+    """
     conversation = fetch_hostaway_conversation(conversation_id) or {}
     reservation_id = conversation.get("reservationId") or conversation.get("reservation_id")
     reservation = fetch_hostaway_reservation(reservation_id) if reservation_id else {}
@@ -197,7 +199,7 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         or "Guest"
     )
 
-    # compact history for AI context
+    # Build short history for AI context
     history = []
     for msg in (conversation.get("messages") or []):
         role = "guest" if (msg.get("senderType") == "guest") else "host"
@@ -218,7 +220,7 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         "property_address": (listing.get("address") or {}).get("address1"),
     }
 
-    # If any portal URL exists, pass it through for the "send_guest_portal" handler
+    # If any portal URL exists, pass it for the "send_guest_portal" handler
     for k in ("guestPortalUrl", "guest_portal_url", "portalUrl"):
         if reservation.get(k):
             meta["guest_portal_url"] = reservation.get(k)
@@ -260,7 +262,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
         mark_processed(event_key)
         return {"status": "no-content"}
 
-    # Collect context from Hostaway
+    # Collect context
     meta = _collect_context_from_hostaway(int(conv_id))
     meta["guest_message"] = guest_message
 
