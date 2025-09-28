@@ -124,25 +124,26 @@ def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
         "elements": [
             {
                 "type": "button",
-                "action_id": "send",  # ✅ correct
-                "text": {"type": "plain_text", "text": "Send", "emoji": True},
+                "action_id": "send",
+                "text": {"type": "plain_text", "text": "✈️ Send", "emoji": True},
                 "style": "primary",
                 "value": json.dumps(send_value, ensure_ascii=False),
             },
             {
                 "type": "button",
-                "action_id": "edit",  # ✅ correct
-                "text": {"type": "plain_text", "text": "Edit", "emoji": True},
+                "action_id": "edit",
+                "text": {"type": "plain_text", "text": "✏️ Edit", "emoji": True},
                 "value": json.dumps(edit_value, ensure_ascii=False),
             },
             {
                 "type": "button",
                 "action_id": "send_guest_portal",
-                "text": {"type": "plain_text", "text": "Send Guest Portal", "emoji": True},
+                "text": {"type": "plain_text", "text": "📎 Guest Portal", "emoji": True},
                 "value": json.dumps(portal_value, ensure_ascii=False),
             },
         ],
     }
+
 
 def _build_message_blocks(guest_message: str, ai_reply: str, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     header_text = meta.get("channel_pretty") or meta.get("property_name") or "New guest message"
