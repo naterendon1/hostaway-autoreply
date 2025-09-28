@@ -194,12 +194,33 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
     listing_id = reservation.get("listingId") or conversation.get("listingId") or conversation.get("listing_id")
     listing = fetch_hostaway_listing(listing_id) if listing_id else {}
 
+    def _num(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    price_total = (
+        _num(reservation.get("totalPrice"))
+        or _num(reservation.get("priceTotal"))
+        or _num(reservation.get("price"))
+        or _num((reservation.get("financials") or {}).get("total"))
+    )
+    platform = (
+        conversation.get("channelName")
+        or reservation.get("channelName")
+        or reservation.get("channel")
+    )
+
     guest_name = (
         (conversation.get("guest") or {}).get("fullName")
         or (conversation.get("guest") or {}).get("firstName")
         or (reservation.get("guest") or {}).get("fullName")
         or "Guest"
     )
+    lat, lng = _get_listing_lat_lng(listing)
+
+    meta: Dict[str, Any] = {
 
     # Compact message history for AI context
     history = []
@@ -225,6 +246,8 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         "property_address": (listing.get("address") or {}).get("address1"),
         "latitude": lat,
         "longitude": lng,
+        "price_total": price_total,
+        "platform": platform,
     }
 
     # If any portal URL exists, pass it through for the "send_guest_portal" handler
