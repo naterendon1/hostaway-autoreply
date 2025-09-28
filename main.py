@@ -3,7 +3,7 @@
 import os
 import json
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 
 from fastapi import FastAPI
@@ -63,7 +63,7 @@ def _pretty_date(dt_str: Optional[str]) -> Optional[str]:
         return None
     try:
         dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        return dt.strftime("%b %d, %Y")
+        return dt.strftime("%m-%d-%Y")
     except Exception:
         return dt_str
 
@@ -144,38 +144,69 @@ def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
         ],
     }
 
+def _format_header_lines(meta: Dict[str, Any], guest_name: str) -> List[str]:
+    """Build the detailed top section (property, dates, guests/res/price/platform)."""
+    property_label = meta.get("property_address") or meta.get("property_name") or "Address unavailable"
+
+    def fmt_date(s: Optional[str]) -> str:
+        d = _pretty_date(s)
+        return d or "None"
+
+    check_in = fmt_date(meta.get("check_in"))
+    check_out = fmt_date(meta.get("check_out"))
+
+    guests = meta.get("guest_count") if meta.get("guest_count") not in (None, "", 0) else "N/A"
+    status = meta.get("status") or "N/A"
+
+    # price formatting if numeric
+    price_total = meta.get("price_total")
+    if isinstance(price_total, (int, float)):
+        price_str = f"${price_total:,.2f}"
+    else:
+        price_str = None
+
+    platform = meta.get("platform")
+
+    lines = [
+        f":email: *Message from {guest_name}*",
+        f":house_with_garden: *Property:* {property_label}",
+        f":date: *Dates:* {check_in} → {check_out}",
+        (
+            f":busts_in_silhouette: *Guests:* {guests} | Res: *{status}*"
+            + (f" | Price: *{price_str}*" if price_str else "")
+            + (f" | Platform: *{platform}*" if platform else "")
+        ),
+    ]
+    return lines
 
 def _build_message_blocks(guest_message: str, ai_reply: str, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-    header_text = meta.get("channel_pretty") or meta.get("property_name") or "New guest message"
     guest_name = meta.get("guest_name", "Guest")
-    check_in = _pretty_date(meta.get("check_in"))
-    check_out = _pretty_date(meta.get("check_out"))
 
-    context_bits = []
-    if guest_name: context_bits.append(f"*Guest:* {guest_name}")
-    if check_in or check_out: context_bits.append(f"*Stay:* {check_in or '?'} → {check_out or '?'}")
-    if meta.get("guest_count"): context_bits.append(f"*Guests:* {meta['guest_count']}")
-    if meta.get("status"): context_bits.append(f"*Status:* {meta['status']}")
-    if meta.get("property_name"): context_bits.append(f"*Listing:* {meta['property_name']}")
+    # Detailed header section (restores your previous style)
+    header_lines = _format_header_lines(meta, guest_name)
 
     blocks: List[Dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": header_text[:150], "emoji": True}},
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*:email: Message from {guest_name}*\n> {guest_message[:2500]}"},
+            "block_id": "header_context",
+            "text": {"type": "mrkdwn", "text": "\n".join(header_lines)},
+        },
+        {
+            "type": "section",
+            "block_id": "guest_message",
+            "text": {"type": "mrkdwn", "text": f"{guest_message[:4000]}"},
         },
         {"type": "divider"},
         {
             "type": "section",
+            "block_id": "ai_suggestion",
             "text": {"type": "mrkdwn", "text": f":bulb: *Suggested Reply:*\n{ai_reply[:3500]}"},
         },
+        _build_action_row(meta, ai_reply),
     ]
-    if context_bits:
-        blocks.insert(1, {"type": "context", "elements": [{"type": "mrkdwn", "text": " • ".join(context_bits)[:300]}]})
-    blocks.append(_build_action_row(meta, ai_reply))
     return blocks
 
-def _get_listing_lat_lng(listing: Dict[str, Any]) -> (Optional[float], Optional[float]):
+def _get_listing_lat_lng(listing: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     # Hostaway typically uses latitude/longitude on the listing or inside 'address'
     lat = listing.get("latitude") or (listing.get("address") or {}).get("lat")
     lng = listing.get("longitude") or (listing.get("address") or {}).get("lng")
@@ -194,6 +225,7 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
     listing_id = reservation.get("listingId") or conversation.get("listingId") or conversation.get("listing_id")
     listing = fetch_hostaway_listing(listing_id) if listing_id else {}
 
+    # --- derive price + platform if available ---
     def _num(x):
         try:
             return float(x)
@@ -212,23 +244,21 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         or reservation.get("channel")
     )
 
+    # guest name
     guest_name = (
         (conversation.get("guest") or {}).get("fullName")
         or (conversation.get("guest") or {}).get("firstName")
         or (reservation.get("guest") or {}).get("fullName")
         or "Guest"
     )
-    lat, lng = _get_listing_lat_lng(listing)
 
-    meta: Dict[str, Any] = {
-
-    # Compact message history for AI context
+    # message history for AI
     history = []
     for msg in (conversation.get("messages") or []):
         role = "guest" if (msg.get("senderType") == "guest") else "host"
         history.append({"role": role, "text": msg.get("body", "")})
 
-    # Lat/Lng (if available) for local recs / distance
+    # geolocation
     lat, lng = _get_listing_lat_lng(listing)
 
     meta: Dict[str, Any] = {
@@ -258,7 +288,6 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
 
     # Local recs bundle only when the guest asks about local things AND we have coordinates
     nearby_bundle: List[Dict[str, Any]] = []
-    # (We’ll decide using the guest_message later inside the webhook.)
 
     ai_ctx: Dict[str, Any] = {
         "guest_name": guest_name,
@@ -269,6 +298,12 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         "property_address": meta["property_address"],
         "latitude": lat,
         "longitude": lng,
+        # passthroughs commonly used by the reply generator
+        "property_name": meta.get("property_name"),
+        "check_in": meta.get("check_in"),
+        "check_out": meta.get("check_out"),
+        "guest_count": meta.get("guest_count"),
+        "status": meta.get("status"),
     }
     return meta | {"_ai_ctx": ai_ctx}
 
