@@ -21,24 +21,26 @@ from utils import (
 )
 from places import build_local_recs, should_fetch_local_recs
 
-# Optional DB helpers (fallback to no-ops if absent)
+# Optional DB helpers (noop fallbacks)
 try:
     from db import already_processed, mark_processed, log_ai_exchange  # type: ignore
 except Exception:  # pragma: no cover
-    def already_processed(_k: str) -> bool:  # type: ignore
-        return False
-    def mark_processed(_k: str) -> None:  # type: ignore
-        pass
-    def log_ai_exchange(*_args, **_kwargs) -> None:  # type: ignore
-        pass
+    def already_processed(_k: str) -> bool: return False
+    def mark_processed(_k: str) -> None: pass
+    def log_ai_exchange(*_args, **_kwargs) -> None: pass
 
 # ---------------- Config ----------------
 logging.basicConfig(level=logging.INFO)
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-DEFAULT_SLACK_CHANNEL = os.getenv("SLACK_CHANNEL_ID")
 ENV = os.getenv("ENV", "dev")
+# Preferred: set SLACK_CHANNEL_ID (e.g., C092C1S2945). Fallback: SLACK_CHANNEL_NAME (e.g., host-messages)
+DEFAULT_SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
+DEFAULT_SLACK_CHANNEL_NAME = os.getenv("SLACK_CHANNEL_NAME", "host-messages")
 
 slack_client: Optional[WebClient] = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
+
+# Cache for a resolved channel id (so we only look it up once)
+_resolved_default_channel_id: Optional[str] = None
 
 # ---------------- App ----------------
 app = FastAPI(title="Hostaway Auto-Reply")
@@ -49,7 +51,47 @@ class HostawayUnifiedWebhook(BaseModel):
     event: str
     data: Dict[str, Any]
 
-# ---------------- Helpers ----------------
+# ---------------- Slack helpers ----------------
+def _resolve_default_channel_id() -> Optional[str]:
+    """
+    1) Use SLACK_CHANNEL_ID if set.
+    2) Else, look up SLACK_CHANNEL_NAME via conversations.list and cache it.
+    """
+    global _resolved_default_channel_id
+
+    if _resolved_default_channel_id:
+        return _resolved_default_channel_id
+
+    if DEFAULT_SLACK_CHANNEL_ID:
+        _resolved_default_channel_id = DEFAULT_SLACK_CHANNEL_ID
+        logging.info(f"Using SLACK_CHANNEL_ID={_resolved_default_channel_id}")
+        return _resolved_default_channel_id
+
+    if not slack_client:
+        logging.warning("No SLACK_BOT_TOKEN configured; cannot resolve Slack channel.")
+        return None
+
+    try:
+        # Requires conversations:read (or channels:read in older scopes) and the bot must be a member of private channels.
+        cursor = None
+        target_name = DEFAULT_SLACK_CHANNEL_NAME.lstrip("#")
+        while True:
+            resp = slack_client.conversations_list(exclude_archived=True, limit=100, cursor=cursor)
+            channels = resp.get("channels", []) or resp.get("channels".encode(), [])
+            for ch in channels:
+                if ch.get("name") == target_name:
+                    _resolved_default_channel_id = ch.get("id")
+                    logging.info(f"Resolved SLACK_CHANNEL_NAME #{target_name} -> { _resolved_default_channel_id }")
+                    return _resolved_default_channel_id
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+        logging.warning(f"Could not resolve SLACK_CHANNEL_NAME #{target_name}; set SLACK_CHANNEL_ID.")
+    except SlackApiError as e:
+        logging.error(f"Slack conversations.list failed: {e}")
+
+    return None
+
 def _pretty_date(dt_str: Optional[str]) -> Optional[str]:
     if not dt_str:
         return None
@@ -60,16 +102,18 @@ def _pretty_date(dt_str: Optional[str]) -> Optional[str]:
         return dt_str
 
 def _fallback_channel_for_listing(_listing: Optional[Dict[str, Any]]) -> Optional[str]:
-    """If you later route by property, add your mapping here."""
-    return DEFAULT_SLACK_CHANNEL
+    """
+    Hook for routing by listing. For now, use the resolved default channel id.
+    """
+    return _resolve_default_channel_id()
 
 def _post_to_slack(blocks: List[Dict[str, Any]], channel: Optional[str] = None, thread_ts: Optional[str] = None) -> None:
     if not slack_client:
         logging.warning("No SLACK_BOT_TOKEN configured; skipping Slack post.")
         return
-    channel_id = channel or DEFAULT_SLACK_CHANNEL
+    channel_id = channel or _resolve_default_channel_id()
     if not channel_id:
-        logging.warning("No Slack channel available; set SLACK_CHANNEL_ID.")
+        logging.warning("No Slack channel available; set SLACK_CHANNEL_ID or SLACK_CHANNEL_NAME.")
         return
     try:
         slack_client.chat_postMessage(
@@ -83,10 +127,10 @@ def _post_to_slack(blocks: List[Dict[str, Any]], channel: Optional[str] = None, 
 
 def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
     """
-    Aligns with slack_interactivity.py handlers:
-      - action_id "send" expects value with conv_id and reply/ai_suggestion
-      - action_id "edit" expects value with draft (and same meta)
-      - action_id "send_guest_portal" expects conv_id and (optionally) guest_portal_url/status
+    Matches slack_interactivity.py handlers:
+      send              -> expects conv_id and reply/ai_suggestion
+      edit              -> expects draft
+      send_guest_portal -> expects conv_id (+ optional guest_portal_url/status)
     """
     base_meta = {
         "conv_id": meta.get("conv_id"),
@@ -103,15 +147,8 @@ def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
         "sent_label": meta.get("sent_label", "message sent"),
     }
 
-    # Send payload (router can also regenerate; include ai_suggestion as fallback)
-    send_value = dict(base_meta)
-    send_value["ai_suggestion"] = ai_reply
-
-    # Edit payload
-    edit_value = dict(base_meta)
-    edit_value["draft"] = ai_reply
-
-    # Guest Portal payload
+    send_value = dict(base_meta); send_value["ai_suggestion"] = ai_reply
+    edit_value = dict(base_meta); edit_value["draft"] = ai_reply
     portal_value = dict(base_meta)
     if meta.get("guest_portal_url"):
         portal_value["guest_portal_url"] = meta["guest_portal_url"]
@@ -122,20 +159,20 @@ def _build_action_row(meta: Dict[str, Any], ai_reply: str) -> Dict[str, Any]:
         "elements": [
             {
                 "type": "button",
-                "action_id": "send",  # ✅ correct
+                "action_id": "send",
                 "text": {"type": "plain_text", "text": "Send", "emoji": True},
                 "style": "primary",
                 "value": json.dumps(send_value, ensure_ascii=False),
             },
             {
                 "type": "button",
-                "action_id": "edit",  # ✅ correct
+                "action_id": "edit",
                 "text": {"type": "plain_text", "text": "Edit", "emoji": True},
                 "value": json.dumps(edit_value, ensure_ascii=False),
             },
             {
                 "type": "button",
-                "action_id": "send_guest_portal",  # ✅ handler exists
+                "action_id": "send_guest_portal",
                 "text": {"type": "plain_text", "text": "Send Guest Portal", "emoji": True},
                 "value": json.dumps(portal_value, ensure_ascii=False),
             },
@@ -149,43 +186,24 @@ def _build_message_blocks(guest_message: str, ai_reply: str, meta: Dict[str, Any
     check_out = _pretty_date(meta.get("check_out"))
 
     context_bits = []
-    if guest_name:
-        context_bits.append(f"*Guest:* {guest_name}")
-    if check_in or check_out:
-        context_bits.append(f"*Stay:* {check_in or '?'} → {check_out or '?'}")
-    if meta.get("guest_count"):
-        context_bits.append(f"*Guests:* {meta['guest_count']}")
-    if meta.get("status"):
-        context_bits.append(f"*Status:* {meta['status']}")
-    if meta.get("property_name"):
-        context_bits.append(f"*Listing:* {meta['property_name']}")
+    if guest_name: context_bits.append(f"*Guest:* {guest_name}")
+    if check_in or check_out: context_bits.append(f"*Stay:* {check_in or '?'} → {check_out or '?'}")
+    if meta.get("guest_count"): context_bits.append(f"*Guests:* {meta['guest_count']}")
+    if meta.get("status"): context_bits.append(f"*Status:* {meta['status']}")
+    if meta.get("property_name"): context_bits.append(f"*Listing:* {meta['property_name']}")
 
     blocks: List[Dict[str, Any]] = [
         {"type": "header", "text": {"type": "plain_text", "text": header_text[:150], "emoji": True}},
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*:email: Message from {guest_name}*\n> {guest_message[:2500]}"},
-        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*:email: Message from {guest_name}*\n> {guest_message[:2500]}"}},
         {"type": "divider"},
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f":bulb: *Suggested Reply:*\n{ai_reply[:3500]}"},
-        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f":bulb: *Suggested Reply:*\n{ai_reply[:3500]}"}},
     ]
-
     if context_bits:
-        blocks.insert(
-            1,
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": " • ".join(context_bits)[:300]}]},
-        )
-
+        blocks.insert(1, {"type": "context", "elements": [{"type": "mrkdwn", "text": " • ".join(context_bits)[:300]}]})
     blocks.append(_build_action_row(meta, ai_reply))
     return blocks
 
 def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
-    """
-    Pull conversation, reservation, and listing context to enrich the Slack card and AI reply.
-    """
     conversation = fetch_hostaway_conversation(conversation_id) or {}
     reservation_id = conversation.get("reservationId") or conversation.get("reservation_id")
     reservation = fetch_hostaway_reservation(reservation_id) if reservation_id else {}
@@ -199,7 +217,6 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         or "Guest"
     )
 
-    # Build short history for AI context
     history = []
     for msg in (conversation.get("messages") or []):
         role = "guest" if (msg.get("senderType") == "guest") else "host"
@@ -220,7 +237,6 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         "property_address": (listing.get("address") or {}).get("address1"),
     }
 
-    # If any portal URL exists, pass it for the "send_guest_portal" handler
     for k in ("guestPortalUrl", "guest_portal_url", "portalUrl"):
         if reservation.get(k):
             meta["guest_portal_url"] = reservation.get(k)
@@ -232,7 +248,7 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
         "guest_name": guest_name,
         "listing_info": listing or {},
         "reservation": reservation or {},
-        "history": history[-8:],  # keep prompt small
+        "history": history[-8:],
         "nearby_places": nearby or [],
     }
     return meta | {"_ai_ctx": ai_ctx}
@@ -241,7 +257,7 @@ def _collect_context_from_hostaway(conversation_id: int) -> Dict[str, Any]:
 @app.post("/unified-webhook")
 async def unified_webhook(payload: HostawayUnifiedWebhook):
     """
-    Expect Hostaway-style events:
+    Expect Hostaway-style:
       object: "conversationMessage"
       event:  "message.received"
     """
@@ -270,7 +286,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     ai_ctx = meta.get("_ai_ctx", {})
     ai_reply = generate_reply(guest_message, ai_ctx) if guest_message else "Thanks for your message! I’ll get back to you shortly."
 
-    # Log (optional)
+    # Optional logging
     try:
         log_ai_exchange(
             conversation_id=str(conv_id),
@@ -282,7 +298,7 @@ async def unified_webhook(payload: HostawayUnifiedWebhook):
     except Exception:
         pass
 
-    # Build and post Slack card (with fixed action_ids & value keys)
+    # Build & post Slack card
     blocks = _build_message_blocks(guest_message, ai_reply, meta)
     _post_to_slack(blocks, channel=_fallback_channel_for_listing(None))
 
