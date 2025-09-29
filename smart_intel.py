@@ -1,34 +1,30 @@
 # file: smart_intel.py
 
 import os
-import re
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Union
 
-# OpenAI client (1.x)
 try:
     from openai import OpenAI
-    _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    _use_client = True
+    _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    _has_client = True
 except Exception:
-    _openai_client = None
-    _use_client = False
+    _client = None
+    _has_client = False
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Distance helper from places.py (supports origin as address OR (lat,lng))
-from places import get_drive_distance_duration
-
-# ---- Small, fast "reply planner" -------------------------------------------------
-
-DISTANCE_PATTERNS = re.compile(
-    r"\b(how\s+far|distance|how\s+long|drive\s*time|minutes?\s*(away|drive))\b",
-    re.I,
+# Generic place + distance helpers (no hardcoded venues)
+from places import (
+    text_search_place,                   # NEW: resolves any free-text destination
+    get_drive_distance_duration,         # accepts address or (lat,lng) for origin/dest
 )
 
-def _parse_iso_date(s: Optional[str]) -> Optional[datetime]:
+# ---------- Utilities ----------
+
+def _parse_iso_date(s: Optional[str]):
     if not s:
         return None
     try:
@@ -36,12 +32,13 @@ def _parse_iso_date(s: Optional[str]) -> Optional[datetime]:
     except Exception:
         return None
 
-def infer_stay_phase(check_in: Optional[str], check_out: Optional[str], *, now: Optional[datetime] = None) -> str:
-    """Return 'pre_arrival' | 'in_stay' | 'post_stay' | 'unknown'."""
+def _infer_phase(check_in: Optional[str], check_out: Optional[str], now: Optional[datetime] = None) -> str:
+    """
+    pre_arrival | in_stay | post_stay | unknown
+    """
     now = now or datetime.now(timezone.utc)
     ci = _parse_iso_date(check_in)
     co = _parse_iso_date(check_out)
-
     if not ci or not co:
         return "unknown"
     if now.date() < ci.date():
@@ -52,231 +49,217 @@ def infer_stay_phase(check_in: Optional[str], check_out: Optional[str], *, now: 
         return "post_stay"
     return "unknown"
 
-def detect_distance_intent(text: str) -> bool:
-    return bool(DISTANCE_PATTERNS.search(text or ""))
-
-def normalize_destination(text: str) -> Optional[str]:
+def _pick_origin(ctx: Dict[str, Any]) -> Optional[Union[str, Tuple[float, float]]]:
     """
-    Expand common venue names to canonical queries for Google Distance Matrix.
-    Add any venues you care about here.
+    Choose best available origin: address string, else (lat,lng), else None.
     """
-    t = (text or "")
-    # COTA
-    if re.search(r"\b(cota|c\.?o\.?t\.?a\.?|circuit\s+of\s+the\s+americas)\b", t, re.I):
-        return "Circuit of the Americas, Austin, TX"
-    # H-E-B Center
-    if re.search(r"\bheb\b.*center\b", t, re.I):
-        return "H-E-B Center at Cedar Park, TX"
-    return None
-
-def pick_origin(ctx: Dict[str, Any]) -> Optional[Tuple[str, Optional[Tuple[float,float]]]]:
-    """
-    Returns a tuple (address_or_empty, coords_or_none).
-    - If address exists, returns (address, None)
-    - Else if coords exist, returns ("", (lat, lng))
-    - Else returns None
-    """
-    address = ctx.get("property_address") \
+    addr = ctx.get("property_address") \
         or ((ctx.get("listing_info") or {}).get("address") or {}).get("address1")
-
-    lat = ctx.get("latitude")
-    lng = ctx.get("longitude")
-    has_coords = isinstance(lat, (int, float)) and isinstance(lng, (int, float))
-    if address:
-        return (address, None)
-    if has_coords:
-        return ("", (float(lat), float(lng)))  # origin can be coords
+    lat = ctx.get("latitude"); lng = ctx.get("longitude")
+    if addr:
+        return addr
+    if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+        return (float(lat), float(lng))
     return None
 
-# ---- Prompt scaffolding ----------------------------------------------------------
+def _collect_core_facts(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Lift everything the writer might use; do not assume any specific Hostaway schema.
+    """
+    reservation = ctx.get("reservation") or {}
+    listing = ctx.get("listing_info") or {}
+    address1 = (listing.get("address") or {}).get("address1") or ctx.get("property_address")
 
-STYLE = """Tone: warm, concise, proactive, no fluff. Use 1–3 short sentences. One brief follow-up question at most. Never contradict known facts from context."""
+    check_in = reservation.get("checkInDate") or reservation.get("checkIn") or ctx.get("check_in")
+    check_out = reservation.get("checkOutDate") or reservation.get("checkOut") or ctx.get("check_out")
 
-def _few_shots() -> list[dict]:
-    # Short, targeted behaviors the model should imitate
-    return [
-        # Distance intent with provided data
-        {
-            "role": "user",
-            "content": json.dumps({
-                "guest_message": "How far is the HEB center from this house? I’m going to a concert there.",
-                "facts": {"phase":"pre_arrival","distance":{"distance_text":"12.4 mi","duration_text":"23 mins"}},
-            })
-        },
-        {
-            "role": "assistant",
-            "content": "It’s about 12.4 miles—roughly a 23-minute drive, depending on traffic. I can send a route if you’d like."
-        },
-        # Post-stay thank-you
-        {
-            "role": "user",
-            "content": json.dumps({
-                "guest_message": "Thank you! We enjoyed our stay!",
-                "facts": {"phase":"post_stay"}
-            })
-        },
-        {
-            "role": "assistant",
-            "content": "I’m so glad you enjoyed your stay—thanks again for choosing us! Safe travels, and we’d love to host you again."
-        },
-        # Missing data
-        {
-            "role": "user",
-            "content": json.dumps({
-                "guest_message": "How far is the arena?",
-                "facts": {"phase":"pre_arrival"},
-                "missing": ["destination"]
-            })
-        },
-        {
-            "role": "assistant",
-            "content": "Happy to help! What’s the arena’s full name? I’ll check the drive time right away."
-        },
-        # Kids activities with nearby_places
-        {
-            "role": "user",
-            "content": json.dumps({
-                "guest_message": "Any fun things for kids nearby?",
-                "facts": {
-                    "phase":"in_stay",
-                    "nearby_places":[
-                        {"label":"Family-friendly","places":[
-                            {"name":"Austin Nature & Science Center","vicinity":"301 Nature Center Dr","distance_text":"3.1 mi","duration_text":"9 mins"},
-                            {"name":"Thinkery","vicinity":"1830 Simond Ave","distance_text":"5.2 mi","duration_text":"14 mins"}
-                        ]}
-                    ]
-                }
-            })
-        },
-        {
-            "role": "assistant",
-            "content": "A couple of close kid-friendly spots: Austin Nature & Science Center (≈9 mins) and Thinkery (≈14 mins). Want more ideas or directions?"
-        },
-    ]
+    # common listing facts (best-effort)
+    def _num(x):
+        try: return int(float(x))
+        except Exception: return None
 
-SYSTEM_TEMPLATE = """You are an expert guest-messaging assistant for short-term rentals.
+    facts = {
+        "guest_name": ctx.get("guest_name"),
+        "property_name": listing.get("name") or ctx.get("property_name"),
+        "property_address": address1,
+        "latitude": ctx.get("latitude"),
+        "longitude": ctx.get("longitude"),
+        "check_in": check_in,
+        "check_out": check_out,
+        "guest_count": ctx.get("guest_count") or reservation.get("numberOfGuests"),
+        "status": ctx.get("status") or reservation.get("status"),
+        "beds": _num(listing.get("beds") or listing.get("numberOfBeds") or listing.get("bedCount")),
+        "bedrooms": _num(listing.get("bedrooms") or listing.get("numberOfBedrooms") or listing.get("bedroomsNumber")),
+        "bathrooms": _num(listing.get("bathrooms") or listing.get("numberOfBathrooms") or listing.get("bathroomsNumber")),
+        "city": (listing.get("address") or {}).get("city") or ctx.get("city"),
+        "state": (listing.get("address") or {}).get("state") or (listing.get("address") or {}).get("province") or ctx.get("state"),
+        "nearby_places": (ctx.get("nearby_places") or [])[:3],  # compact bundle if present
+    }
+    facts["phase"] = _infer_phase(check_in, check_out)
+    return facts
 
-Always:
-- Read the guest message carefully and use the provided facts.
-- Infer stay phase from dates using today's date: {today}.
-  * pre_arrival: today < check-in
-  * in_stay: check-in ≤ today ≤ check-out
-  * post_stay: today > check-out
-- If phase is post_stay, speak in past tense and thank them. Never say “enjoy the rest of your stay”.
-- For distance/time questions:
-  * If a distance fact is provided, include it succinctly (miles + minutes).
-  * If destination is recognized but distance is missing, ask for one missing input at most.
-- If local recommendations are provided (nearby_places), suggest up to 2–3 strong picks, including distance/time if present.
-- Never invent prices, addresses, or policies. Be brief and useful.
+# ---------- Prompts ----------
 
-{style}
+PLANNER_SYSTEM = """You are a planner that extracts user intent and entities from a guest message for a short-term rental host.
+Return ONLY valid JSON with these top-level keys:
+
+{
+  "wants_distance": boolean,
+  "destinations": [ {"text": string} ],           // zero or more free-text destination names found in the message
+  "wants_recommendations": boolean,               // e.g., local things to do, kid-friendly, restaurants, etc.
+  "info_questions": [ "bedrooms" | "bathrooms" | "beds" | "check_in" | "check_out" | "guest_count" | "address" ],
+  "clarifications": [ string ]                    // at most 1 concise clarification if the message is ambiguous
+}
+
+Rules:
+- Do not guess. If the user asked "how far", include "wants_distance": true and put what they wrote into "destinations" (even if vague like "downtown").
+- If they ask about the home (e.g., bedrooms), add a matching token to "info_questions".
+- If they ask for nearby activities, set "wants_recommendations": true.
+- If nothing is ambiguous, "clarifications" should be [].
 """
 
-# ---- Public entrypoint -----------------------------------------------------------
+WRITER_SYSTEM = """You are an expert guest-messaging assistant for short-term rentals.
+
+Use the provided facts exactly. Be brief, warm, and helpful:
+- 1–3 sentences. At most one short follow-up question if essential.
+- Respect stay phase (pre_arrival, in_stay, post_stay). If post_stay, use past tense and thank them.
+- If distance facts exist, include miles and minutes succinctly.
+- If bedrooms/bathrooms/beds exist and the guest asked, answer directly.
+- If local recommendations are provided, suggest up to 2–3 good picks, including minutes if present.
+- Never invent prices, addresses, or policies.
+- If a critical fact is missing and no distance was computed, ask for exactly that one piece.
+
+Output only the final message to the guest (no JSON)."""
+
+# ---------- Public entrypoint ----------
 
 def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
     """
-    ctx may include:
-      property_address, latitude, longitude,
-      listing_info, reservation, history, nearby_places (from places.build_local_recs),
-      guest_name, property_name, check_in, check_out, guest_count, status
+    Two-pass flow:
+      1) Ask the model to plan: extract intents and destination strings (no hardcoding).
+      2) Resolve destinations via Google (text search + distance) using address or (lat,lng).
+      3) Ask the model to write the final reply using all computed facts.
     """
-    # Extract facts from context
-    property_address = ctx.get("property_address") \
-        or ((ctx.get("listing_info") or {}).get("address") or {}).get("address1")
+    core = _collect_core_facts(ctx)
 
-    check_in = ctx.get("reservation", {}).get("checkInDate") \
-        or ctx.get("reservation", {}).get("checkIn") \
-        or ctx.get("check_in")
-
-    check_out = ctx.get("reservation", {}).get("checkOutDate") \
-        or ctx.get("reservation", {}).get("checkOut") \
-        or ctx.get("check_out")
-
-    guest_name = ctx.get("guest_name")
-    property_name = ctx.get("listing_info", {}).get("name") or ctx.get("property_name")
-    guest_count = ctx.get("guest_count") or ctx.get("reservation", {}).get("numberOfGuests")
-    status = ctx.get("status") or ctx.get("reservation", {}).get("status")
-    nearby_places: List[Dict[str, Any]] = ctx.get("nearby_places") or []
-
-    lat = ctx.get("latitude")
-    lng = ctx.get("longitude")
-    has_coords = isinstance(lat, (int, float)) and isinstance(lng, (int, float))
-
-    # Compute stay phase
-    phase = infer_stay_phase(check_in, check_out)
-
-    # Distance intent
-    distance = None
-    missing = []
-
-    if detect_distance_intent(guest_message):
-        destination = normalize_destination(guest_message)
-
-        # Determine origin: address or coords
-        origin_sel = pick_origin(ctx)
-        if not destination:
-            missing.append("destination")
-        if origin_sel is None:
-            # Neither address nor coords available
-            missing.append("property_location")
-
-        # Try to compute distance if we have enough
-        if destination and origin_sel is not None:
-            addr, coords = origin_sel
-            if coords:
-                # Use coords as origin
-                distance = get_drive_distance_duration(coords, destination)
-            else:
-                # Use address as origin
-                distance = get_drive_distance_duration(addr, destination)
-
-    # Prepare facts for the model
-    facts: Dict[str, Any] = {
-        "phase": phase,
-        "property_name": property_name,
-        "check_in": check_in,
-        "check_out": check_out,
-        "guest_name": guest_name,
-        "guest_count": guest_count,
-        "status": status,
-    }
-    if distance:
-        facts["distance"] = distance
-    if nearby_places:
-        # Provide up to 3 bundles; model will choose 2–3 total items
-        facts["nearby_places"] = nearby_places[:3]
-
-    # If we have coords but no address, let the model know origin was resolved (so it won't ask for it)
-    if has_coords and not property_address:
-        facts["origin_resolved"] = "coords"
-
-    user_payload = {
+    # ----- Pass 1: Planner -----
+    planner_input = {
         "guest_message": guest_message,
-        "facts": facts,
+        "available_facts": {k: v for k, v in core.items() if v is not None}
     }
-    if missing:
-        # Only include truly missing pieces (destination when unrecognized, property_location when neither addr nor coords)
-        user_payload["missing"] = missing
+    plan = {
+        "wants_distance": False,
+        "destinations": [],
+        "wants_recommendations": False,
+        "info_questions": [],
+        "clarifications": [],
+    }
 
-    system = SYSTEM_TEMPLATE.format(today=datetime.now().date(), style=STYLE)
-    messages = [{"role": "system", "content": system}] + _few_shots() + [
-        {"role": "user", "content": json.dumps(user_payload)}
-    ]
-
-    # Call OpenAI
     try:
-        if _use_client and _openai_client:
-            resp = _openai_client.chat.completions.create(
+        if _has_client and _client:
+            p = _client.chat.completions.create(
                 model=OPENAI_MODEL,
-                messages=messages,
-                temperature=0.3,
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": PLANNER_SYSTEM},
+                    {"role": "user", "content": json.dumps(planner_input)}
+                ],
+                response_format={"type": "json_object"},
             )
-            return (resp.choices[0].message.content or "").strip()
+            plan = json.loads(p.choices[0].message.content or "{}")
     except Exception as e:
-        logging.warning(f"OpenAI call failed: {e}")
+        logging.warning(f"Planner call failed, falling back: {e}")
 
-    # Fallback if the model call fails
-    if phase == "post_stay":
+    # ----- Resolve destinations (generic) -----
+    distances: List[Dict[str, Any]] = []
+    origin = _pick_origin(ctx)
+
+    if plan.get("wants_distance") and origin is not None:
+        dest_items = plan.get("destinations") or []
+        # Use city/state to bias search if present
+        bias_lat = core.get("latitude") if isinstance(core.get("latitude"), (int, float)) else None
+        bias_lng = core.get("longitude") if isinstance(core.get("longitude"), (int, float)) else None
+        city = core.get("city"); state = core.get("state")
+
+        for d in dest_items:
+            dest_text = (d or {}).get("text")
+            if not dest_text:
+                continue
+            # 1) Resolve free-text destination to a place (lat/lng + name/address)
+            place = text_search_place(
+                query=dest_text,
+                bias_lat=bias_lat,
+                bias_lng=bias_lng,
+                city=city,
+                state=state,
+            )
+            if not place:
+                continue
+
+            # 2) Compute distance using best available origin
+            try:
+                if isinstance(origin, tuple):
+                    dist = get_drive_distance_duration(origin, (place["lat"], place["lng"]))
+                else:
+                    # origin is an address string
+                    dist = get_drive_distance_duration(origin, place["formatted_address"] or place["name"])
+            except Exception as e:
+                logging.warning(f"Distance calc failed for {dest_text}: {e}")
+                dist = None
+
+            if dist:
+                distances.append({
+                    "to_name": place["name"],
+                    "to_address": place["formatted_address"],
+                    "distance_text": dist.get("distance_text"),
+                    "duration_text": dist.get("duration_text"),
+                })
+
+    # ----- Build writer facts -----
+    writer_facts = {k: v for k, v in core.items() if v is not None}
+    if distances:
+        writer_facts["distances"] = distances
+
+    # If user asked bedrooms/baths/beds, keep those visible
+    asked = set(plan.get("info_questions") or [])
+    if "bedrooms" in asked and core.get("bedrooms") is None:
+        writer_facts["missing_bedrooms"] = True
+    if "bathrooms" in asked and core.get("bathrooms") is None:
+        writer_facts["missing_bathrooms"] = True
+    if "beds" in asked and core.get("beds") is None:
+        writer_facts["missing_beds"] = True
+
+    # If they want recommendations and you computed nearby bundle earlier
+    if plan.get("wants_recommendations") and core.get("nearby_places"):
+        writer_facts["nearby_places"] = core["nearby_places"]
+
+    # If planner thought a single clarification is essential and we still have zero distance results,
+    # allow the writer to ask for that one missing item.
+    clarifications = plan.get("clarifications") or []
+    if clarifications and not distances:
+        writer_facts["planner_clarification"] = clarifications[0]
+
+    # ----- Pass 2: Writer -----
+    writer_input = {
+        "guest_message": guest_message,
+        "facts": writer_facts
+    }
+
+    try:
+        if _has_client and _client:
+            r = _client.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.3,
+                messages=[
+                    {"role": "system", "content": WRITER_SYSTEM},
+                    {"role": "user", "content": json.dumps(writer_input)}
+                ],
+            )
+            return (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        logging.warning(f"Writer call failed: {e}")
+
+    # Safe fallback
+    if core.get("phase") == "post_stay":
         return "Thanks so much for staying with us—glad to hear everything went well! Safe travels home."
     return "Thanks for your message! I’ll take a look and follow up shortly."
