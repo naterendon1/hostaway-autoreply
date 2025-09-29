@@ -376,3 +376,34 @@ def debug_slack():
 
 # Mount Slack interactivity routes (/slack/actions, etc.)
 app.include_router(slack_router, prefix="/slack")
+
+# --- health check (append near the end of main.py) ---
+@app.get("/healthz")
+def healthz():
+    def present(name: str) -> str:
+        v = os.getenv(name)
+        return "SET" if v and len(v) > 3 else "MISSING"
+
+    checks = {
+        "SLACK_SIGNING_SECRET": present("SLACK_SIGNING_SECRET"),
+        "SLACK_BOT_TOKEN": present("SLACK_BOT_TOKEN"),
+        "SLACK_CHANNEL_ID": os.getenv("SLACK_CHANNEL_ID") or "unset",
+        "OPENAI_API_KEY": present("OPENAI_API_KEY"),
+        "OPENAI_MODEL": os.getenv("OPENAI_MODEL") or "default",
+        "GOOGLE_PLACES_API_KEY": present("GOOGLE_PLACES_API_KEY"),
+        "GOOGLE_DISTANCE_MATRIX_API_KEY": os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY") and "SET" or "MISSING/using PLACES key",
+        "HOSTAWAY_CLIENT_ID": present("HOSTAWAY_CLIENT_ID"),
+        "HOSTAWAY_CLIENT_SECRET": present("HOSTAWAY_CLIENT_SECRET"),
+    }
+
+    hints = []
+    if checks["GOOGLE_PLACES_API_KEY"] == "MISSING":
+        hints.append("Set GOOGLE_PLACES_API_KEY for place search.")
+    if checks["HOSTAWAY_CLIENT_ID"] == "MISSING" or checks["HOSTAWAY_CLIENT_SECRET"] == "MISSING":
+        hints.append("Set HOSTAWAY_CLIENT_ID and HOSTAWAY_CLIENT_SECRET for Hostaway messaging.")
+    if checks["SLACK_SIGNING_SECRET"] == "MISSING" or checks["SLACK_BOT_TOKEN"] == "MISSING":
+        hints.append("Set Slack credentials to handle events/actions.")
+
+    status = 200 if not [k for k, v in checks.items() if v == "MISSING"] else 500
+    return {"status": "ok" if status == 200 else "missing_env", "checks": checks, "hints": hints}
+
