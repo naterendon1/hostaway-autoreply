@@ -410,9 +410,17 @@ def send_reply_to_hostaway(conversation_id: str, reply_text: str, communication_
         return False
     url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
     payload = {"body": reply_text, "isIncoming": 0, "communicationType": communication_type}
-    headers = {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {t}", "Content-Type": "application/json; charset=utf-8"}
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=15)
+        if r.status_code == 401:
+            # token likely expired mid-flight — refresh once
+            t = get_hostaway_access_token()
+            if not t:
+                logging.error("Failed to refresh Hostaway token after 401")
+                return False
+            headers["Authorization"] = f"Bearer {t}"
+            r = requests.post(url, headers=headers, json=payload, timeout=15)
         r.raise_for_status()
         logging.info(f"✅ Sent to Hostaway: {r.text}")
         return True
