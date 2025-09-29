@@ -33,6 +33,7 @@ PLACES_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 DM_KEY = os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY") or PLACES_KEY
 
 PLACES_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+PLACES_TEXTSEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 DM_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
 
 def _maps_url(place_id: str) -> str:
@@ -157,25 +158,87 @@ def build_local_recs(lat: Optional[float], lng: Optional[float], guest_text: str
 
     return bundle
 
-def get_drive_distance_duration(origin: Union[str, Tuple[float,float]], destination_text: str) -> Optional[Dict[str,str]]:
+# --- NEW: generic text search for ANY destination (no hardcoded venues) ---
+def text_search_place(
+    query: str,
+    *,
+    bias_lat: Optional[float] = None,
+    bias_lng: Optional[float] = None,
+    city: Optional[str] = None,
+    state: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    Returns {'distance_text': '12.3 mi', 'duration_text': '22 mins'} or None.
-    - origin can be an address string OR a (lat, lng) tuple.
-    - destination_text can be a place name or address (Google will resolve it).
+    Resolve any free-text destination with Google Places Text Search.
+    Returns: {"name","formatted_address","lat","lng","place_id"} or None.
     """
-    if not DM_KEY or not destination_text:
+    if not PLACES_KEY or not query:
         return None
-    if isinstance(origin, tuple):
-        origin_param = f"{origin[0]},{origin[1]}"
-    else:
-        origin_param = origin
-    if not origin_param:
+
+    # Nudge vague queries like "downtown" with city/state if available
+    q = query
+    if city and ("downtown" in query.lower()) and city.lower() not in query.lower():
+        q = f"{query} {city}{(' ' + state) if state else ''}"
+
+    params = {
+        "key": PLACES_KEY,
+        "query": q,
+        "region": "us",
+    }
+    if isinstance(bias_lat, (int, float)) and isinstance(bias_lng, (int, float)):
+        params["location"] = f"{bias_lat},{bias_lng}"
+        params["radius"] = "50000"  # 50km search bias
+
+    try:
+        r = requests.get(PLACES_TEXTSEARCH_URL, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") not in ("OK", "ZERO_RESULTS"):
+            logging.warning(f"Text search non-OK: {data.get('status')}")
+        results = (data.get("results") or [])
+        if not results:
+            return None
+        top = results[0]
+        geom = (top.get("geometry") or {}).get("location") or {}
+        return {
+            "name": top.get("name"),
+            "formatted_address": top.get("formatted_address"),
+            "lat": geom.get("lat"),
+            "lng": geom.get("lng"),
+            "place_id": top.get("place_id"),
+        }
+    except Exception as e:
+        logging.warning(f"text_search_place failed: {e}")
+        return None
+
+def get_drive_distance_duration(
+    origin: Union[str, Tuple[float, float]],
+    destination: Union[str, Tuple[float, float]],
+) -> Optional[Dict[str, str]]:
+    """
+    Generic Distance Matrix helper.
+    - origin: address string OR (lat, lng)
+    - destination: address string OR (lat, lng)
+    Returns {'distance_text': '12.3 mi', 'duration_text': '22 mins'} or None.
+    """
+    if not DM_KEY or not origin or not destination:
+        return None
+
+    def _fmt(v: Union[str, Tuple[float, float]]) -> Optional[str]:
+        if isinstance(v, tuple) and len(v) == 2:
+            return f"{v[0]},{v[1]}"
+        if isinstance(v, str):
+            return v
+        return None
+
+    orig = _fmt(origin)
+    dest = _fmt(destination)
+    if not orig or not dest:
         return None
 
     params = {
         "key": DM_KEY,
-        "origins": origin_param,
-        "destinations": destination_text,
+        "origins": orig,
+        "destinations": dest,
         "mode": "driving",
         "units": "imperial",
     }
@@ -193,7 +256,7 @@ def get_drive_distance_duration(origin: Union[str, Tuple[float,float]], destinat
             "duration_text": (elem.get("duration") or {}).get("text"),
         }
     except Exception as e:
-        logging.warning(f"Single-destination Distance Matrix failed: {e}")
+        logging.warning(f"Distance Matrix failed: {e}")
         return None
 
 # ---------- Category inference ----------
