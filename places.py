@@ -4,6 +4,31 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple, Union
 import requests
 import re
+# --- reliability primitives (add near the top of places.py) ---
+import time, math
+import requests
+
+SESSION = requests.Session()
+DEFAULT_TIMEOUT = 12  # seconds
+
+def _req_with_retry(url: str, params: dict, tries: int = 2) -> requests.Response:
+    last_exc = None
+    for i in range(tries):
+        try:
+            r = SESSION.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(1.2 * (i + 1))
+            else:
+                r.raise_for_status()
+        except Exception as e:
+            last_exc = e
+            time.sleep(0.7 * (i + 1))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unknown request failure")
+
 
 # ---------- Intent heuristics ----------
 FOOD_POS = re.compile(r"\b(restaurant|eat|dinner|lunch|breakfast|coffee|cafe|brunch|bar|brewery|pizza|sushi)\b", re.I)
@@ -160,103 +185,72 @@ def build_local_recs(lat: Optional[float], lng: Optional[float], guest_text: str
 # --- NEW: generic text search for ANY destination (no hardcoded venues) ---
 def text_search_place(
     query: str,
-    *,
     bias_lat: Optional[float] = None,
     bias_lng: Optional[float] = None,
     city: Optional[str] = None,
     state: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Resolve any free-text destination with Google Places Text Search.
-    Returns: {"name","formatted_address","lat","lng","place_id"} or None.
-    """
-    if not PLACES_KEY or not query:
+    if not PLACES_KEY:
+        logging.warning("GOOGLE_PLACES_API_KEY missing")
         return None
 
-    # Light nudge for vague "downtown" queries with city/state if available
-    q = query
-    if city and ("downtown" in query.lower()) and city.lower() not in query.lower():
-        q = f"{query} {city}{(' ' + state) if state else ''}"
+    full_query = query
+    bias_suffix = " ".join([p for p in [city, state] if p])
+    if bias_suffix:
+        full_query = f"{query} {bias_suffix}"
 
-    params = {
-        "key": PLACES_KEY,
-        "query": q,
-        "region": "us",
-    }
-    if isinstance(bias_lat, (int, float)) and isinstance(bias_lng, (int, float)):
+    params = {"query": full_query, "key": PLACES_KEY}
+    if bias_lat is not None and bias_lng is not None:
         params["location"] = f"{bias_lat},{bias_lng}"
-        params["radius"] = "50000"  # 50km bias
+        params["radius"] = 20000  # ~12mi bias
 
-    try:
-        r = requests.get(PLACES_TEXTSEARCH_URL, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") not in ("OK", "ZERO_RESULTS"):
-            logging.warning(f"Text search non-OK: {data.get('status')}")
-        results = (data.get("results") or [])
-        if not results:
-            return None
-        top = results[0]
-        geom = (top.get("geometry") or {}).get("location") or {}
-        return {
-            "name": top.get("name"),
-            "formatted_address": top.get("formatted_address"),
-            "lat": geom.get("lat"),
-            "lng": geom.get("lng"),
-            "place_id": top.get("place_id"),
-        }
-    except Exception as e:
-        logging.warning(f"text_search_place failed: {e}")
-        return None
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    data = _req_with_retry(url, params).json()
+    status = data.get("status")
+    if status not in ("OK", "ZERO_RESULTS"):
+        logging.warning(f"Places Text Search status={status} error={data.get('error_message')}")
+    results = data.get("results") or []
+    return results[0] if results else None
+
 
 def get_drive_distance_duration(
     origin: Union[str, Tuple[float, float]],
     destination: Union[str, Tuple[float, float]],
-) -> Optional[Dict[str, str]]:
-    """
-    Generic Distance Matrix helper.
-    - origin: address string OR (lat, lng)
-    - destination: address string OR (lat, lng)
-    Returns {'distance_text': '12.3 mi', 'duration_text': '22 mins'} or None.
-    """
-    if not DM_KEY or not origin or not destination:
+) -> Optional[Dict[str, Any]]:
+    if not DM_KEY:
+        logging.warning("No Distance Matrix key available (falling back to PLACES key if configured)")
         return None
 
-    def _fmt(v: Union[str, Tuple[float, float]]) -> Optional[str]:
-        if isinstance(v, tuple) and len(v) == 2:
-            return f"{v[0]},{v[1]}"
-        if isinstance(v, str):
-            return v
-        return None
-
-    orig = _fmt(origin)
-    dest = _fmt(destination)
-    if not orig or not dest:
-        return None
+    def fmt(x):
+        if isinstance(x, (tuple, list)) and len(x) == 2:
+            return f"{x[0]},{x[1]}"
+        return x
 
     params = {
+        "origins": fmt(origin),
+        "destinations": fmt(destination),
         "key": DM_KEY,
-        "origins": orig,
-        "destinations": dest,
         "mode": "driving",
-        "units": "imperial",
+        "departure_time": "now",
     }
-    try:
-        r = requests.get(DM_URL, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") != "OK":
-            return None
-        elem = (data["rows"][0]["elements"][0] if data.get("rows") else None) or {}
-        if elem.get("status") != "OK":
-            return None
-        return {
-            "distance_text": (elem.get("distance") or {}).get("text"),
-            "duration_text": (elem.get("duration") or {}).get("text"),
-        }
-    except Exception as e:
-        logging.warning(f"Distance Matrix failed: {e}")
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    data = _req_with_retry(url, params).json()
+    if data.get("status") != "OK":
+        logging.warning(f"Distance Matrix status={data.get('status')} error={data.get('error_message')}")
         return None
+
+    rows = data.get("rows") or []
+    if not rows or not rows[0].get("elements"):
+        return None
+    el = rows[0]["elements"][0]
+    if el.get("status") != "OK":
+        return None
+
+    meters = el["distance"]["value"]
+    seconds = el.get("duration_in_traffic", el.get("duration", {})).get("value", 0)
+    miles = round(meters / 1609.344, 1)
+    minutes = max(1, math.ceil(seconds / 60)) if seconds else None
+    return {"miles": miles, "minutes": minutes, "raw": el}
 
 # ---------- Category inference ----------
 def _infer_categories(guest_text: str) -> List[Dict[str, Any]]:
