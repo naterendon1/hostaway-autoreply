@@ -4,7 +4,6 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple, Union
 import requests
 import re
-import urllib.parse
 
 # ---------- Intent heuristics ----------
 FOOD_POS = re.compile(r"\b(restaurant|eat|dinner|lunch|breakfast|coffee|cafe|brunch|bar|brewery|pizza|sushi)\b", re.I)
@@ -174,7 +173,7 @@ def text_search_place(
     if not PLACES_KEY or not query:
         return None
 
-    # Nudge vague queries like "downtown" with city/state if available
+    # Light nudge for vague "downtown" queries with city/state if available
     q = query
     if city and ("downtown" in query.lower()) and city.lower() not in query.lower():
         q = f"{query} {city}{(' ' + state) if state else ''}"
@@ -186,7 +185,7 @@ def text_search_place(
     }
     if isinstance(bias_lat, (int, float)) and isinstance(bias_lng, (int, float)):
         params["location"] = f"{bias_lat},{bias_lng}"
-        params["radius"] = "50000"  # 50km search bias
+        params["radius"] = "50000"  # 50km bias
 
     try:
         r = requests.get(PLACES_TEXTSEARCH_URL, params=params, timeout=10)
