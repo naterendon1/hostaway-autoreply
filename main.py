@@ -37,7 +37,7 @@ except Exception:
 try:
     from slack_interactivity import (
         router as slack_router,
-        build_rich_header_blocks,   # rich header builder we used in cards
+        build_rich_header_blocks,   # rich header builder for Slack cards
     )
 except Exception as e:
     slack_router = None
@@ -65,7 +65,7 @@ except Exception:
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
-# ✅ IMPORTANT: Slack app must call /slack/events and /slack/actions
+# ✅ IMPORTANT: Slack must call /slack/events and /slack/actions
 if slack_router:
     app.include_router(slack_router, prefix="/slack")
 
@@ -264,6 +264,11 @@ def _post_initial_slack_card(
 async def root():
     return {"ok": True, "service": "hostaway-autoresponder"}
 
+# ✅ Render’s default health probe hits GET /ping — add it
+@app.get("/ping")
+async def ping():
+    return PlainTextResponse("ok")
+
 @app.get("/healthz")
 async def healthz():
     def present(name: str) -> str:
@@ -422,4 +427,5 @@ async def hostaway_webhook(request: Request):
 # ---------------------- Run local ----------------------
 if __name__ == "__main__":
     import uvicorn
+    from fastapi.responses import PlainTextResponse
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
