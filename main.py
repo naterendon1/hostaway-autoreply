@@ -7,7 +7,14 @@ from typing import Any, Dict, Optional, Tuple, List
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# Slack SDK (used only to post the initial card)
+# ---------------- Env & logging ----------------
+logging.basicConfig(level=logging.INFO)
+app = FastAPI()
+
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
+
+# ---------------- Slack SDK (optional at import time) ----------------
 try:
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
@@ -15,67 +22,68 @@ except Exception:
     WebClient = None
     SlackApiError = Exception
 
-# --- Local imports ---
-from utils import (
-    make_suggested_reply,
-    fetch_hostaway_listing,
-    fetch_hostaway_reservation,
-    extract_destination_from_message,
-    resolve_place_textsearch,      # legacy (kept)
-    get_distance_drive_time,       # legacy (kept)
-    route_message,                 # quick intent tag for header
-)
+slack_client = WebClient(token=SLACK_BOT_TOKEN) if (SLACK_BOT_TOKEN and WebClient) else None
 
-# Improved Google helpers (bias + robust distance). Optional.
+# ---------------- Local modules (all optional, with safe fallbacks) ----------------
+# utils: core Hostaway & AI helpers you already use
+try:
+    from utils import (
+        make_suggested_reply,
+        fetch_hostaway_listing,
+        fetch_hostaway_reservation,
+        fetch_hostaway_conversation,
+        extract_destination_from_message,
+        get_distance_drive_time,        # legacy text-path distance
+        route_message,                  # simple intent tag
+        send_reply_to_hostaway,         # used by interactivity router typically
+    )
+except Exception:
+    def make_suggested_reply(*args, **kwargs): return ("Thanks for reaching out—happy to help!", "general")
+    def fetch_hostaway_listing(*args, **kwargs): return {}
+    def fetch_hostaway_reservation(*args, **kwargs): return {}
+    def fetch_hostaway_conversation(*args, **kwargs): return {}
+    def extract_destination_from_message(*args, **kwargs): return None
+    def get_distance_drive_time(*args, **kwargs): return ""
+    def route_message(*args, **kwargs): return {"primary_intent": "other"}
+    def send_reply_to_hostaway(*args, **kwargs): return False
+
+# smarter writer
+try:
+    from smart_intel import generate_reply
+except Exception:
+    generate_reply = None
+
+# optional db idempotency/logging
+try:
+    from db import already_processed, mark_processed, log_ai_exchange
+except Exception:
+    def already_processed(key: str) -> bool: return False
+    def mark_processed(key: str) -> None: return None
+    def log_ai_exchange(*args, **kwargs): return None
+
+# google helpers (optional)
 try:
     from places import text_search_place, get_drive_distance_duration
 except Exception:
     text_search_place = None
     get_drive_distance_duration = None
 
-# Mount Slack interactivity router (events + actions live there)
+# nearby recs (optional)
 try:
-    from slack_interactivity import (
-        router as slack_router,
-        build_rich_header_blocks,   # rich header builder used for cards
-    )
-except Exception as e:
-    slack_router = APIRouter()
-    logging.warning(f"Slack interactivity router not available: {e}")
-
-    def build_rich_header_blocks(**kwargs):
-        # Minimal fallback header if import fails
-        meta = kwargs.get("meta", {}) or {}
-        guest_msg = kwargs.get("guest_msg", "")
-        sent_reply = kwargs.get("sent_reply")
-        lines = [
-            {"type": "header", "text": {"type": "plain_text", "text": "Guest Message", "emoji": True}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Guest:* {meta.get('guest_name','Guest')}"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"> {guest_msg}"}},
-        ]
-        if sent_reply is not None:
-            lines += [{"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}}]
-        return lines
-
-# Smarter two-pass writer
-try:
-    from smart_intel import generate_reply
+    from places import build_local_recs, should_fetch_local_recs
 except Exception:
-    generate_reply = None
+    def build_local_recs(*args, **kwargs): return []
+    def should_fetch_local_recs(*args, **kwargs): return False
 
-logging.basicConfig(level=logging.INFO)
-app = FastAPI()
+# Slack interactivity router (your actions/events handlers)
+try:
+    from slack_interactivity import router as slack_router
+except Exception:
+    slack_router = APIRouter()
 
-# Important: mount Slack router at /slack (matches typical Slack config)
 app.include_router(slack_router, prefix="/slack")
 
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")  # channel ID to post the initial card
-slack_client = WebClient(token=SLACK_BOT_TOKEN) if (SLACK_BOT_TOKEN and WebClient) else None
-
-
-# ---------------------------- Utilities ----------------------------
-
+# ---------------- Small helpers ----------------
 def _safe_get(d: Dict[str, Any], *keys, default=None):
     cur = d
     for k in keys:
@@ -86,15 +94,21 @@ def _safe_get(d: Dict[str, Any], *keys, default=None):
             return default
     return cur
 
+def _fmt_date(d: Optional[str]) -> str:
+    if not d:
+        return "N/A"
+    from datetime import datetime
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(d, fmt).strftime("%m-%d-%Y")
+        except Exception:
+            continue
+    return d  # last resort
+
 def _extract_listing_context_from_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extract address/city/state/lat/lng directly from webhook payload.
-    If missing, try to fetch by listingMapId using fetch_hostaway_listing.
-    """
     ctx: Dict[str, Any] = {
         "address": None, "city": None, "state": None, "zipcode": None, "lat": None, "lng": None, "name": None
     }
-
     listing = data.get("listing") or data.get("property") or {}
     for k in ("address", "city", "state", "zipcode", "lat", "lng", "street", "name"):
         v = listing.get(k)
@@ -103,13 +117,11 @@ def _extract_listing_context_from_payload(data: Dict[str, Any]) -> Dict[str, Any
                 ctx["address"] = v
             elif k in ctx:
                 ctx[k] = v
-
     for k in ("address", "city", "state", "zipcode", "lat", "lng", "street", "name"):
         if ctx.get("address") is None and k == "street" and data.get("street"):
             ctx["address"] = data.get("street")
         elif ctx.get(k) in (None, "") and data.get(k) not in (None, ""):
             ctx[k] = data.get(k)
-
     listing_id = data.get("listingMapId") or _safe_get(data, "reservation", "listingMapId")
     if (ctx.get("lat") is None or ctx.get("lng") is None or not ctx.get("name")) and listing_id:
         try:
@@ -123,36 +135,23 @@ def _extract_listing_context_from_payload(data: Dict[str, Any]) -> Dict[str, Any
                     ctx[k] = fv
         except Exception as e:
             logging.info(f"[ctx] listing fetch failed for id={listing_id}: {e}")
-
     if not ctx.get("address"):
         if ctx.get("city") or ctx.get("state"):
             ctx["address"] = ", ".join([p for p in [ctx.get("city"), ctx.get("state")] if p]) or None
-
     return ctx
 
-def _normalize_named_place(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
-    t = raw.strip()
-    if t.lower().replace(".", "").strip().startswith("heb center"):
-        return "H-E-B Center"
-    return t
-
 def _resolve_named_place_and_distance(listing_ctx: Dict[str, Any], guest_text: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    lat = listing_ctx.get("lat")
-    lng = listing_ctx.get("lng")
-    city = listing_ctx.get("city")
-    state = listing_ctx.get("state")
+    lat = listing_ctx.get("lat"); lng = listing_ctx.get("lng")
     if lat is None or lng is None:
         return None, None
-
+    # extract destination
     dest_query = extract_destination_from_message(guest_text) or ""
-    dest_query = _normalize_named_place(dest_query)
     if not dest_query:
         return None, None
-
+    # robust path
     if text_search_place and get_drive_distance_duration:
         try:
+            city = listing_ctx.get("city"); state = listing_ctx.get("state")
             place = text_search_place(dest_query, float(lat), float(lng), city, state)
             if not place:
                 return dest_query, None
@@ -163,13 +162,12 @@ def _resolve_named_place_and_distance(listing_ctx: Dict[str, Any], guest_text: s
             dist = get_drive_distance_duration((float(lat), float(lng)), (float(dlat), float(dlng)))
             return (place.get("name") or dest_query), dist
         except Exception as e:
-            logging.info(f"[distance] robust path failed, will try legacy. err={e}")
-
+            logging.info(f"[distance] robust path failed, fallback. err={e}")
+    # legacy path
     try:
         dm_text = get_distance_drive_time(float(lat), float(lng), dest_query)
         import re
-        miles = None
-        minutes = None
+        miles = None; minutes = None
         m = re.search(r"\(([\d\.]+)\s*mi\)", dm_text)
         if m:
             miles = float(m.group(1))
@@ -178,158 +176,115 @@ def _resolve_named_place_and_distance(listing_ctx: Dict[str, Any], guest_text: s
             minutes = int(m2.group(1))
         dist = {"miles": miles, "minutes": minutes} if (miles or minutes) else None
         return dest_query, dist
-    except Exception as e:
-        logging.info(f"[distance] legacy path failed: {e}")
+    except Exception:
         return dest_query, None
 
-def _detect_intent_label(guest_message: str) -> str:
-    try:
-        r = route_message(guest_message)
-        return r.get("primary_intent", "other")
-    except Exception:
-        return "other"
-
-# ------------- Slack helpers: build initial card with actions -------------
-
-def _action_button(action_id: str, text: str, meta: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "type": "button",
-        "action_id": action_id,
-        "text": {"type": "plain_text", "text": text, "emoji": True},
-        "value": json.dumps(meta),
-    }
-
-def _action_row(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-    elems = [
-        _action_button("edit", "Edit", meta),
-        _action_button("write_own", "Write own", meta),
-        _action_button("send", "Send", meta),
-    ]
-    if meta.get("guest_portal_url") or meta.get("guestPortalUrl"):
-        elems.append(_action_button("send_guest_portal", "Send guest portal", meta))
-    return [{"type": "actions", "elements": elems}]
-
-def _feedback_row(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-    elems = [
-        _action_button("rate_up", "👍 Useful", meta),
-        _action_button("rate_down", "👎 Needs work", meta),
-    ]
-    return [{"type": "actions", "elements": elems}]
-
 def _post_initial_slack_card(
-    *,
-    channel: str,
-    guest_message: str,
-    ai_suggestion: str,
-    meta: Dict[str, Any],
-    detected_intent: Optional[str],
+    *, channel: str, guest_message: str, ai_suggestion: str, meta: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
     if not slack_client or not channel:
+        logging.warning("Slack not configured; skipping card.")
         return None
 
-    header_blocks = build_rich_header_blocks(
-        meta=meta,
-        guest_msg=guest_message,
-        sent_reply=None,
-        detected_intent=detected_intent,
-        sent_label=None,
-        saved_for_learning=False,
+    # Main section (address instead of name for clarity)
+    header_text = (
+        f"*✉️ Message from {meta.get('guest_name','Guest')}*\n"
+        f"🏡 *Property:* {meta.get('property_address','Unknown Address')}\n"
+        f"📅 *Dates:* {meta.get('check_in','N/A')} → {meta.get('check_out','N/A')}\n"
+        f"👥 *Guests:* {meta.get('guest_count','?')} | Res: *{meta.get('status','N/A')}* | "
+        f"Price: *{meta.get('price_str','$N/A')}* | Platform: *{meta.get('platform','Unknown')}*\n\n"
+        f"{guest_message}"
     )
-    suggestion_block = [{
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": f"*AI suggestion:*\n>{ai_suggestion}"},
-    }]
 
-    blocks = header_blocks + [{"type": "divider"}] + suggestion_block + _action_row(meta) + _feedback_row(meta)
+    blocks: List[Dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"💡 *Suggested Reply:*\n{ai_suggestion}"}},
+        {
+            "type": "actions",
+            "block_id": "action_buttons",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Send"},
+                    "style": "primary",
+                    "action_id": "send_reply",
+                    "value": json.dumps({
+                        "conversation_id": meta.get("conv_id"),
+                        "reply_text": ai_suggestion
+                    })
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Edit"},
+                    "action_id": "open_edit_modal",
+                    "value": json.dumps({
+                        "guest_name": meta.get("guest_name"),
+                        "guest_message": guest_message,
+                        "draft_text": ai_suggestion
+                    })
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Send Guest Portal"},
+                    "action_id": "send_guest_portal",
+                    "value": json.dumps({
+                        "conversation_id": meta.get("conv_id")
+                    })
+                },
+            ]
+        }
+    ]
 
     try:
-        resp = slack_client.chat_postMessage(channel=channel, text="New guest message", blocks=blocks)
+        resp = slack_client.chat_postMessage(channel=channel, blocks=blocks, text="New guest message")
         return resp.data if hasattr(resp, "data") else resp
     except SlackApiError as e:
-        logging.error(f"[slack] post card failed: {e.response.data if hasattr(e,'response') else e}")
+        logging.error(f"[slack] chat_postMessage failed: {e.response.data if hasattr(e,'response') else e}")
         return None
 
-
-# ----------------------------- Routes -----------------------------
-
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "hostaway-autoresponder"}
-
-@app.get("/ping")
-async def ping():
-    # Render pings this path; return 200 OK
-    return PlainTextResponse("ok")
-
-@app.get("/healthz")
-async def healthz():
-    def present(name: str) -> str:
-        v = os.getenv(name)
-        return "SET" if v and len(v) > 3 else "MISSING"
-
-    checks = {
-        "SLACK_BOT_TOKEN": present("SLACK_BOT_TOKEN"),
-        "OPENAI_API_KEY": present("OPENAI_API_KEY"),
-        "OPENAI_MODEL": os.getenv("OPENAI_MODEL") or "default",
-        "GOOGLE_PLACES_API_KEY": present("GOOGLE_PLACES_API_KEY"),
-        "GOOGLE_DISTANCE_MATRIX_API_KEY": os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY") and "SET" or "MISSING/using PLACES key",
-        "HOSTAWAY_CLIENT_ID": present("HOSTAWAY_CLIENT_ID"),
-        "HOSTAWAY_CLIENT_SECRET": present("HOSTAWAY_CLIENT_SECRET"),
-        "SLACK_CHANNEL": "SET" if SLACK_CHANNEL else "MISSING",
-    }
-    hints = []
-    if checks["GOOGLE_PLACES_API_KEY"] == "MISSING":
-        hints.append("Set GOOGLE_PLACES_API_KEY for place search.")
-    if checks["HOSTAWAY_CLIENT_ID"] == "MISSING" or checks["HOSTAWAY_CLIENT_SECRET"] == "MISSING":
-        hints.append("Set HOSTAWAY_CLIENT_ID and HOSTAWAY_CLIENT_SECRET for Hostaway messaging.")
-    if checks["SLACK_CHANNEL"] == "MISSING":
-        hints.append("Set SLACK_CHANNEL to post initial Slack cards.")
-
-    status = 200 if not [k for k, v in checks.items() if v == "MISSING"] else 500
-    return JSONResponse({"status": "ok" if status == 200 else "missing_env", "checks": checks, "hints": hints}, status_code=status)
-
-# ---- tolerant body parser for Hostaway webhooks ----
-
-async def _parse_hostaway_request(request: Request) -> Dict[str, Any]:
-    """
-    Accepts JSON, urlencoded forms containing JSON in a field (payload/data/...) or raw JSON string.
-    Returns a dict or raises HTTPException(400).
-    """
-    # 1) Try JSON directly
+# ---------------- Tolerant Hostaway payload reader (fix for 400s) ----------------
+async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
+    # 1) JSON body
     try:
-        return await request.json()
+        body = await request.json()
+        if isinstance(body, dict):
+            return body
     except Exception:
         pass
 
-    # 2) Try reading raw and parsing as JSON string
-    try:
-        raw = await request.body()
-        if raw:
-            s = raw.decode("utf-8", errors="ignore").strip()
-            # If the whole body is just JSON text
-            if s.startswith("{") and s.endswith("}"):
+    # 2) Raw JSON string
+    raw = await request.body()
+    if raw:
+        s = raw.decode("utf-8", "ignore").strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
                 return json.loads(s)
-    except Exception:
-        pass
+            except Exception:
+                pass
 
-    # 3) Try form-encoded (Hostaway sometimes sends form with a JSON string)
+    # 3) Form-encoded with JSON string inside
     try:
         form = await request.form()
-        # Look for a likely JSON-bearing field
-        candidates = ["payload", "data", "event", "body"]
-        for key in candidates:
+        # common keys Hostaway/relays use
+        for key in ("payload", "data", "event", "body"):
             if key in form and form[key]:
-                try:
-                    return json.loads(form[key])
-                except Exception:
-                    # Sometimes the value itself is a one-key stringified dict like {"data":"{...}"}
-                    try:
-                        maybe = json.loads(str(form[key]))
-                        if isinstance(maybe, dict):
-                            return maybe
-                    except Exception:
-                        pass
-        # If there is only one key and its value looks like JSON, try that
+                val = form[key]
+                if isinstance(val, (str, bytes)):
+                    if isinstance(val, bytes):
+                        val = val.decode("utf-8", "ignore")
+                    val = val.strip()
+                    if val.startswith("{"):
+                        try:
+                            return json.loads(val)
+                        except Exception:
+                            # sometimes nested JSON string once more
+                            try:
+                                inner = json.loads(json.loads(val))
+                                if isinstance(inner, dict):
+                                    return inner
+                            except Exception:
+                                pass
+        # one-key form where the only value is JSON
         if len(form.keys()) == 1:
             only_key = list(form.keys())[0]
             val = form[only_key]
@@ -341,145 +296,216 @@ async def _parse_hostaway_request(request: Request) -> Dict[str, Any]:
     except Exception:
         pass
 
-    raise HTTPException(status_code=400, detail="invalid json")
+    # Last resort: don't 400 to avoid retries; just ignore politely
+    return {}
 
-# --------------- Hostaway unified webhook ---------------
+# ---------------- Routes ----------------
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "hostaway-autoreply"}
 
-@app.post("/hostaway/webhook")
-async def hostaway_webhook(request: Request):
+@app.get("/ping")
+async def ping():
+    return PlainTextResponse("ok")
+
+@app.get("/healthz")
+async def healthz():
+    def present(name: str) -> str:
+        v = os.getenv(name)
+        return "SET" if v and len(v) > 2 else "MISSING"
+
+    checks = {
+        "SLACK_BOT_TOKEN": present("SLACK_BOT_TOKEN"),
+        "SLACK_CHANNEL": "SET" if SLACK_CHANNEL else "MISSING",
+        "OPENAI_API_KEY": present("OPENAI_API_KEY"),
+        "GOOGLE_PLACES_API_KEY": present("GOOGLE_PLACES_API_KEY"),
+        "HOSTAWAY_CLIENT_ID": present("HOSTAWAY_CLIENT_ID"),
+        "HOSTAWAY_CLIENT_SECRET": present("HOSTAWAY_CLIENT_SECRET"),
+    }
+    status = 200 if not [k for k, v in checks.items() if v == "MISSING"] else 500
+    return JSONResponse({"status": "ok" if status == 200 else "missing_env", "checks": checks}, status_code=status)
+
+@app.post("/unified-webhook")
+async def unified_webhook(request: Request):
     """
-    Handles new incoming guest messages (conversation webhook).
-    Builds context, computes distance if applicable, generates a *suggested* reply,
-    and posts a Slack card (rich header + actions). Sending to guest happens via Slack actions.
+    Tolerant Hostaway webhook:
+    - Accepts JSON, raw-JSON-string, or form-encoded JSON.
+    - Only processes conversation message inbound events.
+    - Posts a Slack card with AI suggestion; sending to guest happens via Slack actions (in slack_interactivity router).
     """
-    data = await _parse_hostaway_request(request)
+    payload = await _read_hostaway_payload(request)
 
-    guest_message = (data.get("message") or data.get("body") or _safe_get(data, "conversation", "body") or "").strip()
+    # If we truly couldn't parse, don't 400 (Hostaway retries aggressively). Just ack.
+    if not payload:
+        logging.warning("[webhook] empty/invalid payload accepted (ignored).")
+        return {"status": "ignored"}
+
+    event = payload.get("event")
+    obj = payload.get("object")
+    data = payload.get("data") or {}
+
+    if event != "message.received" or obj != "conversationMessage":
+        return {"status": "ignored"}
+
+    # idempotency guard
+    event_key = f"{obj}:{event}:{data.get('id') or data.get('conversationId')}"
+    if already_processed(event_key):
+        return {"status": "duplicate"}
+
+    guest_message = data.get("body") or payload.get("body") or ""
     if not guest_message:
-        raise HTTPException(status_code=400, detail="missing guest message")
+        mark_processed(event_key)
+        return {"status": "ignored"}
 
-    conversation_id = (
-        data.get("conversationId")
-        or data.get("conversation_id")
-        or _safe_get(data, "conversation", "id")
-        or _safe_get(data, "message", "conversationId")
-    )
-    if not conversation_id:
-        raise HTTPException(status_code=400, detail="missing conversation id")
+    conv_id = data.get("conversationId")
+    reservation_id = data.get("reservationId")
+    listing_id = data.get("listingMapId")
 
-    # Reservation context (for header)
-    res = data.get("reservation") or {}
-    if not res and data.get("reservationId"):
+    # ------- fetch Hostaway context -------
+    reservation = fetch_hostaway_reservation(reservation_id) or {}
+    res_data = reservation.get("result", {}) or {}
+    guest_name = res_data.get("guestFirstName") or res_data.get("guest", {}).get("firstName") or "Guest"
+    check_in = res_data.get("arrivalDate")
+    check_out = res_data.get("departureDate")
+
+    conversation = fetch_hostaway_conversation(conv_id) or {}
+    messages = conversation.get("result", {}).get("conversationMessages", [])[-10:]
+    history = [
+        {"role": ("guest" if m.get("isIncoming") else "host"), "text": m.get("body", "")}
+        for m in messages if m.get("body")
+    ]
+
+    listing = fetch_hostaway_listing(listing_id) or {}
+    listing_data = listing.get("result", {}) or {}
+
+    # -------- nearby recs (optional) --------
+    nearby_places: List[Dict[str, Any]] = []
+    lat = listing_data.get("lat")
+    lng = listing_data.get("lng")
+    if should_fetch_local_recs(guest_message) and lat and lng:
         try:
-            fetched_res = fetch_hostaway_reservation(int(data["reservationId"]))
-            res = (fetched_res or {}).get("result") or fetched_res or {}
-        except Exception:
-            res = {}
+            nearby_places = build_local_recs(lat, lng, guest_message)
+        except Exception as e:
+            logging.warning(f"[recs] nearby recs failed: {e}")
 
-    # Listing context (for header + distances)
-    listing_ctx = _extract_listing_context_from_payload(data)
-
-    # Optional “how far” distance add-on
+    # -------- distance add-on (optional, just if guest asked "how far") --------
+    listing_ctx = {
+        "lat": lat, "lng": lng,
+        "city": listing_data.get("city"), "state": listing_data.get("state"),
+        "address": listing_data.get("address"), "name": listing_data.get("name"),
+    }
     place_name, distance = _resolve_named_place_and_distance(listing_ctx, guest_message)
 
-    # Prepare AI ctx for generate_reply (smart_intel) – (guest_message, ctx)
-    base_ctx: Dict[str, Any] = {
-        "guest_name": data.get("guest", {}).get("firstName") or data.get("guestName") or "Guest",
-        "listing_info": {
-            "name": listing_ctx.get("name"),
-            "address": {"address1": listing_ctx.get("address"), "city": listing_ctx.get("city"), "state": listing_ctx.get("state")},
-            "bedrooms": data.get("listing", {}).get("bedrooms"),
-            "bathrooms": data.get("listing", {}).get("bathrooms"),
-            "beds": data.get("listing", {}).get("beds"),
-        },
-        "latitude": listing_ctx.get("lat"),
-        "longitude": listing_ctx.get("lng"),
-        "reservation": {
-            "checkInDate": res.get("arrivalDate") or res.get("checkInDate"),
-            "checkOutDate": res.get("departureDate") or res.get("checkOutDate"),
-            "numberOfGuests": res.get("numberOfGuests") or res.get("guests") or res.get("adults"),
-            "status": res.get("status"),
-        },
-        "nearby_places": [],
-        "city": listing_ctx.get("city"),
-        "state": listing_ctx.get("state"),
+    # -------- AI context & suggestion --------
+    structured_listing_info = {
+        "name": listing_data.get("name"),
+        "address": listing_data.get("address"),
+        "bedrooms": listing_data.get("bedroomsNumber"),
+        "beds": listing_data.get("bedsNumber"),
+        "bathrooms": listing_data.get("bathroomsNumber"),
+        "amenities": listing_data.get("listingAmenities", []),
+        "bed_types": listing_data.get("listingBedTypes", []),
+        "check_in_time": listing_data.get("checkInTimeStart"),
+        "check_out_time": listing_data.get("checkOutTime"),
+        "wifi_username": listing_data.get("wifiUsername"),
+        "wifi_password": listing_data.get("wifiPassword"),
+        "latitude": listing_data.get("lat"),
+        "longitude": listing_data.get("lng"),
+        "description": listing_data.get("description"),
+        "house_rules": listing_data.get("houseRules"),
     }
-    if distance and place_name:
-        base_ctx["named_place"] = place_name
-        base_ctx["distance"] = distance
 
-    # Generate *suggested* reply (do not auto-send here)
-    ai_suggestion = ""
+    ai_context = {
+        "guest_name": guest_name,
+        "check_in_date": check_in,
+        "check_out_date": check_out,
+        "listing_info": structured_listing_info,
+        "reservation": res_data,
+        "history": history,
+        "nearby_places": nearby_places,
+    }
+    if place_name and distance:
+        ai_context["named_place"] = place_name
+        ai_context["distance"] = distance
+
+    ai_reply = ""
     try:
         if generate_reply:
-            ai_suggestion = generate_reply(guest_message, base_ctx) or ""
-        if not ai_suggestion:
-            ai_suggestion, _ = make_suggested_reply(guest_message, {
-                "location": {"lat": listing_ctx.get("lat"), "lng": listing_ctx.get("lng")},
+            ai_reply = generate_reply(guest_message, ai_context) or ""
+    except Exception as e:
+        logging.warning(f"[AI] generate_reply failed: {e}")
+    if not ai_reply:
+        # legacy/simple fallback
+        try:
+            ai_reply, _ = make_suggested_reply(guest_message, {
+                "location": {"lat": lat, "lng": lng},
                 "listing": listing_ctx,
-                "reservation": base_ctx["reservation"],
+                "reservation": {"arrivalDate": check_in, "departureDate": check_out},
                 "distance": distance,
                 "named_place": place_name,
             })
-    except Exception as e:
-        logging.warning(f"[AI] generation failed: {e}")
-        ai_suggestion = "Got it—here’s a concise reply ready to send."
-
-    # Build metadata for Slack action handlers (values read by slack_interactivity.py)
-    def _intent():
-        try:
-            r = route_message(guest_message)
-            return r.get("primary_intent", "other")
         except Exception:
-            return "other"
+            ai_reply = "Thanks for reaching out—happy to help. I’ll get you the details shortly."
 
-    intent = _intent()
-    meta: Dict[str, Any] = {
-        "conv_id": conversation_id,
-        "listing_id": data.get("listingMapId") or _safe_get(data, "reservation", "listingMapId") or "",
-        "guest_id": data.get("guest", {}).get("id") or data.get("guestId") or "",
-        "guest_name": base_ctx["guest_name"],
-        "guest_message": guest_message,
-        "ai_suggestion": ai_suggestion,
-        "type": (data.get("channel") or data.get("communicationType") or "email"),
-        "status": (res.get("status") or data.get("status") or "unknown"),
-        "check_in": base_ctx["reservation"]["checkInDate"] or "N/A",
-        "check_out": base_ctx["reservation"]["checkOutDate"] or "N/A",
-        "guest_count": base_ctx["reservation"]["numberOfGuests"] or "N/A",
-        "channel_pretty": data.get("source") or data.get("platform") or data.get("channelName") or None,
-        "property_address": listing_ctx.get("address"),
-        "property_name": listing_ctx.get("name"),
-        "guest_portal_url": res.get("guestPortalUrl") or res.get("guest_portal_url"),
-        "location": {"lat": listing_ctx.get("lat"), "lng": listing_ctx.get("lng")},
-        "detected_intent": intent,
-        # UI labels
-        "sent_label": "message sent",
-        "checkbox_checked": False,
-        "coach_prompt": "",
+    # -------- log & idempotency --------
+    try:
+        log_ai_exchange(
+            conversation_id=str(conv_id),
+            guest_message=guest_message,
+            ai_suggestion=ai_reply,
+            intent=(route_message(guest_message) or {}).get("primary_intent", "general"),
+        )
+    except Exception:
+        pass
+
+    # -------- Slack card --------
+    checkin_fmt = _fmt_date(check_in)
+    checkout_fmt = _fmt_date(check_out)
+
+    price = res_data.get("grandTotalPrice") or res_data.get("totalPrice") or res_data.get("price") or "N/A"
+    # prettify price if numeric-ish
+    try:
+        price_float = float(str(price))
+        price_str = f"${price_float:,.2f}"
+    except Exception:
+        price_str = "$N/A"
+
+    # Platform name (simple mapping)
+    channel_map = {
+        2018: "Airbnb", 2002: "Vrbo", 2005: "Booking.com", 2007: "Expedia",
+        2009: "Vrbo (iCal)", 2010: "Vrbo (iCal)", 2000: "Direct", 2013: "Booking Engine",
+        2015: "Custom iCal", 2016: "Tripadvisor (iCal)", 2017: "WordPress", 2019: "Marriott",
+        2020: "Partner", 2021: "GDS", 2022: "Google",
+    }
+    platform = channel_map.get(res_data.get("channelId"), "Unknown")
+    guest_count = res_data.get("numberOfGuests") or res_data.get("adults") or "?"
+
+    meta = {
+        "conv_id": conv_id,
+        "guest_name": guest_name,
+        "property_address": listing_data.get("address") or "Unknown Address",
+        "check_in": checkin_fmt,
+        "check_out": checkout_fmt,
+        "guest_count": guest_count,
+        "status": res_data.get("status", "N/A"),
+        "price_str": price_str,
+        "platform": platform,
     }
 
-    if not SLACK_CHANNEL:
-        logging.warning("SLACK_CHANNEL not set; skipping Slack post.")
-    else:
+    if SLACK_CHANNEL:
         _post_initial_slack_card(
             channel=SLACK_CHANNEL,
             guest_message=guest_message,
-            ai_suggestion=ai_suggestion,
+            ai_suggestion=ai_reply,
             meta=meta,
-            detected_intent=intent,
         )
+    else:
+        logging.warning("SLACK_CHANNEL not set; skipping Slack post.")
 
-    # Hostaway only needs a 200; sending to guest is done later via Slack “Send”.
-    return JSONResponse({"ok": True, "posted_to_slack": bool(SLACK_CHANNEL)})
+    mark_processed(event_key)
+    return {"status": "ok"}
 
-# ---- Alias to support the old URL Hostaway is posting to ----
-@app.post("/unified-webhook")
-async def unified_webhook(request: Request):
-    # Reuse the same handler
-    return await hostaway_webhook(request)
-
-
-# ---------------------- Run local ----------------------
+# ---------------- Local dev runner ----------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
