@@ -8,7 +8,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, date as _date
 from difflib import get_close_matches
-from typing import Any, Dict, List, Optional, Tuple, Literal
+from typing import Any, Dict, List, Optional, Tuple, Literal, Union  # << added Union
 
 import requests
 from openai import OpenAI
@@ -653,3 +653,136 @@ def detect_intent(message: str) -> str:
     except Exception as e:
         logging.error(f"Intent detection failed: {e}")
         return "other"
+
+# --------------------------- NEW: Hostaway calendar + pricing helpers ---------------------------
+
+def _hostaway_headers_for_read() -> Dict[str, str]:
+    """Bearer header via your token cache; used for GETs."""
+    t = get_hostaway_access_token()
+    if not t:
+        raise RuntimeError("Hostaway token unavailable")
+    return {"Authorization": f"Bearer {t}"}
+
+def _hostaway_headers_for_write() -> Dict[str, str]:
+    h = _hostaway_headers_for_read()
+    h["Content-Type"] = "application/json"
+    return h
+
+def get_calendar(listing_id: Union[int, str], start_date: str, end_date: str, include_resources: int = 0) -> List[Dict[str, Any]]:
+    """
+    GET /v1/listings/{listingId}/calendar
+    """
+    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}/calendar"
+    params = {"startDate": start_date, "endDate": end_date, "includeResources": include_resources}
+    try:
+        r = requests.get(url, headers=_hostaway_headers_for_read(), params=params, timeout=20)
+        if r.status_code == 401:
+            r = requests.get(url, headers=_hostaway_headers_for_read(), params=params, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        return (j.get("result") if isinstance(j, dict) else j) or []
+    except Exception as e:
+        logging.error(f"[Hostaway] get_calendar error: {e}")
+        return []
+
+def update_calendar(listing_id: Union[int, str], payload: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """
+    PUT /v1/listings/{listingId}/calendar
+    Body must include startDate, endDate, and fields such as isAvailable/price/minimumStay/etc.
+    """
+    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}/calendar"
+    try:
+        r = requests.put(url, headers=_hostaway_headers_for_write(), json=payload, timeout=30)
+        if r.status_code == 401:
+            r = requests.put(url, headers=_hostaway_headers_for_write(), json=payload, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        return (j.get("result") if isinstance(j, dict) else j) or []
+    except Exception as e:
+        logging.error(f"[Hostaway] update_calendar error: {e}")
+        return None
+
+def _to_date_iso(s: str) -> _date:
+    return datetime.fromisoformat(s).date()
+
+def calendar_window_is_available(days: List[Dict[str, Any]], start_date: str, end_date: str) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    True if every day in [start, end) is sellable (not in reserved/pending/blocked/hardBlock/mreserved/mblocked/conflicted).
+    """
+    if not days:
+        return False, []
+    s, e = _to_date_iso(start_date), _to_date_iso(end_date)
+    window = [d for d in days if "date" in d and s <= _to_date_iso(d["date"]) < e]
+    blockers = {"reserved", "pending", "blocked", "hardBlock", "mreserved", "mblocked", "conflicted"}
+    ok = all((d.get("status") or "").lower() not in blockers for d in window)
+    return ok, window
+
+def derive_min_stay(window_days: List[Dict[str, Any]]) -> Optional[int]:
+    """
+    Max of per-day minimumStay across the window.
+    """
+    vals: List[int] = []
+    for d in window_days:
+        v = d.get("minimumStay")
+        try:
+            iv = int(v)
+            if iv > 0:
+                vals.append(iv)
+        except Exception:
+            pass
+    return max(vals) if vals else None
+
+def price_details_v2(listing_id: Union[int, str], start_date: str, end_date: str, number_of_guests: int,
+                     components: Optional[List[Dict[str, Any]]] = None,
+                     reservation_coupon_id: Optional[int] = None,
+                     markup: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """
+    POST /v1/listings/{listingId}/calendar/priceDetails (version=2)
+    Returns { totalPrice, components: [...] } or None.
+    """
+    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}/calendar/priceDetails"
+    body: Dict[str, Any] = {
+        "startingDate": start_date,
+        "endingDate": end_date,
+        "numberOfGuests": str(number_of_guests),
+        "version": 2,
+    }
+    if components: body["components"] = components
+    if reservation_coupon_id is not None: body["reservationCouponId"] = reservation_coupon_id
+    if markup is not None: body["markup"] = markup
+    try:
+        r = requests.post(url, headers=_hostaway_headers_for_write(), json=body, timeout=30)
+        if r.status_code == 401:
+            r = requests.post(url, headers=_hostaway_headers_for_write(), json=body, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        return (j.get("result") if isinstance(j, dict) else j) or None
+    except Exception as e:
+        logging.error(f"[Hostaway] price_details_v2 error: {e}")
+        return None
+
+def early_late_available(listing_id: Union[int, str], arrival_date: Optional[str], departure_date: Optional[str]) -> Dict[str, bool]:
+    """
+    Conservative check for early check-in / late check-out feasibility using calendar day flags.
+    """
+    res = {"early_checkin_ok": False, "late_checkout_ok": False}
+    try:
+        if arrival_date:
+            arr = _to_date_iso(arrival_date)
+            arr_str = arr.isoformat()
+            days = get_calendar(listing_id, arr_str, arr_str, 0) or []
+            for d in days:
+                if d.get("date") == arr_str:
+                    res["early_checkin_ok"] = bool(d.get("isAvailable", 1)) and not bool(d.get("closedOnArrival"))
+                    break
+        if departure_date:
+            dep = _to_date_iso(departure_date)
+            dep_str = dep.isoformat()
+            days = get_calendar(listing_id, dep_str, dep_str, 0) or []
+            for d in days:
+                if d.get("date") == dep_str:
+                    res["late_checkout_ok"] = bool(d.get("isAvailable", 1)) and not bool(d.get("closedOnDeparture"))
+                    break
+    except Exception as e:
+        logging.warning(f"early_late_available failed: {e}")
+    return res
