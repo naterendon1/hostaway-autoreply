@@ -5,7 +5,8 @@ import logging
 from typing import Any, Dict, Optional, Tuple, List
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
+from starlette.responses import PlainTextResponse  # ✅ fixes /ping NameError
 
 # Slack SDK (used only to post the initial card)
 try:
@@ -33,11 +34,11 @@ except Exception:
     text_search_place = None
     get_drive_distance_duration = None
 
-# Mount Slack interactivity router (events + actions live there)
+# Slack interactivity (events + actions live there). Mounted at /slack
 try:
     from slack_interactivity import (
         router as slack_router,
-        build_rich_header_blocks,   # rich header builder we used in cards
+        build_rich_header_blocks,   # rich header for the Slack card
     )
 except Exception as e:
     slack_router = None
@@ -56,7 +57,7 @@ except Exception as e:
             lines += [{"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}}]
         return lines
 
-# Smarter two-pass writer
+# Optional smarter writer
 try:
     from smart_intel import generate_reply
 except Exception:
@@ -70,7 +71,7 @@ if slack_router:
     app.include_router(slack_router, prefix="/slack")
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")  # channel ID (e.g., C0123ABCDEF)
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")  # channel ID to post the initial card
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if (SLACK_BOT_TOKEN and WebClient) else None
 
 
@@ -264,7 +265,7 @@ def _post_initial_slack_card(
 async def root():
     return {"ok": True, "service": "hostaway-autoresponder"}
 
-# ✅ Render’s health probe hits GET /ping — must return 200
+# ✅ Render health probe hits GET /ping — must return 200
 @app.get("/ping")
 async def ping():
     return PlainTextResponse("ok")
@@ -421,7 +422,7 @@ async def hostaway_webhook(request: Request):
             detected_intent=intent,
         )
 
-    # Hostaway only needs a 200; sending to guest is done later via Slack “Send”.
+    # Hostaway only needs a 200; sending to guest is handled via Slack “Send”.
     return JSONResponse({"ok": True, "posted_to_slack": bool(SLACK_CHANNEL)})
 
 # ---------------------- Run local ----------------------
