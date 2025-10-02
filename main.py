@@ -2,12 +2,12 @@
 import os
 import json
 import logging
-from typing import Any, Dict, Optional, Tuple, List, Union
+from typing import Any, Dict, Optional, Tuple, List
 
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# Slack SDK (for posting initial card)
+# Slack SDK (used only to post the initial card)
 try:
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
@@ -23,28 +23,28 @@ from utils import (
     extract_destination_from_message,
     resolve_place_textsearch,      # legacy (kept)
     get_distance_drive_time,       # legacy (kept)
-    route_message,                 # for a quick intent tag
+    route_message,                 # quick intent tag for header
 )
 
-# Places: newer, more reliable Google helpers (bias + retries)
+# Improved Google helpers (bias + robust distance). Optional.
 try:
     from places import text_search_place, get_drive_distance_duration
 except Exception:
     text_search_place = None
     get_drive_distance_duration = None
 
-# Rich header + security helpers from slack_interactivity
+# Mount Slack interactivity router (events + actions live there)
 try:
     from slack_interactivity import (
-        verify_slack_signature,
-        build_rich_header_blocks,
-        pack_private_meta,  # reuse its slim meta shape for modal flows
+        router as slack_router,
+        build_rich_header_blocks,   # rich header builder we used in cards
+        pack_private_meta,          # not used here, but handy if needed later
     )
-except Exception:
-    verify_slack_signature = None
+except Exception as e:
+    slack_router = APIRouter()
+    logging.warning(f"Slack interactivity router not available: {e}")
 
     def build_rich_header_blocks(**kwargs):
-        # Minimal fallback if import fails
         meta = kwargs.get("meta", {}) or {}
         guest_msg = kwargs.get("guest_msg", "")
         sent_reply = kwargs.get("sent_reply")
@@ -57,23 +57,18 @@ except Exception:
             lines += [{"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}}]
         return lines
 
-    def pack_private_meta(d: Dict[str, Any]) -> str:
-        return json.dumps(d)
-
-# Optional smarter writer
+# Smarter two-pass writer
 try:
-    from smart_intel import generate_reply  # planner/writer
+    from smart_intel import generate_reply
 except Exception:
     generate_reply = None
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
-router = APIRouter()
+app.include_router(slack_router, prefix="/slack-interactivity")  # Slack should call this prefix
 
-SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")  # channel ID to post the initial card
-
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if (SLACK_BOT_TOKEN and WebClient) else None
 
 
@@ -211,13 +206,11 @@ def _action_button(action_id: str, text: str, meta: Dict[str, Any]) -> Dict[str,
     }
 
 def _action_row(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # Main actions row (Edit / Write / Send / Portal)
     elems = [
         _action_button("edit", "Edit", meta),
         _action_button("write_own", "Write own", meta),
         _action_button("send", "Send", meta),
     ]
-    # Only show Guest Portal if we have a URL hint (meta may be missing it; still OK)
     if meta.get("guest_portal_url") or meta.get("guestPortalUrl"):
         elems.append(_action_button("send_guest_portal", "Send guest portal", meta))
     return [{"type": "actions", "elements": elems}]
@@ -240,7 +233,6 @@ def _post_initial_slack_card(
     if not slack_client or not channel:
         return None
 
-    # Header (no "Sent Reply" yet)
     header_blocks = build_rich_header_blocks(
         meta=meta,
         guest_msg=guest_message,
@@ -249,8 +241,6 @@ def _post_initial_slack_card(
         sent_label=None,
         saved_for_learning=False,
     )
-
-    # Show the suggested reply as a section (not “sent” yet)
     suggestion_block = [{
         "type": "section",
         "text": {"type": "mrkdwn", "text": f"*AI suggestion:*\n>{ai_suggestion}"},
@@ -302,46 +292,6 @@ async def healthz():
     status = 200 if not [k for k, v in checks.items() if v == "MISSING"] else 500
     return JSONResponse({"status": "ok" if status == 200 else "missing_env", "checks": checks, "hints": hints}, status_code=status)
 
-# ---------------- Slack endpoints ----------------
-
-@app.post("/slack/events")
-async def slack_events(request: Request):
-    # Slack URL verification
-    try:
-        body = await request.json()
-        if body.get("type") == "url_verification":
-            return JSONResponse({"challenge": body.get("challenge")})
-    except Exception:
-        pass
-
-    raw = await request.body()
-    ts = request.headers.get("X-Slack-Request-Timestamp", "")
-    sig = request.headers.get("X-Slack-Signature", "")
-    if verify_slack_signature:
-        # correct call order: (request_body, signature, timestamp)
-        if not verify_slack_signature(raw.decode("utf-8", errors="ignore"), sig, ts):
-            raise HTTPException(status_code=403, detail="invalid slack signature")
-
-    return JSONResponse({"ok": True})
-
-@app.post("/slack/actions")
-async def slack_actions(request: Request):
-    raw = await request.body()
-    ts = request.headers.get("X-Slack-Request-Timestamp", "")
-    sig = request.headers.get("X-Slack-Signature", "")
-    if verify_slack_signature:
-        if not verify_slack_signature(raw.decode("utf-8", errors="ignore"), sig, ts):
-            raise HTTPException(status_code=403, detail="invalid slack signature")
-
-    # The interactive flow is handled in slack_interactivity.py router; this stub is OK.
-    form = await request.form()
-    payload = form.get("payload")
-    try:
-        _ = json.loads(payload) if payload else {}
-    except Exception:
-        pass
-    return JSONResponse({"ok": True})
-
 # --------------- Hostaway unified webhook ---------------
 
 @app.post("/hostaway/webhook")
@@ -349,7 +299,7 @@ async def hostaway_webhook(request: Request):
     """
     Handles new incoming guest messages (conversation webhook).
     Builds context, computes distance if applicable, generates a *suggested* reply,
-    and posts a Slack card (rich header + actions). We do NOT auto-send to Hostaway here.
+    and posts a Slack card (rich header + actions). Sending to guest happens via Slack actions.
     """
     try:
         data = await request.json()
@@ -379,7 +329,7 @@ async def hostaway_webhook(request: Request):
     # Optional “how far” distance add-on
     place_name, distance = _resolve_named_place_and_distance(listing_ctx, guest_message)
 
-    # Prepare AI ctx for generate_reply (smart_intel) – matches the function’s expected order: (guest_message, ctx)
+    # Prepare AI ctx for generate_reply (smart_intel) – (guest_message, ctx)
     base_ctx: Dict[str, Any] = {
         "guest_name": data.get("guest", {}).get("firstName") or data.get("guestName") or "Guest",
         "listing_info": {
@@ -392,13 +342,12 @@ async def hostaway_webhook(request: Request):
         "latitude": listing_ctx.get("lat"),
         "longitude": listing_ctx.get("lng"),
         "reservation": {
-            # smart_intel expects checkInDate/checkOutDate when available
             "checkInDate": res.get("arrivalDate") or res.get("checkInDate"),
             "checkOutDate": res.get("departureDate") or res.get("checkOutDate"),
             "numberOfGuests": res.get("numberOfGuests") or res.get("guests") or res.get("adults"),
             "status": res.get("status"),
         },
-        "nearby_places": [],  # can be filled by places.py elsewhere
+        "nearby_places": [],
         "city": listing_ctx.get("city"),
         "state": listing_ctx.get("state"),
     }
@@ -406,7 +355,7 @@ async def hostaway_webhook(request: Request):
         base_ctx["named_place"] = place_name
         base_ctx["distance"] = distance
 
-    # Generate *suggested* reply (do not auto-send)
+    # Generate *suggested* reply (do not auto-send here)
     ai_suggestion = ""
     try:
         if generate_reply:
@@ -423,8 +372,15 @@ async def hostaway_webhook(request: Request):
         logging.warning(f"[AI] generation failed: {e}")
         ai_suggestion = "Got it—here’s a concise reply ready to send."
 
-    # Build metadata for action handlers (values are read by slack_interactivity.py)
-    intent = _detect_intent_label(guest_message)
+    # Build metadata for Slack action handlers (values read by slack_interactivity.py)
+    def _intent():
+        try:
+            r = route_message(guest_message)
+            return r.get("primary_intent", "other")
+        except Exception:
+            return "other"
+
+    intent = _intent()
     meta: Dict[str, Any] = {
         "conv_id": conversation_id,
         "listing_id": data.get("listingMapId") or _safe_get(data, "reservation", "listingMapId") or "",
@@ -449,11 +405,9 @@ async def hostaway_webhook(request: Request):
         "coach_prompt": "",
     }
 
-    # Post the initial Slack card (rich header + suggestion + actions)
     if not SLACK_CHANNEL:
         logging.warning("SLACK_CHANNEL not set; skipping Slack post.")
     else:
-        # For actions, we embed full meta (not private_metadata)
         _post_initial_slack_card(
             channel=SLACK_CHANNEL,
             guest_message=guest_message,
@@ -462,7 +416,7 @@ async def hostaway_webhook(request: Request):
             detected_intent=intent,
         )
 
-    # We return OK to Hostaway webhook quickly; sending to guest happens via Slack action “Send”.
+    # Hostaway only needs a 200; sending to guest is done later via Slack “Send”.
     return JSONResponse({"ok": True, "posted_to_slack": bool(SLACK_CHANNEL)})
 
 # ---------------------- Run local ----------------------
