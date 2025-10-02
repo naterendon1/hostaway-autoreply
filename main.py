@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, Dict, Optional, Tuple, List
 
-from fastapi import FastAPI, APIRouter, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 # Slack SDK (used only to post the initial card)
@@ -38,10 +38,9 @@ try:
     from slack_interactivity import (
         router as slack_router,
         build_rich_header_blocks,   # rich header builder we used in cards
-        pack_private_meta,          # not used here, but handy if needed later
     )
 except Exception as e:
-    slack_router = APIRouter()
+    slack_router = None
     logging.warning(f"Slack interactivity router not available: {e}")
 
     def build_rich_header_blocks(**kwargs):
@@ -65,7 +64,10 @@ except Exception:
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
-app.include_router(slack_router, prefix="/slack-interactivity")  # Slack should call this prefix
+
+# ✅ IMPORTANT: Slack app must call /slack/events and /slack/actions
+if slack_router:
+    app.include_router(slack_router, prefix="/slack")
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")  # channel ID to post the initial card
@@ -284,8 +286,6 @@ async def healthz():
         hints.append("Set GOOGLE_PLACES_API_KEY for place search.")
     if checks["HOSTAWAY_CLIENT_ID"] == "MISSING" or checks["HOSTAWAY_CLIENT_SECRET"] == "MISSING":
         hints.append("Set HOSTAWAY_CLIENT_ID and HOSTAWAY_CLIENT_SECRET for Hostaway messaging.")
-    if checks["SLACK_SIGNING_SECRET"] == "MISSING":
-        hints.append("Set SLACK_SIGNING_SECRET so Slack events/actions verify.")
     if checks["SLACK_CHANNEL"] == "MISSING":
         hints.append("Set SLACK_CHANNEL to post initial Slack cards.")
 
