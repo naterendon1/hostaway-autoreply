@@ -18,19 +18,50 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # Generic place + distance helpers (no hardcoded venues)
 from places import (
-    text_search_place,                   # NEW: resolves any free-text destination
+    text_search_place,                   # resolves any free-text destination
     get_drive_distance_duration,         # accepts address or (lat,lng) for origin/dest
 )
+
+# Hostaway + reply cleanup helpers
+from utils import (
+    get_calendar,
+    calendar_window_is_available,
+    derive_min_stay,
+    price_details_v2,
+    early_late_available,
+    fetch_hostaway_reservation,
+    clean_ai_reply,
+    sanitize_ai_reply,
+)
+
+# Optional: flexible date parsing
+try:
+    from dateutil import parser as _dtparse
+except Exception:
+    _dtparse = None  # fallback to ISO only
+
 
 # ---------- Utilities ----------
 
 def _parse_iso_date(s: Optional[str]):
     if not s:
         return None
+    # Accept true ISO or RFC3339, fallback to dateutil if installed
+    if _dtparse:
+        try:
+            return _dtparse.parse(s)
+        except Exception:
+            pass
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
+
+def _coerce_date_str(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    dt = _parse_iso_date(s)
+    return dt.date().isoformat() if dt else None
 
 def _infer_phase(check_in: Optional[str], check_out: Optional[str], now: Optional[datetime] = None) -> str:
     """
@@ -70,10 +101,10 @@ def _collect_core_facts(ctx: Dict[str, Any]) -> Dict[str, Any]:
     listing = ctx.get("listing_info") or {}
     address1 = (listing.get("address") or {}).get("address1") or ctx.get("property_address")
 
-    check_in = reservation.get("checkInDate") or reservation.get("checkIn") or ctx.get("check_in")
-    check_out = reservation.get("checkOutDate") or reservation.get("checkOut") or ctx.get("check_out")
+    # Accept multiple field names
+    check_in = reservation.get("arrivalDate") or reservation.get("checkInDate") or reservation.get("checkIn") or ctx.get("check_in")
+    check_out = reservation.get("departureDate") or reservation.get("checkOutDate") or reservation.get("checkOut") or ctx.get("check_out")
 
-    # common listing facts (best-effort)
     def _num(x):
         try: return int(float(x))
         except Exception: return None
@@ -87,16 +118,21 @@ def _collect_core_facts(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "check_in": check_in,
         "check_out": check_out,
         "guest_count": ctx.get("guest_count") or reservation.get("numberOfGuests"),
-        "status": ctx.get("status") or reservation.get("status"),
+        "status": (ctx.get("status") or reservation.get("status")),
         "beds": _num(listing.get("beds") or listing.get("numberOfBeds") or listing.get("bedCount")),
         "bedrooms": _num(listing.get("bedrooms") or listing.get("numberOfBedrooms") or listing.get("bedroomsNumber")),
         "bathrooms": _num(listing.get("bathrooms") or listing.get("numberOfBathrooms") or listing.get("bathroomsNumber")),
         "city": (listing.get("address") or {}).get("city") or ctx.get("city"),
         "state": (listing.get("address") or {}).get("state") or (listing.get("address") or {}).get("province") or ctx.get("state"),
-        "nearby_places": (ctx.get("nearby_places") or [])[:3],  # compact bundle if present
+        "nearby_places": (ctx.get("nearby_places") or [])[:3],
+        # IDs for Hostaway calls
+        "listing_id": ctx.get("listing_id") or reservation.get("listingMapId"),
+        "reservation_id": reservation.get("id") or ctx.get("reservation_id"),
+        "conversation_id": ctx.get("conversation_id"),
     }
     facts["phase"] = _infer_phase(check_in, check_out)
     return facts
+
 
 # ---------- Prompts ----------
 
@@ -104,34 +140,40 @@ PLANNER_SYSTEM = """You are a planner that extracts user intent and entities fro
 Return ONLY valid JSON with these top-level keys:
 
 {
+  "wants_availability": boolean,
+  "wants_price_quote": boolean,
+  "dates": {"start": "YYYY-MM-DD" | null, "end": "YYYY-MM-DD" | null},
+  "guests": int | null,
   "wants_distance": boolean,
-  "destinations": [ {"text": string} ],           // zero or more free-text destination names found in the message
-  "wants_recommendations": boolean,               // e.g., local things to do, kid-friendly, restaurants, etc.
+  "destinations": [ {"text": string} ],
+  "wants_recommendations": boolean,
   "info_questions": [ "bedrooms" | "bathrooms" | "beds" | "check_in" | "check_out" | "guest_count" | "address" ],
-  "clarifications": [ string ]                    // at most 1 concise clarification if the message is ambiguous
+  "clarifications": []
 }
 
 Rules:
-- Do not guess. If the user asked "how far", include "wants_distance": true and put what they wrote into "destinations" (even if vague like "downtown").
-- If they ask about the home (e.g., bedrooms), add a matching token to "info_questions".
-- If they ask for nearby activities, set "wants_recommendations": true.
-- If nothing is ambiguous, "clarifications" should be [].
+- If they mention booking, availability, specific dates, or rates/price: set the appropriate flags.
+- Extract explicit or relative dates if present; otherwise nulls.
+- Extract guest count if present (adults+children combined).
+- If they ask “how far” or travel time → wants_distance true; place the raw target text in destinations.
+- If they ask for local things to do/places → wants_recommendations true.
+- If nothing is ambiguous, clarifications must be [].
 """
 
-# --- find WRITER_SYSTEM in smart_intel.py and replace it with this ---
 WRITER_SYSTEM = """You are an expert guest-messaging assistant for short-term rentals.
+Use ONLY the provided facts. No greetings, no sign-offs, no emojis. No questions.
 
-Use the provided facts exactly. Be brief, warm, and helpful:
-- 1–3 sentences. At most one short follow-up question if essential.
-- Respect stay phase (pre_arrival, in_stay, post_stay). If post_stay, use past tense and thank them.
-- If distance facts exist, include miles and minutes succinctly.
-- If bedrooms/bathrooms/beds exist and the guest asked, answer directly.
-- If local recommendations are provided, suggest up to 2–3 good picks, including minutes if present.
-- Never invent prices, addresses, or policies.
-- If a critical fact is missing and no distance was computed, ask for exactly that one piece.
-- No greetings, no sign-offs, no emojis.
+Priorities:
+1) If availability facts exist, say Available/Not available; include min-stay if provided.
+2) If price quote exists, give total and 1–2 key components (plain words).
+3) If upsells exist, state whether early check-in / late check-out is possible and fees if provided.
+4) If distance facts exist, include miles and minutes succinctly.
+5) If the guest asked about bedrooms/bathrooms/beds and you have values, answer directly.
+6) If local recommendations exist, list up to 2–3 concise options.
 
-Output only the final message to the guest (no JSON)."""
+If a critical fact is missing, state what’s needed in a single short clause (no question mark).
+Output only the final message text.
+"""
 
 
 # ---------- Public entrypoint ----------
@@ -139,9 +181,10 @@ Output only the final message to the guest (no JSON)."""
 def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
     """
     Two-pass flow:
-      1) Ask the model to plan: extract intents and destination strings (no hardcoding).
-      2) Resolve destinations via Google (text search + distance) using address or (lat,lng).
-      3) Ask the model to write the final reply using all computed facts.
+      1) Planner: extract intents, dates, guests, destinations.
+      2) Hostaway: availability, price v2, upsells.
+      3) Places: resolve destinations + distances using address/(lat,lng).
+      4) Writer: compose decisive reply (no clarifying questions).
     """
     core = _collect_core_facts(ctx)
 
@@ -151,6 +194,10 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
         "available_facts": {k: v for k, v in core.items() if v is not None}
     }
     plan = {
+        "wants_availability": False,
+        "wants_price_quote": False,
+        "dates": {"start": None, "end": None},
+        "guests": None,
         "wants_distance": False,
         "destinations": [],
         "wants_recommendations": False,
@@ -173,13 +220,75 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
     except Exception as e:
         logging.warning(f"Planner call failed, falling back: {e}")
 
-    # ----- Resolve destinations (generic) -----
+    # Normalize dates/guests
+    start = _coerce_date_str(((plan.get("dates") or {}).get("start"))) or None
+    end   = _coerce_date_str(((plan.get("dates") or {}).get("end"))) or None
+    guests = plan.get("guests") or core.get("guest_count") or 1
+    try:
+        guests = int(guests)
+    except Exception:
+        guests = 1
+
+    listing_id = core.get("listing_id")
+    reservation_id = core.get("reservation_id")
+
+    # ----- Hostaway: Availability & Price (if requested and data present) -----
+    writer_facts: Dict[str, Any] = {k: v for k, v in core.items() if v is not None}
+
+    if plan.get("wants_availability") and listing_id and start and end:
+        try:
+            days = get_calendar(listing_id, start, end, 0)
+            is_open, window = calendar_window_is_available(days, start, end)
+            min_stay = derive_min_stay(window)
+            writer_facts["availability"] = {
+                "is_open": bool(is_open),
+                "min_stay": min_stay,
+                "start": start,
+                "end": end
+            }
+        except Exception as e:
+            logging.warning(f"[availability] {e}")
+
+    if plan.get("wants_price_quote") and listing_id and start and end:
+        try:
+            priced = price_details_v2(listing_id, start, end, int(guests))
+            if priced and "totalPrice" in priced:
+                comps = priced.get("components") or []
+                key = []
+                for c in comps:
+                    title = (c.get("title") or c.get("name") or "").lower()
+                    if any(k in title for k in ("base", "cleaning", "tax")) and len(key) < 2:
+                        key.append({"title": c.get("title") or c.get("name"), "amount": c.get("total")})
+                writer_facts["price_quote"] = {
+                    "total": priced["totalPrice"],
+                    "components": key,
+                    "start": start, "end": end, "guests": int(guests)
+                }
+        except Exception as e:
+            logging.warning(f"[pricing] {e}")
+
+    # ----- Hostaway: Upsells (early/late) if reservation exists -----
+    if listing_id and reservation_id:
+        try:
+            rj = fetch_hostaway_reservation(int(reservation_id)) or {}
+            r = (rj.get("result") or {})
+            ups = early_late_available(listing_id, r.get("arrivalDate"), r.get("departureDate"))
+            if ups:
+                writer_facts["upsells"] = {
+                    "early_checkin_ok": bool(ups.get("early_checkin_ok")),
+                    "late_checkout_ok": bool(ups.get("late_checkout_ok")),
+                    "early_fee": os.getenv("EARLY_CHECKIN_FEE") or 0,
+                    "late_fee": os.getenv("LATE_CHECKOUT_FEE") or 0,
+                }
+        except Exception as e:
+            logging.debug(f"[upsells] {e}")
+
+    # ----- Resolve distances (your original logic, kept) -----
     distances: List[Dict[str, Any]] = []
     origin = _pick_origin(ctx)
 
     if plan.get("wants_distance") and origin is not None:
         dest_items = plan.get("destinations") or []
-        # Use city/state to bias search if present
         bias_lat = core.get("latitude") if isinstance(core.get("latitude"), (int, float)) else None
         bias_lng = core.get("longitude") if isinstance(core.get("longitude"), (int, float)) else None
         city = core.get("city"); state = core.get("state")
@@ -188,7 +297,6 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
             dest_text = (d or {}).get("text")
             if not dest_text:
                 continue
-            # 1) Resolve free-text destination to a place (lat/lng + name/address)
             place = text_search_place(
                 query=dest_text,
                 bias_lat=bias_lat,
@@ -199,12 +307,10 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
             if not place:
                 continue
 
-            # 2) Compute distance using best available origin
             try:
                 if isinstance(origin, tuple):
                     dist = get_drive_distance_duration(origin, (place["lat"], place["lng"]))
                 else:
-                    # origin is an address string
                     dist = get_drive_distance_duration(origin, place["formatted_address"] or place["name"])
             except Exception as e:
                 logging.warning(f"Distance calc failed for {dest_text}: {e}")
@@ -218,12 +324,10 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
                     "duration_text": dist.get("duration_text"),
                 })
 
-    # ----- Build writer facts -----
-    writer_facts = {k: v for k, v in core.items() if v is not None}
     if distances:
         writer_facts["distances"] = distances
 
-    # If user asked bedrooms/baths/beds, keep those visible
+    # Asked fields (bed/bath/beds) surfaced if present
     asked = set(plan.get("info_questions") or [])
     if "bedrooms" in asked and core.get("bedrooms") is None:
         writer_facts["missing_bedrooms"] = True
@@ -232,14 +336,9 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
     if "beds" in asked and core.get("beds") is None:
         writer_facts["missing_beds"] = True
 
-    # If they want recommendations and you computed nearby bundle earlier
-    if plan.get("wants_recommendations") and core.get("nearby_places"):
-        writer_facts["nearby_places"] = core["nearby_places"]
-
-    # If planner thought a single clarification is essential and we still have zero distance results,
-    # allow the writer to ask for that one missing item.
+    # Clarification only as a declarative clause, and only if we computed nothing else
     clarifications = plan.get("clarifications") or []
-    if clarifications and not distances:
+    if clarifications and not (writer_facts.get("availability") or writer_facts.get("price_quote") or writer_facts.get("distances")):
         writer_facts["planner_clarification"] = clarifications[0]
 
     # ----- Pass 2: Writer -----
@@ -252,17 +351,46 @@ def generate_reply(guest_message: str, ctx: Dict[str, Any]) -> str:
         if _has_client and _client:
             r = _client.chat.completions.create(
                 model=OPENAI_MODEL,
-                temperature=0.3,
+                temperature=0.2,
                 messages=[
                     {"role": "system", "content": WRITER_SYSTEM},
-                    {"role": "user", "content": json.dumps(writer_input)}
+                    {"role": "user", "content": json.dumps(writer_input, ensure_ascii=False)}
                 ],
             )
-            return (r.choices[0].message.content or "").strip()
+            final = (r.choices[0].message.content or "").strip()
+        else:
+            final = ""
     except Exception as e:
         logging.warning(f"Writer call failed: {e}")
+        final = ""
 
-    # Safe fallback
-    if core.get("phase") == "post_stay":
-        return "Thanks so much for staying with us—glad to hear everything went well! Safe travels home."
-    return "Thanks for your message! I’ll take a look and follow up shortly."
+    # Deterministic fallbacks to avoid questions
+    if not final and writer_facts.get("availability"):
+        a = writer_facts["availability"]
+        status = "Available" if a.get("is_open") else "Not available"
+        extra = f"; minimum stay {a['min_stay']} nights" if a.get("min_stay") else ""
+        final = f"{status} for {a.get('start')}–{a.get('end')}{extra}."
+    if not final and writer_facts.get("price_quote"):
+        pq = writer_facts["price_quote"]
+        parts = ", ".join(f"{c['title']}: {c['amount']}" for c in (pq.get("components") or [])[:2])
+        final = f"Total for {pq['start']}–{pq['end']} for {pq['guests']} guest(s) is {pq['total']}. {parts}".strip()
+    if not final and writer_facts.get("distances"):
+        d0 = writer_facts["distances"][0]
+        final = f"{d0['to_name']} is about {d0.get('duration_text')} by car ({d0.get('distance_text')})."
+    if not final and writer_facts.get("upsells"):
+        u = writer_facts["upsells"]
+        bits = []
+        if u.get("early_checkin_ok"):
+            bits.append(f"Early check-in available (fee {u.get('early_fee')}).")
+        if u.get("late_checkout_ok"):
+            bits.append(f"Late check-out available (fee {u.get('late_fee')}).")
+        if bits:
+            final = " ".join(bits)
+
+    if not final:
+        final = "I’ve shared the applicable details for your dates and request."
+
+    # Final cleanup: tone/length guardrails
+    final = clean_ai_reply(final, guest_message)
+    final = sanitize_ai_reply(final, guest_message)
+    return final
