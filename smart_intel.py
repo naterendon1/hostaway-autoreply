@@ -34,6 +34,48 @@ from utils import (
     sanitize_ai_reply,
 )
 
+
+# --- add this helper ---
+def _smart_generate_reply(generate_reply_fn, guest_message: str, ctx: Dict[str, Any]) -> str:
+    """
+    Call smart_intel.generate_reply safely regardless of version:
+      - v1: generate_reply(guest_message, ctx)
+      - v2: generate_reply(ctx, guest_message)
+    Accepts either str or dict return values.
+    """
+    if not generate_reply_fn:
+        return ""
+
+    def _normalize(ret) -> str:
+        if isinstance(ret, str):
+            return ret
+        if isinstance(ret, dict):
+            # common keys your writer might return
+            for k in ("reply", "text", "message"):
+                if k in ret and isinstance(ret[k], str):
+                    return ret[k]
+        return ""
+
+    # try v1
+    try:
+        out = generate_reply_fn(guest_message, ctx)
+        s = _normalize(out)
+        if s:
+            return s
+    except Exception:
+        pass
+
+    # try v2
+    try:
+        out = generate_reply_fn(ctx, guest_message)
+        s = _normalize(out)
+        if s:
+            return s
+    except Exception:
+        pass
+
+    return ""
+
 # Optional: flexible date parsing
 try:
     from dateutil import parser as _dtparse
