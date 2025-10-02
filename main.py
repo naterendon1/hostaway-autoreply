@@ -3,6 +3,7 @@ import os
 import json
 import logging
 from typing import Any, Dict, Optional, Tuple, List
+from smart_intel import generate_reply, _smart_generate_reply
 
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -428,24 +429,29 @@ async def unified_webhook(request: Request):
         ai_context["named_place"] = place_name
         ai_context["distance"] = distance
 
-    ai_reply = ""
+# -------- AI context & suggestion (robust wrapper + fallback) --------
+ai_reply = ""
+try:
+    ai_reply = _smart_generate_reply(generate_reply, guest_message, ai_context)
+except Exception as e:
+    logging.warning(f"[AI] generate_reply wrapper failed: {e}")
+
+if not ai_reply:
+    # legacy/simple fallback so we always show something in Slack
     try:
-        if generate_reply:
-            ai_reply = generate_reply(guest_message, ai_context) or ""
-    except Exception as e:
-        logging.warning(f"[AI] generate_reply failed: {e}")
-    if not ai_reply:
-        # legacy/simple fallback
-        try:
-            ai_reply, _ = make_suggested_reply(guest_message, {
+        ai_reply, _ = make_suggested_reply(
+            guest_message,
+            {
                 "location": {"lat": lat, "lng": lng},
                 "listing": listing_ctx,
                 "reservation": {"arrivalDate": check_in, "departureDate": check_out},
                 "distance": distance,
                 "named_place": place_name,
-            })
-        except Exception:
-            ai_reply = "Thanks for reaching out—happy to help. I’ll get you the details shortly."
+            },
+        )
+    except Exception:
+        ai_reply = "Thanks for reaching out—happy to help. I’ll get you the details shortly."
+
 
     # -------- log & idempotency --------
     try:
