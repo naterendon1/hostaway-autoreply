@@ -288,6 +288,61 @@ async def healthz():
     status = 200 if not [k for k, v in checks.items() if v == "MISSING"] else 500
     return JSONResponse({"status": "ok" if status == 200 else "missing_env", "checks": checks, "hints": hints}, status_code=status)
 
+# ---- tolerant body parser for Hostaway webhooks ----
+
+async def _parse_hostaway_request(request: Request) -> Dict[str, Any]:
+    """
+    Accepts JSON, urlencoded forms containing JSON in a field (payload/data/...) or raw JSON string.
+    Returns a dict or raises HTTPException(400).
+    """
+    # 1) Try JSON directly
+    try:
+        return await request.json()
+    except Exception:
+        pass
+
+    # 2) Try reading raw and parsing as JSON string
+    try:
+        raw = await request.body()
+        if raw:
+            s = raw.decode("utf-8", errors="ignore").strip()
+            # If the whole body is just JSON text
+            if s.startswith("{") and s.endswith("}"):
+                return json.loads(s)
+    except Exception:
+        pass
+
+    # 3) Try form-encoded (Hostaway sometimes sends form with a JSON string)
+    try:
+        form = await request.form()
+        # Look for a likely JSON-bearing field
+        candidates = ["payload", "data", "event", "body"]
+        for key in candidates:
+            if key in form and form[key]:
+                try:
+                    return json.loads(form[key])
+                except Exception:
+                    # Sometimes the value itself is a one-key stringified dict like {"data":"{...}"}
+                    try:
+                        maybe = json.loads(str(form[key]))
+                        if isinstance(maybe, dict):
+                            return maybe
+                    except Exception:
+                        pass
+        # If there is only one key and its value looks like JSON, try that
+        if len(form.keys()) == 1:
+            only_key = list(form.keys())[0]
+            val = form[only_key]
+            if isinstance(val, str) and val.strip().startswith("{"):
+                try:
+                    return json.loads(val)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=400, detail="invalid json")
+
 # --------------- Hostaway unified webhook ---------------
 
 @app.post("/hostaway/webhook")
@@ -297,16 +352,18 @@ async def hostaway_webhook(request: Request):
     Builds context, computes distance if applicable, generates a *suggested* reply,
     and posts a Slack card (rich header + actions). Sending to guest happens via Slack actions.
     """
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid json")
+    data = await _parse_hostaway_request(request)
 
-    guest_message = (data.get("message") or data.get("body") or "").strip()
+    guest_message = (data.get("message") or data.get("body") or _safe_get(data, "conversation", "body") or "").strip()
     if not guest_message:
         raise HTTPException(status_code=400, detail="missing guest message")
 
-    conversation_id = data.get("conversationId") or data.get("conversation_id") or _safe_get(data, "conversation", "id")
+    conversation_id = (
+        data.get("conversationId")
+        or data.get("conversation_id")
+        or _safe_get(data, "conversation", "id")
+        or _safe_get(data, "message", "conversationId")
+    )
     if not conversation_id:
         raise HTTPException(status_code=400, detail="missing conversation id")
 
