@@ -5,7 +5,7 @@ import logging
 from typing import Any, Dict, Optional, Tuple, List
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # Slack SDK (used only to post the initial card)
 try:
@@ -37,7 +37,7 @@ except Exception:
 try:
     from slack_interactivity import (
         router as slack_router,
-        build_rich_header_blocks,   # rich header builder for Slack cards
+        build_rich_header_blocks,   # rich header builder we used in cards
     )
 except Exception as e:
     slack_router = None
@@ -65,12 +65,12 @@ except Exception:
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
-# ✅ IMPORTANT: Slack must call /slack/events and /slack/actions
+# ✅ Slack must call /slack/events and /slack/actions
 if slack_router:
     app.include_router(slack_router, prefix="/slack")
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")  # channel ID to post the initial card
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")  # channel ID (e.g., C0123ABCDEF)
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if (SLACK_BOT_TOKEN and WebClient) else None
 
 
@@ -264,7 +264,7 @@ def _post_initial_slack_card(
 async def root():
     return {"ok": True, "service": "hostaway-autoresponder"}
 
-# ✅ Render’s default health probe hits GET /ping — add it
+# ✅ Render’s health probe hits GET /ping — must return 200
 @app.get("/ping")
 async def ping():
     return PlainTextResponse("ok")
@@ -427,5 +427,4 @@ async def hostaway_webhook(request: Request):
 # ---------------------- Run local ----------------------
 if __name__ == "__main__":
     import uvicorn
-    from fastapi.responses import PlainTextResponse
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
