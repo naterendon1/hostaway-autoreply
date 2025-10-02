@@ -4,9 +4,8 @@ import json
 import logging
 from typing import Any, Dict, Optional, Tuple, List
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from starlette.responses import PlainTextResponse  # ✅ fixes /ping NameError
+from fastapi import FastAPI, APIRouter, Request, HTTPException
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # Slack SDK (used only to post the initial card)
 try:
@@ -34,17 +33,18 @@ except Exception:
     text_search_place = None
     get_drive_distance_duration = None
 
-# Slack interactivity (events + actions live there). Mounted at /slack
+# Mount Slack interactivity router (events + actions live there)
 try:
     from slack_interactivity import (
         router as slack_router,
-        build_rich_header_blocks,   # rich header for the Slack card
+        build_rich_header_blocks,   # rich header builder used for cards
     )
 except Exception as e:
-    slack_router = None
+    slack_router = APIRouter()
     logging.warning(f"Slack interactivity router not available: {e}")
 
     def build_rich_header_blocks(**kwargs):
+        # Minimal fallback header if import fails
         meta = kwargs.get("meta", {}) or {}
         guest_msg = kwargs.get("guest_msg", "")
         sent_reply = kwargs.get("sent_reply")
@@ -57,7 +57,7 @@ except Exception as e:
             lines += [{"type": "section", "text": {"type": "mrkdwn", "text": f"*Sent Reply:*\n>{sent_reply}"}}]
         return lines
 
-# Optional smarter writer
+# Smarter two-pass writer
 try:
     from smart_intel import generate_reply
 except Exception:
@@ -66,9 +66,8 @@ except Exception:
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
-# ✅ Slack must call /slack/events and /slack/actions
-if slack_router:
-    app.include_router(slack_router, prefix="/slack")
+# Important: mount Slack router at /slack (matches typical Slack config)
+app.include_router(slack_router, prefix="/slack")
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")  # channel ID to post the initial card
@@ -183,14 +182,6 @@ def _resolve_named_place_and_distance(listing_ctx: Dict[str, Any], guest_text: s
         logging.info(f"[distance] legacy path failed: {e}")
         return dest_query, None
 
-def _compose_ai_context(base_ctx: Dict[str, Any], named_place, distance) -> Dict[str, Any]:
-    ctx = dict(base_ctx)
-    if named_place:
-        ctx["named_place"] = named_place
-    if distance:
-        ctx["distance"] = distance
-    return ctx
-
 def _detect_intent_label(guest_message: str) -> str:
     try:
         r = route_message(guest_message)
@@ -265,9 +256,9 @@ def _post_initial_slack_card(
 async def root():
     return {"ok": True, "service": "hostaway-autoresponder"}
 
-# ✅ Render health probe hits GET /ping — must return 200
 @app.get("/ping")
 async def ping():
+    # Render pings this path; return 200 OK
     return PlainTextResponse("ok")
 
 @app.get("/healthz")
@@ -277,7 +268,6 @@ async def healthz():
         return "SET" if v and len(v) > 3 else "MISSING"
 
     checks = {
-        "SLACK_SIGNING_SECRET": present("SLACK_SIGNING_SECRET"),
         "SLACK_BOT_TOKEN": present("SLACK_BOT_TOKEN"),
         "OPENAI_API_KEY": present("OPENAI_API_KEY"),
         "OPENAI_MODEL": os.getenv("OPENAI_MODEL") or "default",
@@ -422,8 +412,15 @@ async def hostaway_webhook(request: Request):
             detected_intent=intent,
         )
 
-    # Hostaway only needs a 200; sending to guest is handled via Slack “Send”.
+    # Hostaway only needs a 200; sending to guest is done later via Slack “Send”.
     return JSONResponse({"ok": True, "posted_to_slack": bool(SLACK_CHANNEL)})
+
+# ---- Alias to support the old URL Hostaway is posting to ----
+@app.post("/unified-webhook")
+async def unified_webhook(request: Request):
+    # Reuse the same handler
+    return await hostaway_webhook(request)
+
 
 # ---------------------- Run local ----------------------
 if __name__ == "__main__":
