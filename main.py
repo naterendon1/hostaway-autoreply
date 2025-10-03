@@ -3,9 +3,9 @@ import os
 import json
 import logging
 from typing import Any, Dict, Optional, Tuple, List
-from smart_intel import generate_reply, _smart_generate_reply  # _smart_generate_reply is imported but not required
+from smart_intel import generate_reply, _smart_generate_reply
 
-from fastapi import FastAPI, APIRouter, Request
+from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 # ---------------- Env & logging ----------------
@@ -96,9 +96,7 @@ def _fmt_date(d: Optional[str]) -> str:
     return d
 
 def _extract_listing_context_from_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    ctx: Dict[str, Any] = {
-        "address": None, "city": None, "state": None, "zipcode": None, "lat": None, "lng": None, "name": None
-    }
+    ctx: Dict[str, Any] = {"address": None, "city": None, "state": None, "zipcode": None, "lat": None, "lng": None, "name": None}
     listing = data.get("listing") or data.get("property") or {}
     for k in ("address", "city", "state", "zipcode", "lat", "lng", "street", "name"):
         v = listing.get(k)
@@ -182,6 +180,39 @@ def _post_initial_slack_card(
         f"{guest_message}"
     )
 
+    # Make button payloads robust: include BOTH old and new key names
+    send_payload = {
+        "conv_id": meta.get("conv_id"),
+        "conversation_id": meta.get("conv_id"),
+        "reply": ai_suggestion,
+        "reply_text": ai_suggestion,
+        "guest_message": guest_message,
+        "type": meta.get("type", "email"),
+    }
+    edit_payload = {
+        "guest_name": meta.get("guest_name", "Guest"),
+        "guest_message": guest_message,
+        "draft_text": ai_suggestion,
+        # add the missing conv_id so modal can send
+        "conv_id": meta.get("conv_id"),
+        # carry useful context
+        "listing_id": meta.get("listing_id"),
+        "reservation_id": meta.get("reservation_id"),
+        "status": meta.get("status"),
+        "check_in": meta.get("check_in"),
+        "check_out": meta.get("check_out"),
+        "guest_count": meta.get("guest_count"),
+        "property_address": meta.get("property_address"),
+        "property_name": meta.get("property_name"),
+        "type": meta.get("type", "email"),
+    }
+    portal_payload = {
+        "conv_id": meta.get("conv_id"),
+        "status": (meta.get("status") or "").lower(),
+        "guest_portal_url": meta.get("guest_portal_url"),
+        "type": meta.get("type", "email"),
+    }
+
     blocks: List[Dict[str, Any]] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"💡 *Suggested Reply:*\n{ai_suggestion}"}},
@@ -193,32 +224,21 @@ def _post_initial_slack_card(
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send"},
                     "style": "primary",
-                    "action_id": "send_reply",
-                    "value": json.dumps({
-                        "conversation_id": meta.get("conv_id"),
-                        "reply_text": ai_suggestion
-                    })
+                    "action_id": "send",  # support new id
+                    "value": json.dumps(send_payload)
                 },
                 {
-                    # ✅ include conversation_id here so modal submit can send
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Edit"},
                     "action_id": "open_edit_modal",
-                    "value": json.dumps({
-                        "guest_name": meta.get("guest_name"),
-                        "guest_message": guest_message,
-                        "draft_text": ai_suggestion,
-                        "conversation_id": meta.get("conv_id")  # <-- added
-                    })
+                    "value": json.dumps(edit_payload)
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send Guest Portal"},
                     "action_id": "send_guest_portal",
-                    "value": json.dumps({
-                        "conversation_id": meta.get("conv_id")
-                    })
-                },
+                    "value": json.dumps(portal_payload)
+                }
             ]
         }
     ]
@@ -444,12 +464,17 @@ async def unified_webhook(request: Request):
         "conv_id": conv_id,
         "guest_name": guest_name,
         "property_address": listing_data.get("address") or "Unknown Address",
+        "property_name": listing_data.get("name"),
         "check_in": checkin_fmt,
         "check_out": checkout_fmt,
         "guest_count": guest_count,
         "status": res_data.get("status", "N/A"),
         "price_str": price_str,
         "platform": platform,
+        "listing_id": listing_id,
+        "reservation_id": reservation_id,
+        "type": "email",
+        "guest_portal_url": res_data.get("guestPortalUrl") or res_data.get("portalUrl"),
     }
 
     if SLACK_CHANNEL:
@@ -465,6 +490,7 @@ async def unified_webhook(request: Request):
     mark_processed(event_key)
     return {"status": "ok"}
 
+# ---------------- Local dev runner ----------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
