@@ -3,19 +3,18 @@ import os
 import json
 import logging
 from typing import Any, Dict, Optional, Tuple, List
-from smart_intel import generate_reply, _smart_generate_reply
 
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# ---------------- Env & logging ----------------
+# --- Logging & app ---
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
 
-# ---------------- Slack SDK (optional at import time) ----------------
+# --- Slack SDK (optional at import time) ---
 try:
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
@@ -25,8 +24,8 @@ except Exception:
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if (SLACK_BOT_TOKEN and WebClient) else None
 
-# ---------------- Local modules (all optional, with safe fallbacks) ----------------
-# utils: core Hostaway & AI helpers you already use
+# --- Local modules (safe fallbacks everywhere) ---
+# utils: Hostaway + fallbacks
 try:
     from utils import (
         make_suggested_reply,
@@ -36,7 +35,7 @@ try:
         extract_destination_from_message,
         get_distance_drive_time,        # legacy text-path distance
         route_message,                  # simple intent tag
-        send_reply_to_hostaway,         # used by interactivity router typically
+        send_reply_to_hostaway,         # handled by interactivity router typically
     )
 except Exception:
     def make_suggested_reply(*args, **kwargs): return ("Thanks for reaching out—happy to help!", "general")
@@ -48,11 +47,12 @@ except Exception:
     def route_message(*args, **kwargs): return {"primary_intent": "other"}
     def send_reply_to_hostaway(*args, **kwargs): return False
 
-# smarter writer
+# smart_intel: robust wrapper + generator
 try:
-    from smart_intel import generate_reply
+    from smart_intel import generate_reply, _smart_generate_reply
 except Exception:
     generate_reply = None
+    def _smart_generate_reply(*_a, **_kw): return ""
 
 # optional db idempotency/logging
 try:
@@ -76,7 +76,7 @@ except Exception:
     def build_local_recs(*args, **kwargs): return []
     def should_fetch_local_recs(*args, **kwargs): return False
 
-# Slack interactivity router (your actions/events handlers)
+# Slack interactivity router (actions/events)
 try:
     from slack_interactivity import router as slack_router
 except Exception:
@@ -243,7 +243,7 @@ def _post_initial_slack_card(
         logging.error(f"[slack] chat_postMessage failed: {e.response.data if hasattr(e,'response') else e}")
         return None
 
-# ---------------- Tolerant Hostaway payload reader (fix for 400s) ----------------
+# ---------------- Tolerant Hostaway payload reader (prevents 400s) ----------------
 async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
     # 1) JSON body
     try:
@@ -266,7 +266,6 @@ async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
     # 3) Form-encoded with JSON string inside
     try:
         form = await request.form()
-        # common keys Hostaway/relays use
         for key in ("payload", "data", "event", "body"):
             if key in form and form[key]:
                 val = form[key]
@@ -278,7 +277,6 @@ async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
                         try:
                             return json.loads(val)
                         except Exception:
-                            # sometimes nested JSON string once more
                             try:
                                 inner = json.loads(json.loads(val))
                                 if isinstance(inner, dict):
@@ -297,7 +295,7 @@ async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Last resort: don't 400 to avoid retries; just ignore politely
+    # Last resort: don't 400 (Hostaway retries aggressively). Just ack/ignore.
     return {}
 
 # ---------------- Routes ----------------
@@ -375,6 +373,8 @@ async def unified_webhook(request: Request):
         {"role": ("guest" if m.get("isIncoming") else "host"), "text": m.get("body", "")}
         for m in messages if m.get("body")
     ]
+    if messages:
+        logging.info(f"✅ Conversation {conv_id} fetched with messages.")
 
     listing = fetch_hostaway_listing(listing_id) or {}
     listing_data = listing.get("result", {}) or {}
@@ -429,29 +429,28 @@ async def unified_webhook(request: Request):
         ai_context["named_place"] = place_name
         ai_context["distance"] = distance
 
-# -------- AI context & suggestion (robust wrapper + fallback) --------
-ai_reply = ""
-try:
-    ai_reply = _smart_generate_reply(generate_reply, guest_message, ai_context)
-except Exception as e:
-    logging.warning(f"[AI] generate_reply wrapper failed: {e}")
-
-if not ai_reply:
-    # legacy/simple fallback so we always show something in Slack
+    # robust wrapper + legacy fallback
+    ai_reply = ""
     try:
-        ai_reply, _ = make_suggested_reply(
-            guest_message,
-            {
-                "location": {"lat": lat, "lng": lng},
-                "listing": listing_ctx,
-                "reservation": {"arrivalDate": check_in, "departureDate": check_out},
-                "distance": distance,
-                "named_place": place_name,
-            },
-        )
-    except Exception:
-        ai_reply = "Thanks for reaching out—happy to help. I’ll get you the details shortly."
+        ai_reply = _smart_generate_reply(generate_reply, guest_message, ai_context)
+    except Exception as e:
+        logging.warning(f"[AI] generate_reply wrapper failed: {e}")
 
+    if not ai_reply:
+        # legacy/simple fallback so we always show something in Slack
+        try:
+            ai_reply, _ = make_suggested_reply(
+                guest_message,
+                {
+                    "location": {"lat": lat, "lng": lng},
+                    "listing": listing_ctx,
+                    "reservation": {"arrivalDate": check_in, "departureDate": check_out},
+                    "distance": distance,
+                    "named_place": place_name,
+                },
+            )
+        except Exception:
+            ai_reply = "Thanks for reaching out—happy to help. I’ll get you the details shortly."
 
     # -------- log & idempotency --------
     try:
