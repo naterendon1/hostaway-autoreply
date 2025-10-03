@@ -16,13 +16,13 @@ from openai import OpenAI
 
 from utils import (
     send_reply_to_hostaway,
-    store_learning_example,  # legacy helper kept for backwards compatibility
+    store_learning_example,
     clean_ai_reply,
     sanitize_ai_reply,
 )
 from smart_intel import generate_reply
 from places import should_fetch_local_recs, build_local_recs
-from db import record_event  # <-- analytics
+from db import record_event
 
 logging.basicConfig(level=logging.INFO)
 router = APIRouter()
@@ -39,7 +39,6 @@ LEARNING_DB_PATH = os.getenv("LEARNING_DB_PATH", "learning.db")
 
 if not SLACK_BOT_TOKEN:
     logging.warning("SLACK_BOT_TOKEN is not set; Slack operations will fail in production.")
-
 
 # -------------------- Security: Slack Signature Verify --------------------
 def verify_slack_signature(
@@ -62,13 +61,11 @@ def verify_slack_signature(
     ).hexdigest()
     return hmac.compare_digest(my_signature, slack_signature)
 
-
 # -------------------- Small helpers --------------------
 CONFIRMED_STATUSES = {"new", "modified"}
 
 def is_booking_confirmed(status: Optional[str]) -> bool:
     return (status or "").strip().lower() in CONFIRMED_STATUSES
-
 
 def _post_thread_note(channel: Optional[str], ts: Optional[str], text: str) -> None:
     if not slack_client or not channel or not ts:
@@ -77,7 +74,6 @@ def _post_thread_note(channel: Optional[str], ts: Optional[str], text: str) -> N
         slack_client.chat_postMessage(channel=channel, thread_ts=ts, text=text)
     except Exception as e:
         logging.error(f"Thread note failed: {e}")
-
 
 # ---------------- Private metadata packing --------------------
 MAX_PRIVATE_BYTES = 2800
@@ -110,7 +106,6 @@ def pack_private_meta(meta: Dict[str, Any]) -> str:
             s = "{}"
     return s
 
-
 # ---------------- Places injection ----------------
 def inject_local_recs(meta: Dict[str, Any], guest_msg_override: Optional[str] = None) -> Dict[str, Any]:
     try:
@@ -140,7 +135,6 @@ def inject_local_recs(meta: Dict[str, Any], guest_msg_override: Optional[str] = 
             pass
     return meta
 
-
 # ---------------- Rich header helpers ----------------
 def _fmt_int(x: Any, default: str = "N/A") -> str:
     try:
@@ -149,7 +143,6 @@ def _fmt_int(x: Any, default: str = "N/A") -> str:
         return default
 
 def format_date(d: Optional[str]) -> str:
-    # Accepts YYYY-MM-DD or ISO-like; returns YYYY-MM-DD or N/A
     if not d:
         return "N/A"
     try:
@@ -161,12 +154,10 @@ def format_date(d: Optional[str]) -> str:
         return d[:10] if len(d) >= 10 else "N/A"
 
 def pretty_platform(meta: Dict[str, Any]) -> str:
-    # Prefers Slack-provided pretties or Hostaway channelName
     for k in ("channel_pretty", "platform", "channelName", "source"):
         v = meta.get(k)
         if v:
             return str(v).strip()
-    # Fallback to communication type
     t = meta.get("type")
     return str(t).capitalize() if t else "Channel"
 
@@ -223,7 +214,6 @@ def build_rich_header_blocks(
         ]
     return blocks
 
-
 # ---------------- Update Slack with rich header ----------------
 def update_slack_message_with_sent_reply(
     slack_bot_token: Optional[str],
@@ -249,7 +239,6 @@ def update_slack_message_with_sent_reply(
         return
 
     _client = WebClient(token=slack_bot_token)
-    # Build a temp meta to feed header builder
     meta: Dict[str, Any] = {
         "guest_name": guest_name,
         "property_address": property_address,
@@ -276,7 +265,6 @@ def update_slack_message_with_sent_reply(
         logging.error(
             f"❌ Failed to update Slack message with sent reply: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}"
         )
-
 
 # --------- Modal building blocks ----------
 def get_modal_blocks(
@@ -360,7 +348,6 @@ def get_modal_blocks(
         learning_checkbox,
     ]
 
-
 def add_undo_button(blocks: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     if meta.get("previous_draft"):
         blocks.append(
@@ -377,7 +364,6 @@ def add_undo_button(blocks: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[
             }
         )
     return blocks
-
 
 # ---------------- Background: improve + final views.update ----------------
 def _background_improve_and_update(
@@ -472,7 +458,6 @@ def _background_improve_and_update(
         except Exception as e2:
             logging.error(f"views_update (final) second exception: {e2}")
 
-
 # ---------------- Background: send to Hostaway + update Slack ----------------
 def _ensure_feedback_tables(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
@@ -499,7 +484,6 @@ def _ensure_feedback_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.commit()
 
-
 def _insert_feedback_row(row: Dict[str, Any]) -> None:
     conn = sqlite3.connect(LEARNING_DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -511,7 +495,6 @@ def _insert_feedback_row(row: Dict[str, Any]) -> None:
     """, row)
     conn.commit()
     conn.close()
-
 
 def _insert_learning_example(question: str, answer: str, intent: str = "") -> None:
     if not (question and answer):
@@ -526,7 +509,6 @@ def _insert_learning_example(question: str, answer: str, intent: str = "") -> No
     """, (intent or "", question, answer))
     conn.commit()
     conn.close()
-
 
 def _background_send_and_update(meta: dict, reply_text: str):
     logging.info(
@@ -604,7 +586,6 @@ def _background_send_and_update(meta: dict, reply_text: str):
         except Exception as e:
             logging.error(f"Slack chat_update error: {e}")
 
-
 # ---------------------------- Events Endpoint ----------------------------
 @router.post("/events")
 async def slack_events(
@@ -620,7 +601,6 @@ async def slack_events(
     if payload.get("type") == "url_verification":
         return JSONResponse({"challenge": payload.get("challenge")})
     return JSONResponse({"ok": True})
-
 
 # ---------------------------- Interactivity Endpoint ----------------------------
 @router.post("/actions")
@@ -667,6 +647,96 @@ async def slack_actions(
                 return json.loads(_action.get("value") or "{}")
             except Exception:
                 return {}
+
+        # --- NEW: "Send" button from the message card ---
+        if action_id == "send_reply":
+            try:
+                val = json.loads(action.get("value") or "{}")
+            except Exception:
+                val = {}
+
+            conv_id = val.get("conversation_id") or val.get("convId")
+            reply_text = (val.get("reply_text") or val.get("draft_text") or "").strip()
+
+            if not conv_id or not reply_text:
+                _post_thread_note(channel_id, message_ts, "⚠️ Missing conversation id or reply text.")
+                return JSONResponse({"ok": True})
+
+            meta = {
+                "conv_id": conv_id,
+                "channel": channel_id,
+                "ts": message_ts,
+                "guest_name": (payload.get("message") or {}).get("username") or (payload.get("user") or {}).get("name") or "Guest",
+                "guest_message": "",
+                "type": "email",
+                "check_in": "",
+                "check_out": "",
+                "guest_count": "",
+                "status": "inquiry",
+                "detected_intent": "general",
+                "sent_label": "message sent",
+                "channel_pretty": "Slack",
+            }
+
+            background_tasks.add_task(_background_send_and_update, meta, reply_text)
+            _post_thread_note(channel_id, message_ts, "✅ Sending reply to guest…")
+            return JSONResponse({"ok": True})
+
+        # --- NEW: "Edit" button from the message card (opens modal) ---
+        if action_id == "open_edit_modal":
+            try:
+                val = json.loads(action.get("value") or "{}")
+            except Exception:
+                val = {}
+
+            meta = {
+                "conv_id": val.get("conversation_id"),
+                "channel": channel_id,
+                "ts": message_ts,
+                "guest_name": val.get("guest_name") or "Guest",
+                "guest_message": val.get("guest_message") or "",
+                "ai_suggestion": val.get("draft_text") or "",
+                "sent_label": "edited message sent",
+                "checkbox_checked": False,
+                "coach_prompt": "",
+            }
+
+            guest_name = meta["guest_name"]
+            guest_msg = meta["guest_message"]
+            ai_suggestion = meta["ai_suggestion"]
+
+            modal_blocks = get_modal_blocks(
+                guest_name,
+                guest_msg,
+                action_id="edit",
+                draft_text=ai_suggestion,
+                checkbox_checked=False,
+                input_block_id="reply_input",
+                input_action_id="reply",
+                coach_prompt_initial=None,
+            )
+            modal_blocks = add_undo_button(modal_blocks, meta)
+
+            modal = {
+                "type": "modal",
+                "title": {"type": "plain_text", "text": "Edit AI Reply", "emoji": True},
+                "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                "private_metadata": pack_private_meta(meta),
+                "blocks": modal_blocks,
+            }
+
+            if slack_client:
+                try:
+                    if (payload.get("container") or {}).get("type") == "message":
+                        slack_client.views_open(trigger_id=trigger_id, view=modal)
+                    else:
+                        slack_client.views_push(trigger_id=trigger_id, view=modal)
+                except SlackApiError as e:
+                    logging.error(
+                        f"Slack modal error: {getattr(e, 'response', {}).data if hasattr(e, 'response') else e}"
+                    )
+            return JSONResponse({})
 
         # FEEDBACK 👍
         if action_id == "rate_up":
@@ -753,7 +823,7 @@ async def slack_actions(
                 logging.error(f"views_open failed: {e.response.data if hasattr(e, 'response') else e}")
             return JSONResponse({})
 
-        # SEND (AI decisive compose)
+        # (Legacy) SEND via AI compose id "send" – keep for backward compatibility
         if action_id == "send":
             meta = get_meta_from_action(action)
 
@@ -769,7 +839,6 @@ async def slack_actions(
             reply_text = (meta.get("reply") or meta.get("ai_suggestion") or "").strip()
             context = meta.copy()
             guest_msg = context.pop("guest_message", "")
-            # Generate decisive reply using new Hostaway-aware smart_intel
             reply_text = generate_reply(guest_msg, context)
 
             if not reply_text or not meta.get("conv_id"):
@@ -820,7 +889,7 @@ async def slack_actions(
                 slack_client.views_open(trigger_id=trigger_id, view=modal)
             return JSONResponse({})
 
-        # EDIT
+        # EDIT (legacy id)
         if action_id == "edit":
             meta = get_meta_from_action(action)
             if channel_id:
