@@ -162,10 +162,12 @@ def format_date(d: Optional[str]) -> str:
         return d[:10] if len(d) >= 10 else "N/A"
 
 def pretty_platform(meta: Dict[str, Any]) -> str:
+    # Prefers Slack-provided pretties or Hostaway channelName
     for k in ("channel_pretty", "platform", "channelName", "source"):
         v = meta.get(k)
         if v:
             return str(v).strip()
+    # Fallback to communication type
     t = meta.get("type")
     return str(t).capitalize() if t else "Channel"
 
@@ -248,6 +250,7 @@ def update_slack_message_with_sent_reply(
         return
 
     _client = WebClient(token=slack_bot_token)
+    # Build a temp meta to feed header builder
     meta: Dict[str, Any] = {
         "guest_name": guest_name,
         "property_address": property_address,
@@ -661,10 +664,17 @@ async def slack_actions(
         user_id = (payload.get("user") or {}).get("id")
 
         def get_meta_from_action(_action: Dict[str, Any]) -> dict:
+            """Parse and normalize button value meta (back-compat)."""
             try:
-                return json.loads(_action.get("value") or "{}")
+                meta = json.loads(_action.get("value") or "{}")
             except Exception:
-                return {}
+                meta = {}
+            # normalize old keys -> new keys
+            if "conversation_id" in meta and "conv_id" not in meta:
+                meta["conv_id"] = meta["conversation_id"]
+            if "reply_text" in meta and "reply" not in meta:
+                meta["reply"] = meta["reply_text"]
+            return meta
 
         # FEEDBACK 👍
         if action_id == "rate_up":
@@ -761,6 +771,10 @@ async def slack_actions(
             if message_ts and not meta.get("ts"):
                 meta["ts"] = message_ts
 
+            # back-compat: if conv_id missing but conversation_id present
+            if not meta.get("conv_id") and meta.get("conversation_id"):
+                meta["conv_id"] = meta.get("conversation_id")
+
             meta["sent_label"] = meta.get("sent_label", "message sent")
             inject_local_recs(meta)
 
@@ -768,7 +782,7 @@ async def slack_actions(
             reply_text = (meta.get("reply") or meta.get("ai_suggestion") or "").strip()
             context = meta.copy()
             guest_msg = context.pop("guest_message", "")
-            if not reply_text:
+            if not reply_text and guest_msg:
                 try:
                     reply_text = generate_reply(guest_msg, context) or ""
                 except Exception:
@@ -778,7 +792,8 @@ async def slack_actions(
                 _post_thread_note(channel_id, message_ts, "⚠️ Nothing to send (no draft or no conversation id).")
                 return JSONResponse({"ok": True})
 
-            BackgroundTasks().add_task(_background_send_and_update, meta, reply_text)
+            # ✅ Use the injected background task runner
+            background_tasks.add_task(_background_send_and_update, meta, reply_text)
             _post_thread_note(channel_id, message_ts, "✅ Sending reply to guest…")
             return JSONResponse({"ok": True})
 
@@ -1031,7 +1046,7 @@ async def slack_actions(
             channel = meta.get("channel")
             ts = meta.get("ts")
 
-            conv_id = meta.get("conv_id")
+            conv_id = meta.get("conv_id") or meta.get("conversation_id")
             communication_type = meta.get("type", "email")
             status = (meta.get("status") or "").lower()
             url = meta.get("guest_portal_url") or meta.get("guestPortalUrl")
@@ -1134,12 +1149,15 @@ async def slack_actions(
         if not fp:
             logging.warning("No fingerprint in private_metadata; allowing send for backward-compat.")
 
+        # back-compat: normalize conv id if provided under old name
+        if not meta.get("conv_id") and meta.get("conversation_id"):
+            meta["conv_id"] = meta["conversation_id"]
+
         if not (reply_text and meta.get("conv_id")):
+            # return error keyed to whatever input block the user sees
+            error_key = "reply_input_ai" if "reply_input_ai" in state else "reply_input"
             return JSONResponse(
-                {
-                    "response_action": "errors",
-                    "errors": {"reply_input": "Please enter a reply (and make sure we have a conversation id)."},
-                }
+                {"response_action": "errors", "errors": {error_key: "Please enter a reply (and make sure we have a conversation id)."}}
             )
 
         # Put channel/ts from original container if missing
