@@ -3,18 +3,19 @@ import os
 import json
 import logging
 from typing import Any, Dict, Optional, Tuple, List
+from smart_intel import generate_reply, _smart_generate_reply  # _smart_generate_reply is imported but not required
 
-from fastapi import FastAPI, APIRouter, Request, HTTPException
+from fastapi import FastAPI, APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# --- Logging & app ---
+# ---------------- Env & logging ----------------
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
 
-# --- Slack SDK (optional at import time) ---
+# ---------------- Slack SDK (optional at import time) ----------------
 try:
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
@@ -24,8 +25,7 @@ except Exception:
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if (SLACK_BOT_TOKEN and WebClient) else None
 
-# --- Local modules (safe fallbacks everywhere) ---
-# utils: Hostaway + fallbacks
+# ---------------- Local modules (all optional, with safe fallbacks) ----------------
 try:
     from utils import (
         make_suggested_reply,
@@ -33,9 +33,9 @@ try:
         fetch_hostaway_reservation,
         fetch_hostaway_conversation,
         extract_destination_from_message,
-        get_distance_drive_time,        # legacy text-path distance
-        route_message,                  # simple intent tag
-        send_reply_to_hostaway,         # handled by interactivity router typically
+        get_distance_drive_time,
+        route_message,
+        send_reply_to_hostaway,
     )
 except Exception:
     def make_suggested_reply(*args, **kwargs): return ("Thanks for reaching out—happy to help!", "general")
@@ -47,14 +47,6 @@ except Exception:
     def route_message(*args, **kwargs): return {"primary_intent": "other"}
     def send_reply_to_hostaway(*args, **kwargs): return False
 
-# smart_intel: robust wrapper + generator
-try:
-    from smart_intel import generate_reply, _smart_generate_reply
-except Exception:
-    generate_reply = None
-    def _smart_generate_reply(*_a, **_kw): return ""
-
-# optional db idempotency/logging
 try:
     from db import already_processed, mark_processed, log_ai_exchange
 except Exception:
@@ -62,21 +54,18 @@ except Exception:
     def mark_processed(key: str) -> None: return None
     def log_ai_exchange(*args, **kwargs): return None
 
-# google helpers (optional)
 try:
     from places import text_search_place, get_drive_distance_duration
 except Exception:
     text_search_place = None
     get_drive_distance_duration = None
 
-# nearby recs (optional)
 try:
     from places import build_local_recs, should_fetch_local_recs
 except Exception:
     def build_local_recs(*args, **kwargs): return []
     def should_fetch_local_recs(*args, **kwargs): return False
 
-# Slack interactivity router (actions/events)
 try:
     from slack_interactivity import router as slack_router
 except Exception:
@@ -104,7 +93,7 @@ def _fmt_date(d: Optional[str]) -> str:
             return datetime.strptime(d, fmt).strftime("%m-%d-%Y")
         except Exception:
             continue
-    return d  # last resort
+    return d
 
 def _extract_listing_context_from_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     ctx: Dict[str, Any] = {
@@ -145,11 +134,9 @@ def _resolve_named_place_and_distance(listing_ctx: Dict[str, Any], guest_text: s
     lat = listing_ctx.get("lat"); lng = listing_ctx.get("lng")
     if lat is None or lng is None:
         return None, None
-    # extract destination
     dest_query = extract_destination_from_message(guest_text) or ""
     if not dest_query:
         return None, None
-    # robust path
     if text_search_place and get_drive_distance_duration:
         try:
             city = listing_ctx.get("city"); state = listing_ctx.get("state")
@@ -164,7 +151,6 @@ def _resolve_named_place_and_distance(listing_ctx: Dict[str, Any], guest_text: s
             return (place.get("name") or dest_query), dist
         except Exception as e:
             logging.info(f"[distance] robust path failed, fallback. err={e}")
-    # legacy path
     try:
         dm_text = get_distance_drive_time(float(lat), float(lng), dest_query)
         import re
@@ -187,7 +173,6 @@ def _post_initial_slack_card(
         logging.warning("Slack not configured; skipping card.")
         return None
 
-    # Main section (address instead of name for clarity)
     header_text = (
         f"*✉️ Message from {meta.get('guest_name','Guest')}*\n"
         f"🏡 *Property:* {meta.get('property_address','Unknown Address')}\n"
@@ -215,13 +200,15 @@ def _post_initial_slack_card(
                     })
                 },
                 {
+                    # ✅ include conversation_id here so modal submit can send
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Edit"},
                     "action_id": "open_edit_modal",
                     "value": json.dumps({
                         "guest_name": meta.get("guest_name"),
                         "guest_message": guest_message,
-                        "draft_text": ai_suggestion
+                        "draft_text": ai_suggestion,
+                        "conversation_id": meta.get("conv_id")  # <-- added
                     })
                 },
                 {
@@ -243,17 +230,14 @@ def _post_initial_slack_card(
         logging.error(f"[slack] chat_postMessage failed: {e.response.data if hasattr(e,'response') else e}")
         return None
 
-# ---------------- Tolerant Hostaway payload reader (prevents 400s) ----------------
+# ---------------- Tolerant Hostaway payload reader ----------------
 async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
-    # 1) JSON body
     try:
         body = await request.json()
         if isinstance(body, dict):
             return body
     except Exception:
         pass
-
-    # 2) Raw JSON string
     raw = await request.body()
     if raw:
         s = raw.decode("utf-8", "ignore").strip()
@@ -262,8 +246,6 @@ async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
                 return json.loads(s)
             except Exception:
                 pass
-
-    # 3) Form-encoded with JSON string inside
     try:
         form = await request.form()
         for key in ("payload", "data", "event", "body"):
@@ -283,7 +265,6 @@ async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
                                     return inner
                             except Exception:
                                 pass
-        # one-key form where the only value is JSON
         if len(form.keys()) == 1:
             only_key = list(form.keys())[0]
             val = form[only_key]
@@ -294,8 +275,6 @@ async def _read_hostaway_payload(request: Request) -> Dict[str, Any]:
                     pass
     except Exception:
         pass
-
-    # Last resort: don't 400 (Hostaway retries aggressively). Just ack/ignore.
     return {}
 
 # ---------------- Routes ----------------
@@ -326,15 +305,7 @@ async def healthz():
 
 @app.post("/unified-webhook")
 async def unified_webhook(request: Request):
-    """
-    Tolerant Hostaway webhook:
-    - Accepts JSON, raw-JSON-string, or form-encoded JSON.
-    - Only processes conversation message inbound events.
-    - Posts a Slack card with AI suggestion; sending to guest happens via Slack actions (in slack_interactivity router).
-    """
     payload = await _read_hostaway_payload(request)
-
-    # If we truly couldn't parse, don't 400 (Hostaway retries aggressively). Just ack.
     if not payload:
         logging.warning("[webhook] empty/invalid payload accepted (ignored).")
         return {"status": "ignored"}
@@ -346,7 +317,6 @@ async def unified_webhook(request: Request):
     if event != "message.received" or obj != "conversationMessage":
         return {"status": "ignored"}
 
-    # idempotency guard
     event_key = f"{obj}:{event}:{data.get('id') or data.get('conversationId')}"
     if already_processed(event_key):
         return {"status": "duplicate"}
@@ -360,7 +330,6 @@ async def unified_webhook(request: Request):
     reservation_id = data.get("reservationId")
     listing_id = data.get("listingMapId")
 
-    # ------- fetch Hostaway context -------
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     res_data = reservation.get("result", {}) or {}
     guest_name = res_data.get("guestFirstName") or res_data.get("guest", {}).get("firstName") or "Guest"
@@ -373,13 +342,10 @@ async def unified_webhook(request: Request):
         {"role": ("guest" if m.get("isIncoming") else "host"), "text": m.get("body", "")}
         for m in messages if m.get("body")
     ]
-    if messages:
-        logging.info(f"✅ Conversation {conv_id} fetched with messages.")
 
     listing = fetch_hostaway_listing(listing_id) or {}
     listing_data = listing.get("result", {}) or {}
 
-    # -------- nearby recs (optional) --------
     nearby_places: List[Dict[str, Any]] = []
     lat = listing_data.get("lat")
     lng = listing_data.get("lng")
@@ -389,7 +355,6 @@ async def unified_webhook(request: Request):
         except Exception as e:
             logging.warning(f"[recs] nearby recs failed: {e}")
 
-    # -------- distance add-on (optional, just if guest asked "how far") --------
     listing_ctx = {
         "lat": lat, "lng": lng,
         "city": listing_data.get("city"), "state": listing_data.get("state"),
@@ -397,7 +362,6 @@ async def unified_webhook(request: Request):
     }
     place_name, distance = _resolve_named_place_and_distance(listing_ctx, guest_message)
 
-    # -------- AI context & suggestion --------
     structured_listing_info = {
         "name": listing_data.get("name"),
         "address": listing_data.get("address"),
@@ -429,30 +393,24 @@ async def unified_webhook(request: Request):
         ai_context["named_place"] = place_name
         ai_context["distance"] = distance
 
-    # robust wrapper + legacy fallback
     ai_reply = ""
     try:
-        ai_reply = _smart_generate_reply(generate_reply, guest_message, ai_context)
+        if generate_reply:
+            ai_reply = generate_reply(guest_message, ai_context) or ""
     except Exception as e:
-        logging.warning(f"[AI] generate_reply wrapper failed: {e}")
-
+        logging.warning(f"[AI] generate_reply failed: {e}")
     if not ai_reply:
-        # legacy/simple fallback so we always show something in Slack
         try:
-            ai_reply, _ = make_suggested_reply(
-                guest_message,
-                {
-                    "location": {"lat": lat, "lng": lng},
-                    "listing": listing_ctx,
-                    "reservation": {"arrivalDate": check_in, "departureDate": check_out},
-                    "distance": distance,
-                    "named_place": place_name,
-                },
-            )
+            ai_reply, _ = make_suggested_reply(guest_message, {
+                "location": {"lat": lat, "lng": lng},
+                "listing": listing_ctx,
+                "reservation": {"arrivalDate": check_in, "departureDate": check_out},
+                "distance": distance,
+                "named_place": place_name,
+            })
         except Exception:
             ai_reply = "Thanks for reaching out—happy to help. I’ll get you the details shortly."
 
-    # -------- log & idempotency --------
     try:
         log_ai_exchange(
             conversation_id=str(conv_id),
@@ -463,19 +421,16 @@ async def unified_webhook(request: Request):
     except Exception:
         pass
 
-    # -------- Slack card --------
     checkin_fmt = _fmt_date(check_in)
     checkout_fmt = _fmt_date(check_out)
 
     price = res_data.get("grandTotalPrice") or res_data.get("totalPrice") or res_data.get("price") or "N/A"
-    # prettify price if numeric-ish
     try:
         price_float = float(str(price))
         price_str = f"${price_float:,.2f}"
     except Exception:
         price_str = "$N/A"
 
-    # Platform name (simple mapping)
     channel_map = {
         2018: "Airbnb", 2002: "Vrbo", 2005: "Booking.com", 2007: "Expedia",
         2009: "Vrbo (iCal)", 2010: "Vrbo (iCal)", 2000: "Direct", 2013: "Booking Engine",
@@ -510,7 +465,6 @@ async def unified_webhook(request: Request):
     mark_processed(event_key)
     return {"status": "ok"}
 
-# ---------------- Local dev runner ----------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
