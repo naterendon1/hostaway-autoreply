@@ -5,8 +5,8 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, JSONResponse
 
 # Import new modular routers
-from src.slack_interactions import slack_interactions_bp
-from src.message_handler import message_handler_bp
+from src.slack_client import router as slack_router
+from src.message_handler import router as message_router
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -15,8 +15,8 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="Hostaway Autoreply")
 
 # Register routers
-app.include_router(slack_interactions_bp, prefix="/slack", tags=["slack"])
-app.include_router(message_handler_bp, prefix="/webhook", tags=["webhook"])
+app.include_router(slack_router, prefix="/slack", tags=["slack"])
+app.include_router(message_router, prefix="/webhook", tags=["webhook"])
 
 # ---------------- Root Routes ----------------
 @app.get("/")
@@ -43,7 +43,10 @@ async def healthz():
         "HOSTAWAY_CLIENT_SECRET": present("HOSTAWAY_CLIENT_SECRET"),
     }
     status = 200 if not [k for k, v in checks.items() if v == "MISSING"] else 500
-    return JSONResponse({"status": "ok" if status == 200 else "missing_env", "checks": checks}, status_code=status)
+    return JSONResponse(
+        {"status": "ok" if status == 200 else "missing_env", "checks": checks},
+        status_code=status,
+    )
 
 # ---------------- Local Dev Runner ----------------
 if __name__ == "__main__":
