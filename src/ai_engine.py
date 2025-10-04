@@ -142,7 +142,7 @@ Rewrite with a {tone} tone:
 
 
 # -------------------- Analyze Conversation Thread --------------------
-dasync def analyze_conversation_thread(thread: list):
+async def analyze_conversation_thread(thread: list):
     """
     Analyze a guest conversation thread.
     Returns a tuple: (mood, summary)
