@@ -147,36 +147,37 @@ Rewrite with a {tone} tone:
 
 # -------------------- Analyze Conversation Thread --------------------
 async def analyze_conversation_thread(thread: list):
-    """
-    Analyze a guest conversation thread.
-    Returns a tuple: (mood, summary)
-    """
+    """Analyzes a guest conversation and returns (mood, summary)."""
     try:
-        prompt = (
-            "Summarize the last 10–15 messages of this guest-host thread. "
-            "Capture the tone (e.g., friendly, upset, neutral) and a concise summary of context."
+        # Build a structured conversation transcript
+        conversation_text = "\n".join(
+            [f"{m.get('sender', 'Guest')}: {m.get('body', '')}" for m in thread]
         )
-        messages = [{"role": "system", "content": prompt}]
-        for msg in thread[-15:]:
-            messages.append({"role": "user", "content": msg.get("message", "")})
 
-        response = openai_client.chat.completions.create(
+        # 🔹 Await the async call correctly
+        response = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=messages,
+            messages=[
+                {"role": "system", "content": "You are an assistant analyzing Airbnb guest conversations."},
+                {"role": "user", "content": f"Analyze this conversation and provide:\n1. The guest's mood (e.g., happy, confused, frustrated).\n2. A short summary.\n\nConversation:\n{conversation_text}"}
+            ],
+            max_tokens=300,
         )
 
-        content = response.choices[0].message.content or ""
-        # Extract a simple mood and summary
-        if ":" in content:
-            parts = content.split(":", 1)
-            mood = parts[0].strip()
-            summary = parts[1].strip()
-        else:
-            mood = "neutral"
-            summary = content.strip()
+        # Extract the model response text safely
+        text = response.choices[0].message.content.strip()
+
+        # Very simple split logic
+        mood, summary = "Neutral", text
+        if "Mood:" in text and "Summary:" in text:
+            try:
+                mood = text.split("Mood:")[1].split("Summary:")[0].strip()
+                summary = text.split("Summary:")[1].strip()
+            except Exception:
+                pass
 
         return mood, summary
 
     except Exception as e:
         logging.error(f"[ai_engine] analyze_conversation_thread failed: {e}")
-        return "neutral", "Unable to summarize thread"
+        return "Neutral", "No summary available."
