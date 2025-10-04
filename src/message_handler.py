@@ -43,7 +43,7 @@ async def unified_webhook(request: Request):
     messages = (conversation or {}).get("result", {}).get("conversationMessages", []) or []
     thread = [{"role": "guest" if m.get("isIncoming") else "host", "text": m.get("body")} for m in messages if m.get("body")]
 
-    mood, summary = analyze_conversation_thread(thread)
+    mood, summary = await analyze_conversation_thread(thread)
 
     ai_context = {
         "guest_name": guest_name,
