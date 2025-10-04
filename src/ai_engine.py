@@ -3,6 +3,10 @@ import os
 import logging
 from typing import List, Dict, Any
 from openai import OpenAI
+from openai import AsyncOpenAI
+import os
+
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
