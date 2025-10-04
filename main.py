@@ -5,8 +5,8 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, JSONResponse
 
 # Import new modular routers
-from src.slack_client import router as slack_router
-from src.message_handler import router as message_router
+from src.slack_interactions import slack_interactions_bp
+from src.message_handler import message_handler_bp
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
