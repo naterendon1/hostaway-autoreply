@@ -240,3 +240,40 @@ def open_edit_modal(trigger_id: str, payload: Dict[str, Any]):
         client.views_open(trigger_id=trigger_id, view=modal)
     except SlackApiError as e:
         logging.error(f"[SLACK] Failed to open modal: {e}")
+
+# ---------------- Send Reply to Hostaway ----------------
+import requests
+import os
+import logging
+
+HOSTAWAY_API_BASE = os.getenv("HOSTAWAY_API_BASE", "https://api.hostaway.com/v1")
+HOSTAWAY_ACCESS_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")
+
+
+def send_hostaway_reply(conversation_id: int, message: str) -> bool:
+    """
+    Sends a reply message to a Hostaway guest conversation.
+    """
+    if not (HOSTAWAY_ACCESS_TOKEN and conversation_id and message):
+        logging.warning("[send_hostaway_reply] Missing token, conversation_id, or message.")
+        return False
+
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"body": message}
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logging.info(f"[Hostaway] Reply sent successfully to conversation {conversation_id}")
+            return True
+        else:
+            logging.error(f"[Hostaway] Failed to send reply (status={resp.status_code}, resp={resp.text})")
+            return False
+    except Exception as e:
+        logging.error(f"[Hostaway] Error sending reply: {e}")
+        return False
+
