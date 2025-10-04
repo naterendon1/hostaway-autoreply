@@ -6,8 +6,18 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from src.api_client import send_hostaway_reply
-from src.slack_client import slack_client, _build_guest_context, _build_header_block
+from src.slack_client 
 from src.ai_engine import generate_reply_with_tone, improve_message_with_ai
+from src.slack_client import (
+    client as slack_client,
+    build_message_blocks,
+    build_edit_modal,
+    post_message_to_slack,
+    handle_tone_rewrite,
+    handle_improve_with_ai,
+    open_edit_modal,
+)
+
 
 router = APIRouter()
 
