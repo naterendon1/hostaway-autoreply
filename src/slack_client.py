@@ -2,108 +2,121 @@
 import os
 import json
 import logging
-from typing import Dict, Any, List, Optional
-
+from typing import Dict, Any, Optional, List
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-# Initialize Slack client
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
+
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
 
 
-# ---------------- Helper: Build context/photo section ----------------
-def _build_guest_context(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """Builds the Slack context block with guest photo and info."""
-    elements = []
+# -------------------- Helper: Post Slack Message --------------------
+def post_message_to_slack(
+    guest_message: str,
+    ai_suggestion: str,
+    meta: Dict[str, Any],
+    mood: Optional[str] = None,
+    summary: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Posts the main Slack message with header, guest info, summary, and buttons.
+    """
 
-    # Add guest profile photo (if available)
-    guest_photo_url = meta.get("guest_photo_url")
-    if guest_photo_url:
-        elements.append({
-            "type": "image",
-            "image_url": guest_photo_url,
-            "alt_text": f"{meta.get('guest_name', 'Guest')} photo"
-        })
+    if not slack_client:
+        logging.warning("Slack not configured; skipping message post.")
+        return None
 
-    # Add platform and name
     guest_name = meta.get("guest_name", "Guest")
-    platform = meta.get("platform", "Unknown")
-    elements.append({
-        "type": "mrkdwn",
-        "text": f"*{guest_name}* via *{platform}*"
-    })
-
-    # Optional: Add perceived mood (if available from AI)
-    if meta.get("guest_mood"):
-        mood = meta["guest_mood"]
-        emoji = "🙂" if mood == "neutral" else "😃" if mood == "happy" else "😟"
-        elements.append({"type": "mrkdwn", "text": f"*Mood:* {emoji} {mood.title()}"})
-
-    return {"type": "context", "elements": elements}
-
-
-# ---------------- Helper: Build header block ----------------
-def _build_header_block(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """Builds the main header with property and reservation details."""
     property_name = meta.get("property_name", "Unknown Property")
     property_address = meta.get("property_address", "Unknown Address")
     check_in = meta.get("check_in", "N/A")
     check_out = meta.get("check_out", "N/A")
     guest_count = meta.get("guest_count", "?")
-    price_str = meta.get("price_str", "$N/A")
     status = meta.get("status", "N/A")
+    price_str = meta.get("price_str", "$N/A")
+    platform = meta.get("platform", "Unknown")
+    guest_photo = meta.get("guest_photo")
+    conversation_id = meta.get("conv_id")
 
+    # -------------------- Header Composition --------------------
     header_text = (
-        f"🏡 *{property_name}*\n"
+        f"*✉️ Message from {guest_name}*"
+        + (f" (Mood: *{mood}*)" if mood else "")
+        + "\n"
+        f"🏡 *Property:* {property_name}\n"
         f"📍 {property_address}\n"
-        f"📅 *{check_in} → {check_out}* | 👥 *{guest_count} guests* | 💵 {price_str} | {status}"
+        f"📅 *{check_in} → {check_out}*\n"
+        f"👥 {guest_count} guests | Status: *{status}* | {price_str} | Platform: *{platform}*\n"
     )
 
-    # Add optional conversation summary from AI
-    if meta.get("conversation_summary"):
-        header_text += f"\n\n🗒️ *Conversation Summary:*\n_{meta['conversation_summary']}_"
+    if summary:
+        header_text += f"\n🗒️ *Conversation Summary:* {summary}\n"
 
-    return {"type": "section", "text": {"type": "mrkdwn", "text": header_text}}
-
-
-# ---------------- Helper: Build action buttons ----------------
-def _build_action_buttons(meta: Dict[str, Any], guest_message: str, ai_suggestion: str) -> Dict[str, Any]:
-    """Builds interactive buttons for Slack message cards."""
-    conv_id = meta.get("conv_id")
-
+    # -------------------- Build Action Buttons --------------------
     send_payload = {
-        "conv_id": conv_id,
-        "reply_text": ai_suggestion,
+        "conv_id": conversation_id,
+        "reply": ai_suggestion,
         "guest_message": guest_message,
-        "type": meta.get("type", "email"),
     }
-
     edit_payload = {
-        "conv_id": conv_id,
+        **meta,
         "guest_message": guest_message,
         "draft_text": ai_suggestion,
-        **{k: meta.get(k) for k in (
-            "guest_name", "listing_id", "reservation_id",
-            "check_in", "check_out", "guest_count",
-            "property_address", "property_name"
-        )}
     }
-
     portal_payload = {
-        "conv_id": conv_id,
+        "conv_id": conversation_id,
         "guest_portal_url": meta.get("guest_portal_url"),
-        "status": meta.get("status", "").lower(),
-        "type": meta.get("type", "email"),
     }
 
-    tone_payloads = {
-        "friendlier": {**send_payload, "tone": "friendlier"},
-        "formal": {**send_payload, "tone": "formal"},
-    }
+    # Tone buttons payloads
+    tone_buttons = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "More Friendly"},
+            "action_id": "tone_friendly",
+            "value": json.dumps({"conv_id": conversation_id, "tone": "friendly", "guest_message": guest_message}),
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "More Formal"},
+            "action_id": "tone_formal",
+            "value": json.dumps({"conv_id": conversation_id, "tone": "formal", "guest_message": guest_message}),
+        },
+    ]
 
-    return {
+    # -------------------- Construct Blocks --------------------
+    blocks: List[Dict[str, Any]] = []
+
+    # Include guest photo if available (e.g. Airbnb profile picture)
+    if guest_photo:
+        blocks.append({
+            "type": "image",
+            "image_url": guest_photo,
+            "alt_text": f"Photo of {guest_name}"
+        })
+
+    # Header
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": header_text},
+    })
+
+    # Guest message
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": f"💬 *Guest Message:*\n{guest_message}"},
+    })
+
+    # AI suggested reply
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": f"💡 *Suggested Reply:*\n{ai_suggestion}"},
+    })
+
+    # Main buttons (Send / Edit / Portal)
+    blocks.append({
         "type": "actions",
         "block_id": "action_buttons",
         "elements": [
@@ -122,56 +135,37 @@ def _build_action_buttons(meta: Dict[str, Any], guest_message: str, ai_suggestio
             },
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "More Friendly"},
-                "action_id": "adjust_tone_friendlier",
-                "value": json.dumps(tone_payloads["friendlier"]),
-            },
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "More Formal"},
-                "action_id": "adjust_tone_formal",
-                "value": json.dumps(tone_payloads["formal"]),
-            },
-            {
-                "type": "button",
                 "text": {"type": "plain_text", "text": "Send Guest Portal"},
                 "action_id": "send_guest_portal",
                 "value": json.dumps(portal_payload),
-            }
+            },
         ],
-    }
+    })
 
+    # Tone change buttons
+    blocks.append({
+        "type": "actions",
+        "block_id": "tone_buttons",
+        "elements": tone_buttons,
+    })
 
-# ---------------- Public: Post Slack card ----------------
-def post_guest_message_to_slack(
-    meta: Dict[str, Any],
-    guest_message: str,
-    ai_suggestion: str
-) -> Optional[Dict[str, Any]]:
-    """Sends a styled Slack card summarizing guest info and AI reply."""
-
-    if not slack_client or not SLACK_CHANNEL:
-        logging.warning("Slack not configured correctly; skipping post.")
-        return None
-
+    # -------------------- Send to Slack --------------------
     try:
-        # Build all sections
-        blocks: List[Dict[str, Any]] = [
-            _build_guest_context(meta),
-            _build_header_block(meta),
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"💬 *Guest Message:*\n{guest_message}"}},
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"💡 *Suggested Reply:*\n{ai_suggestion}"}},
-            _build_action_buttons(meta, guest_message, ai_suggestion),
-        ]
-
-        response = slack_client.chat_postMessage(
+        resp = slack_client.chat_postMessage(
             channel=SLACK_CHANNEL,
             blocks=blocks,
-            text="New guest message received"
+            text=f"Message from {guest_name} at {property_name}"
         )
-
-        return response.data if hasattr(response, "data") else response
-
+        return resp.data if hasattr(resp, "data") else resp
     except SlackApiError as e:
-        logging.error(f"[Slack] Message post failed: {e.response.data if hasattr(e, 'response') else e}")
+        logging.error(f"[Slack] post_message_to_slack failed: {e.response['error']}")
         return None
+
+
+# -------------------- Helper: Update Message --------------------
+def update_message_in_slack(ts: str, channel: str, blocks: List[Dict[str, Any]]):
+    """Allows the message header and blocks to stay consistent when updates occur."""
+    try:
+        slack_client.chat_update(channel=channel, ts=ts, blocks=blocks)
+    except Exception as e:
+        logging.error(f"[Slack] update_message_in_slack failed: {e}")
