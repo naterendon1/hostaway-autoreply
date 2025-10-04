@@ -11,6 +11,49 @@ SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
 
+# ---------------- Helper functions for Slack message composition ----------------
+def _build_guest_context(meta: dict) -> str:
+    """
+    Build a concise guest context summary used in Slack headers.
+    """
+    guest_name = meta.get("guest_name", "Guest")
+    property_name = meta.get("property_name", "Unknown Property")
+    address = meta.get("property_address", "")
+    check_in = meta.get("check_in", "N/A")
+    check_out = meta.get("check_out", "N/A")
+    guest_count = meta.get("guest_count", "?")
+    price_str = meta.get("price_str", "$N/A")
+    platform = meta.get("platform", "Unknown")
+    mood = meta.get("guest_mood", "Neutral 😐")
+    summary = meta.get("conversation_summary", "No summary available yet.")
+
+    return (
+        f"*✉️ Message from {guest_name}*\n"
+        f"🏡 *Property:* {property_name}\n"
+        f"📍 {address}\n"
+        f"📅 *{check_in} → {check_out}* | 👥 {guest_count} guests | 💰 {price_str} | 🌐 {platform}\n"
+        f"🧠 *Mood:* {mood}\n"
+        f"🗒️ *Conversation Summary:* {summary}"
+    )
+
+
+def _build_header_block(meta: dict) -> dict:
+    """
+    Returns a Slack Block Kit section block for the header.
+    """
+    header_text = _build_guest_context(meta)
+    return {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": header_text},
+        # Add image if guest uploaded one (Airbnb guests often attach photos)
+        "accessory": {
+            "type": "image",
+            "image_url": meta.get("guest_image_url", "https://i.imgur.com/9M3K4sY.png"),
+            "alt_text": meta.get("guest_name", "Guest"),
+        },
+    }
+
+
 
 # -------------------- Helper: Post Slack Message --------------------
 def post_message_to_slack(
