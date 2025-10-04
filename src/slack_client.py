@@ -1,8 +1,9 @@
+# file: src/slack_client.py
 """
 Slack Client for Hostaway AutoReply
 -----------------------------------
 Handles:
-- Posting structured message blocks (headers, suggested reply, buttons)
+- Posting structured message blocks (headers, guest photo, AI suggestions, buttons)
 - Opening modals for message editing / improvement
 - Processing tone rewrite and AI improvement interactions
 """
@@ -10,15 +11,13 @@ Handles:
 import os
 import json
 import logging
-from typing import Any, Dict, Optional
 import requests
+from typing import Any, Dict, Optional
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from src.ai_engine import (
-    improve_message_with_ai,
-    rewrite_tone,
-)
+from src.ai_engine import improve_message_with_ai, rewrite_tone
+
 
 # ---------------------------------------------------------------------
 # Environment setup
@@ -35,17 +34,6 @@ client = WebClient(token=SLACK_BOT_TOKEN)
 # ---------------------------------------------------------------------
 # Slack Block Builders
 # ---------------------------------------------------------------------
-def _build_guest_context(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """Creates a compact summary context for guests."""
-    return {
-        "guest_name": meta.get("guest_name"),
-        "property_name": meta.get("property_name"),
-        "check_in": meta.get("check_in"),
-        "check_out": meta.get("check_out"),
-        "guest_count": meta.get("guest_count"),
-    }
-
-
 def _build_header_block(meta: Dict[str, Any], summary: Optional[str] = None, mood: Optional[str] = None) -> Dict[str, Any]:
     """Generates the Slack header block with guest + listing info."""
     header_text = (
@@ -61,7 +49,20 @@ def _build_header_block(meta: Dict[str, Any], summary: Optional[str] = None, moo
     if summary:
         header_text += f"\n*📝 Summary:* {summary}"
 
-    return {"type": "section", "text": {"type": "mrkdwn", "text": header_text}}
+    guest_photo = meta.get("guest_photo")
+
+    if guest_photo:
+        return {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text},
+            "accessory": {
+                "type": "image",
+                "image_url": guest_photo,
+                "alt_text": f"Photo of {meta.get('guest_name','Guest')}",
+            },
+        }
+    else:
+        return {"type": "section", "text": {"type": "mrkdwn", "text": header_text}}
 
 
 def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> list:
@@ -76,7 +77,15 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
     blocks = [
         header_block,
         {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"💡 *Suggested Reply:*\n{ai_suggestion}"}},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"💬 *Guest Message:*\n>{guest_message}"},
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"💡 *Suggested Reply:*\n{ai_suggestion}"},
+        },
         {
             "type": "actions",
             "block_id": "action_buttons",
@@ -140,8 +149,9 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
         "type": "modal",
         "callback_id": "edit_modal_submit",
         "title": {"type": "plain_text", "text": "Edit Reply"},
-        "submit": {"type": "plain_text", "text": "Save"},
+        "submit": {"type": "plain_text", "text": "Send"},
         "close": {"type": "plain_text", "text": "Cancel"},
+        "private_metadata": json.dumps(meta),
         "blocks": [
             header_block,
             {"type": "divider"},
@@ -174,13 +184,25 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 # Slack Actions
 # ---------------------------------------------------------------------
-def post_message_to_slack(meta: Dict[str, Any], ai_result: Dict[str, str]):
+def post_message_to_slack(guest_message: str, ai_suggestion: str, meta: Dict[str, Any], mood: Optional[str] = None, summary: Optional[str] = None):
     """Posts the main AI card to Slack."""
     try:
+        ai_result = {
+            "suggested_reply": ai_suggestion,
+            "summary": summary,
+            "mood": mood,
+        }
+        meta["guest_message"] = guest_message
         blocks = build_message_blocks(meta, ai_result)
-        client.chat_postMessage(channel=SLACK_CHANNEL, blocks=blocks, text="New guest message received")
+        client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            blocks=blocks,
+            text=f"New guest message from {meta.get('guest_name','Guest')}",
+        )
+        return True
     except SlackApiError as e:
         logging.error(f"[SLACK] Failed to post message: {e}")
+        return False
 
 
 def handle_tone_rewrite(action_id: str, value: str, trigger_id: str):
@@ -190,7 +212,10 @@ def handle_tone_rewrite(action_id: str, value: str, trigger_id: str):
         reply = data.get("reply", "")
         tone = "friendly" if "friendly" in action_id else "formal" if "formal" in action_id else "professional"
         new_reply = rewrite_tone(reply, tone)
-        client.chat_postEphemeral(channel=SLACK_CHANNEL, user=os.getenv("SLACK_BOT_USER", ""), text=f"*Rewritten ({tone.capitalize()} tone):*\n{new_reply}")
+        client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            text=f"*Rewritten ({tone.capitalize()} tone):*\n{new_reply}",
+        )
         return new_reply
     except Exception as e:
         logging.error(f"[SLACK] Tone rewrite failed: {e}")
@@ -203,12 +228,15 @@ def handle_improve_with_ai(action_value: str, trigger_id: str):
         data = json.loads(action_value)
         draft_text = data.get("draft_text", "")
         meta = data.get("meta", {})
-        improved = improve_message_with_ai(draft_text, None, meta)
+        improved = improve_message_with_ai(draft_text, meta)
         modal = {
             "type": "modal",
             "title": {"type": "plain_text", "text": "Improved Reply"},
             "close": {"type": "plain_text", "text": "Close"},
-            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "*✨ Improved Message:*"}}, {"type": "section", "text": {"type": "mrkdwn", "text": improved}}],
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "*✨ Improved Message:*"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": improved}},
+            ],
         }
         client.views_open(trigger_id=trigger_id, view=modal)
         return improved
