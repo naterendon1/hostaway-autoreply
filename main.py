@@ -1,84 +1,62 @@
-# file: main.py
-"""
-Main entrypoint for Hostaway AutoReply Service
-----------------------------------------------
-Handles:
-- Slack interactive actions (/slack routes)
-- Hostaway webhook events (/webhook routes)
-- Health checks for Render deployment
-"""
-
 import os
 import logging
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 
-# Import routers
+# Import modular routers
 from src.slack_interactions import slack_interactions_bp
-from src.message_handler import message_handler_bp
+from src.message_handler import message_handler_bp, unified_webhook
 
-# ---------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("hostaway-autoreply")
 
-# ---------------------------------------------------------------------
-# FastAPI App
-# ---------------------------------------------------------------------
-app = FastAPI(title="Hostaway Autoreply Service")
+# ---------------- FastAPI App ----------------
+app = FastAPI(title="Hostaway Autoreply")
 
-# Register Routers
+# Register routers with prefixes
 app.include_router(slack_interactions_bp, prefix="/slack", tags=["slack"])
 app.include_router(message_handler_bp, prefix="/webhook", tags=["webhook"])
 
+# ---------------- Alias Route ----------------
+@app.post("/unified-webhook")
+async def unified_webhook_alias(request: Request):
+    """
+    Alias for backward compatibility — forwards to /webhook/unified-webhook.
+    Hostaway posts directly here.
+    """
+    return await unified_webhook(request)
 
-# ---------------------------------------------------------------------
-# Root Routes
-# ---------------------------------------------------------------------
+# ---------------- Root Routes ----------------
 @app.get("/")
 async def root():
-    """Basic root endpoint for quick verification."""
     return {"ok": True, "service": "hostaway-autoreply"}
-
 
 @app.get("/ping")
 async def ping():
-    """Lightweight endpoint for uptime pings."""
     return PlainTextResponse("ok")
-
 
 @app.get("/healthz")
 async def healthz():
-    """Health check for Render.com / Kubernetes probes."""
+    """Basic environment variable checks for Render.com health probes"""
     def present(name: str) -> str:
-        val = os.getenv(name)
-        return "SET" if val and len(val) > 2 else "MISSING"
+        v = os.getenv(name)
+        return "SET" if v and len(v) > 2 else "MISSING"
 
     checks = {
         "SLACK_BOT_TOKEN": present("SLACK_BOT_TOKEN"),
         "SLACK_CHANNEL": present("SLACK_CHANNEL"),
         "OPENAI_API_KEY": present("OPENAI_API_KEY"),
-        "HOSTAWAY_ACCESS_TOKEN": present("HOSTAWAY_ACCESS_TOKEN"),
+        "GOOGLE_PLACES_API_KEY": present("GOOGLE_PLACES_API_KEY"),
         "HOSTAWAY_CLIENT_ID": present("HOSTAWAY_CLIENT_ID"),
         "HOSTAWAY_CLIENT_SECRET": present("HOSTAWAY_CLIENT_SECRET"),
     }
-
-    missing = [k for k, v in checks.items() if v == "MISSING"]
-    status_code = 200 if not missing else 500
-
+    status = 200 if not [k for k, v in checks.items() if v == "MISSING"] else 500
     return JSONResponse(
-        {"status": "ok" if status_code == 200 else "missing_env", "checks": checks},
-        status_code=status_code,
+        {"status": "ok" if status == 200 else "missing_env", "checks": checks},
+        status_code=status,
     )
 
-
-# ---------------------------------------------------------------------
-# Local Dev Runner
-# ---------------------------------------------------------------------
+# ---------------- Local Dev Runner ----------------
 if __name__ == "__main__":
     import uvicorn
-
-    port = int(os.getenv("PORT", "5000"))
-    logger.info(f"Starting Hostaway Autoreply Service on port {port}")
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
