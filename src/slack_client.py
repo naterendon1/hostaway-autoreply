@@ -10,7 +10,8 @@ Handles:
 import os
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+import requests
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -19,10 +20,14 @@ from src.ai_engine import (
     rewrite_tone,
 )
 
+# ---------------------------------------------------------------------
 # Environment setup
+# ---------------------------------------------------------------------
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
+HOSTAWAY_API_BASE = os.getenv("HOSTAWAY_API_BASE", "https://api.hostaway.com/v1")
+HOSTAWAY_ACCESS_TOKEN = os.getenv("HOSTAWAY_ACCESS_TOKEN")
 
 client = WebClient(token=SLACK_BOT_TOKEN)
 
@@ -30,6 +35,35 @@ client = WebClient(token=SLACK_BOT_TOKEN)
 # ---------------------------------------------------------------------
 # Slack Block Builders
 # ---------------------------------------------------------------------
+def _build_guest_context(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Creates a compact summary context for guests."""
+    return {
+        "guest_name": meta.get("guest_name"),
+        "property_name": meta.get("property_name"),
+        "check_in": meta.get("check_in"),
+        "check_out": meta.get("check_out"),
+        "guest_count": meta.get("guest_count"),
+    }
+
+
+def _build_header_block(meta: Dict[str, Any], summary: Optional[str] = None, mood: Optional[str] = None) -> Dict[str, Any]:
+    """Generates the Slack header block with guest + listing info."""
+    header_text = (
+        f"*✉️ Message from {meta.get('guest_name','Guest')}*\n"
+        f"🏡 *Property:* {meta.get('property_name') or meta.get('property_address','Unknown')}*\n"
+        f"📅 *Dates:* {meta.get('check_in','N/A')} → {meta.get('check_out','N/A')}\n"
+        f"👥 *Guests:* {meta.get('guest_count','?')} | *Status:* {meta.get('status','N/A')} | "
+        f"*Platform:* {meta.get('platform','Unknown')}*\n"
+    )
+
+    if mood:
+        header_text += f"\n*🧠 Mood:* {mood}"
+    if summary:
+        header_text += f"\n*📝 Summary:* {summary}"
+
+    return {"type": "section", "text": {"type": "mrkdwn", "text": header_text}}
+
+
 def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> list:
     """Constructs Slack message blocks for the guest message + AI suggestion card."""
     guest_message = meta.get("guest_message", "")
@@ -37,19 +71,10 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
     summary = ai_result.get("summary", "Summary unavailable.")
     mood = ai_result.get("mood", "Neutral")
 
-    header_text = (
-        f"*✉️ Message from {meta.get('guest_name','Guest')}*\n"
-        f"🏡 *Property:* {meta.get('property_name') or meta.get('property_address','Unknown')}*\n"
-        f"📅 *Dates:* {meta.get('check_in','N/A')} → {meta.get('check_out','N/A')}\n"
-        f"👥 *Guests:* {meta.get('guest_count','?')} | *Status:* {meta.get('status','N/A')} | "
-        f"*Platform:* {meta.get('platform','Unknown')}*\n\n"
-        f"*🧠 Mood:* {mood}\n"
-        f"*📝 Conversation Summary:* {summary}\n\n"
-        f"> {guest_message}"
-    )
+    header_block = _build_header_block(meta, summary, mood)
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
+        header_block,
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"💡 *Suggested Reply:*\n{ai_suggestion}"}},
         {
@@ -90,28 +115,15 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
             "type": "actions",
             "block_id": "tone_buttons",
             "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Friendly Tone"},
-                    "action_id": "rewrite_friendly",
-                    "value": json.dumps({"reply": ai_suggestion}),
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Formal Tone"},
-                    "action_id": "rewrite_formal",
-                    "value": json.dumps({"reply": ai_suggestion}),
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Professional Tone"},
-                    "action_id": "rewrite_professional",
-                    "value": json.dumps({"reply": ai_suggestion}),
-                },
+                {"type": "button", "text": {"type": "plain_text", "text": "Friendly Tone"},
+                 "action_id": "rewrite_friendly", "value": json.dumps({"reply": ai_suggestion})},
+                {"type": "button", "text": {"type": "plain_text", "text": "Formal Tone"},
+                 "action_id": "rewrite_formal", "value": json.dumps({"reply": ai_suggestion})},
+                {"type": "button", "text": {"type": "plain_text", "text": "Professional Tone"},
+                 "action_id": "rewrite_professional", "value": json.dumps({"reply": ai_suggestion})},
             ],
         },
     ]
-
     return blocks
 
 
@@ -122,16 +134,7 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
     guest_message = payload.get("guest_message", "")
     draft_text = payload.get("draft_text", "")
 
-    header_block = {
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"*Edit / Improve Reply for {guest_name}*\n\n"
-                f"> {guest_message}"
-            ),
-        },
-    }
+    header_block = _build_header_block(meta)
 
     modal = {
         "type": "modal",
@@ -141,6 +144,7 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": [
             header_block,
+            {"type": "divider"},
             {
                 "type": "input",
                 "block_id": "reply_input",
@@ -156,12 +160,10 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "type": "actions",
                 "block_id": "improve_ai_actions",
                 "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✨ Improve with AI"},
-                        "action_id": "improve_with_ai",
-                        "value": json.dumps({"draft_text": draft_text, "meta": meta}),
-                    },
+                    {"type": "button",
+                     "text": {"type": "plain_text", "text": "✨ Improve with AI"},
+                     "action_id": "improve_with_ai",
+                     "value": json.dumps({"draft_text": draft_text, "meta": meta})},
                 ],
             },
         ],
@@ -186,18 +188,9 @@ def handle_tone_rewrite(action_id: str, value: str, trigger_id: str):
     try:
         data = json.loads(value)
         reply = data.get("reply", "")
-        tone = (
-            "friendly" if "friendly" in action_id else
-            "formal" if "formal" in action_id else
-            "professional"
-        )
-
+        tone = "friendly" if "friendly" in action_id else "formal" if "formal" in action_id else "professional"
         new_reply = rewrite_tone(reply, tone)
-        client.chat_postEphemeral(
-            channel=SLACK_CHANNEL,
-            user=os.getenv("SLACK_BOT_USER", ""),
-            text=f"*Rewritten ({tone.capitalize()} tone):*\n{new_reply}",
-        )
+        client.chat_postEphemeral(channel=SLACK_CHANNEL, user=os.getenv("SLACK_BOT_USER", ""), text=f"*Rewritten ({tone.capitalize()} tone):*\n{new_reply}")
         return new_reply
     except Exception as e:
         logging.error(f"[SLACK] Tone rewrite failed: {e}")
@@ -215,16 +208,7 @@ def handle_improve_with_ai(action_value: str, trigger_id: str):
             "type": "modal",
             "title": {"type": "plain_text", "text": "Improved Reply"},
             "close": {"type": "plain_text", "text": "Close"},
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": "*✨ Improved Message:*"},
-                },
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": improved},
-                },
-            ],
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "*✨ Improved Message:*"}}, {"type": "section", "text": {"type": "mrkdwn", "text": improved}}],
         }
         client.views_open(trigger_id=trigger_id, view=modal)
         return improved
@@ -240,3 +224,61 @@ def open_edit_modal(trigger_id: str, payload: Dict[str, Any]):
         client.views_open(trigger_id=trigger_id, view=modal)
     except SlackApiError as e:
         logging.error(f"[SLACK] Failed to open modal: {e}")
+
+
+# ---------------------------------------------------------------------
+# Hostaway API Wrappers
+# ---------------------------------------------------------------------
+def send_hostaway_reply(conversation_id: int, message: str) -> bool:
+    """Sends a reply to Hostaway conversation."""
+    if not (HOSTAWAY_ACCESS_TOKEN and conversation_id and message):
+        logging.warning("[send_hostaway_reply] Missing token, conversation_id, or message.")
+        return False
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
+    headers = {"Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    try:
+        resp = requests.post(url, headers=headers, json={"body": message}, timeout=10)
+        if resp.status_code == 200:
+            logging.info(f"[Hostaway] Reply sent successfully to conversation {conversation_id}")
+            return True
+        logging.error(f"[Hostaway] Failed to send reply (status={resp.status_code}): {resp.text}")
+        return False
+    except Exception as e:
+        logging.error(f"[Hostaway] Error sending reply: {e}")
+        return False
+
+
+def fetch_hostaway_reservation(reservation_id: int):
+    if not reservation_id:
+        return {}
+    url = f"{HOSTAWAY_API_BASE}/reservations/{reservation_id}"
+    headers = {"Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}"}
+    try:
+        return requests.get(url, headers=headers, timeout=10).json()
+    except Exception as e:
+        logging.error(f"[fetch_hostaway_reservation] {e}")
+        return {}
+
+
+def fetch_hostaway_listing(listing_id: int):
+    if not listing_id:
+        return {}
+    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}"
+    headers = {"Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}"}
+    try:
+        return requests.get(url, headers=headers, timeout=10).json()
+    except Exception as e:
+        logging.error(f"[fetch_hostaway_listing] {e}")
+        return {}
+
+
+def fetch_hostaway_conversation(conversation_id: int):
+    if not conversation_id:
+        return {}
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}"
+    headers = {"Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}"}
+    try:
+        return requests.get(url, headers=headers, timeout=10).json()
+    except Exception as e:
+        logging.error(f"[fetch_hostaway_conversation] {e}")
+        return {}
