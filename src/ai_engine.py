@@ -152,5 +152,20 @@ Guest said:
 Rewritten message:
     """
 
+    # ---------------- Tone Rewriting (temporary placeholder) ----------------
+async def rewrite_tone(original_text: str, tone: str) -> str:
+    """
+    Placeholder for tone rewriting logic (e.g., 'friendly', 'formal', etc.).
+    For now, simply prefixes the tone for debugging purposes.
+    """
+    try:
+        tone = tone.lower()
+        if tone not in ["friendly", "formal", "informal", "professional"]:
+            tone = "neutral"
+        return f"[{tone.capitalize()} tone] {original_text}"
+    except Exception:
+        return original_text
+
+
     rewritten = _call_openai(prompt, temperature=0.7)
     return rewritten or base
