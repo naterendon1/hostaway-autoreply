@@ -142,33 +142,37 @@ Rewrite with a {tone} tone:
 
 
 # -------------------- Analyze Conversation Thread --------------------
-def analyze_conversation_thread(messages: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Summarize a guest-host conversation and detect mood."""
-    if not client:
-        return {"summary": "AI unavailable", "sentiment": "neutral", "topics": []}
-
-    conversation_text = "\n".join(
-        [f"{m.get('role', 'guest')}: {m.get('text', '')}" for m in messages if m.get("text")]
-    )
-
-    sys_prompt = (
-        "You are analyzing guest-host chat threads for a vacation rental. "
-        "Summarize what the guest wants in 1–2 sentences, infer their mood "
-        "(e.g. polite, happy, confused, upset), and extract main topics. "
-        "Return JSON with fields: summary, sentiment, topics."
-    )
-
+dasync def analyze_conversation_thread(thread: list):
+    """
+    Analyze a guest conversation thread.
+    Returns a tuple: (mood, summary)
+    """
     try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": conversation_text},
-            ],
-            temperature=0,
+        prompt = (
+            "Summarize the last 10–15 messages of this guest-host thread. "
+            "Capture the tone (e.g., friendly, upset, neutral) and a concise summary of context."
         )
-        return resp.choices[0].message.parsed or {}
+        messages = [{"role": "system", "content": prompt}]
+        for msg in thread[-15:]:
+            messages.append({"role": "user", "content": msg.get("message", "")})
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+        )
+
+        content = response.choices[0].message.content or ""
+        # Extract a simple mood and summary
+        if ":" in content:
+            parts = content.split(":", 1)
+            mood = parts[0].strip()
+            summary = parts[1].strip()
+        else:
+            mood = "neutral"
+            summary = content.strip()
+
+        return mood, summary
+
     except Exception as e:
         logging.error(f"[ai_engine] analyze_conversation_thread failed: {e}")
-        return {"summary": "Unable to analyze.", "sentiment": "neutral", "topics": []}
+        return "neutral", "Unable to summarize thread"
