@@ -184,16 +184,16 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 # Slack Actions
 # ---------------------------------------------------------------------
-def post_message_to_slack(guest_message: str, ai_suggestion: str, meta: Dict[str, Any], mood: Optional[str] = None, summary: Optional[str] = None):
+def post_message_to_slack(meta: Dict[str, Any], ai_result: Dict[str, Any]):
     """Posts the main AI card to Slack."""
     try:
-        ai_result = {
-            "suggested_reply": ai_suggestion,
-            "summary": summary,
-            "mood": mood,
-        }
-        meta["guest_message"] = guest_message
+        guest_message = meta.get("guest_message", "")
+        ai_suggestion = ai_result.get("suggested_reply", "")
+        summary = ai_result.get("summary")
+        mood = ai_result.get("mood")
+
         blocks = build_message_blocks(meta, ai_result)
+
         client.chat_postMessage(
             channel=SLACK_CHANNEL,
             blocks=blocks,
@@ -203,6 +203,7 @@ def post_message_to_slack(guest_message: str, ai_suggestion: str, meta: Dict[str
     except SlackApiError as e:
         logging.error(f"[SLACK] Failed to post message: {e}")
         return False
+
 
 
 def handle_tone_rewrite(action_id: str, value: str, trigger_id: str):
