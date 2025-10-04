@@ -218,3 +218,5 @@ def _extract_input_text(state_values: dict) -> str:
     except Exception:
         pass
     return ""
+
+slack_interactions_bp = router
