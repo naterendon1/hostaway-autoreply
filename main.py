@@ -56,6 +56,23 @@ async def healthz():
         status_code=status,
     )
 
+@app.post("/debug-webhook")
+async def debug_webhook(request: Request):
+    """
+    Temporary endpoint to inspect what Hostaway actually sends.
+    Use it in Render logs or locally to verify JSON structure.
+    """
+    try:
+        payload = await request.json()
+        logging.info("🧩 DEBUG WEBHOOK PAYLOAD:\n%s", payload)
+    except Exception as e:
+        logging.error(f"Failed to parse JSON: {e}")
+        payload = await request.body()
+        logging.info("🧩 RAW BODY:\n%s", payload)
+    
+    # Return it so you can see it in browser or via curl
+    return payload
+
 # ---------------- Local Dev Runner ----------------
 if __name__ == "__main__":
     import uvicorn
