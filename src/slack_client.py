@@ -243,6 +243,67 @@ def open_edit_modal(trigger_id: str, payload: Dict[str, Any]):
     except SlackApiError as e:
         logging.error(f"[SLACK] Failed to open modal: {e}")
 
+# ---------------------------------------------------------------------
+# Modal Builder (exported for interactivity)
+# ---------------------------------------------------------------------
+def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Rebuilds the edit modal when 'Edit / Improve' is clicked in Slack.
+    This version matches what slack_interactions.py expects.
+    """
+    meta = payload.get("meta", {})
+    guest_name = payload.get("guest_name", meta.get("guest_name", "Guest"))
+    guest_message = payload.get("guest_message", meta.get("guest_message", ""))
+    draft_text = payload.get("draft_text", meta.get("draft_text", ""))
+
+    header_text = (
+        f"*✉️ Message from {guest_name}*\n"
+        f"🏡 *Property:* {meta.get('property_name', 'Unknown')}*\n"
+        f"📅 *Dates:* {meta.get('check_in', 'N/A')} → {meta.get('check_out', 'N/A')}\n"
+        f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}*\n"
+    )
+
+    modal = {
+        "type": "modal",
+        "callback_id": "edit_modal_submit",
+        "title": {"type": "plain_text", "text": "Edit AI Reply"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "private_metadata": json.dumps(meta),
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": header_text},
+            },
+            {"type": "divider"},
+            {
+                "type": "input",
+                "block_id": "reply_input",
+                "label": {"type": "plain_text", "text": "Edit your reply"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "reply_text",
+                    "multiline": True,
+                    "initial_value": draft_text or "",
+                },
+            },
+            {
+                "type": "actions",
+                "block_id": "improve_ai_actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✨ Improve with AI"},
+                        "action_id": "improve_with_ai",
+                        "value": json.dumps({"draft_text": draft_text, "meta": meta}),
+                    },
+                ],
+            },
+        ],
+    }
+    return modal
+
+
 
 # ---------------------------------------------------------------------
 # Hostaway API Wrappers
