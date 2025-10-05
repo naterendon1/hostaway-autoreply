@@ -92,7 +92,7 @@ async def unified_webhook(request: Request):
     # ---------------------------------------------------------------------
     # ✅ Post full AI card to Slack (includes photo, mood, and summary)
     # ---------------------------------------------------------------------
-    await post_message_to_slack(
+    post_message_to_slack(
         guest_message=meta["guest_message"],
         ai_suggestion=ai_suggestion,
         meta=meta,
