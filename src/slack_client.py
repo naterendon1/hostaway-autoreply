@@ -1,3 +1,4 @@
+# file: src/slack_client.py
 """
 Slack Client for Hostaway AutoReply
 -----------------------------------
@@ -12,11 +13,11 @@ import json
 import logging
 import requests
 from typing import Any, Dict, Optional
+from datetime import datetime
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from src.ai_engine import improve_message_with_ai, rewrite_tone
-
 
 # ---------------------------------------------------------------------
 # Environment setup
@@ -31,17 +32,66 @@ client = WebClient(token=SLACK_BOT_TOKEN)
 
 
 # ---------------------------------------------------------------------
+# Formatting Helpers
+# ---------------------------------------------------------------------
+def _fmt_date(d: Optional[str]) -> str:
+    """Formats a date like 2025-10-04T00:00:00Z → 2025-10-04."""
+    if not d:
+        return "N/A"
+    try:
+        if "T" in d:
+            return datetime.fromisoformat(d.replace("Z", "+00:00")).date().isoformat()
+        return d[:10]
+    except Exception:
+        return str(d)[:10] if len(str(d)) >= 10 else "N/A"
+
+
+def _fmt_int(x: Any, default: str = "N/A") -> str:
+    try:
+        return str(int(x))
+    except Exception:
+        return default
+
+
+def _pretty_property(meta: Dict[str, Any]) -> str:
+    name = meta.get("property_name")
+    addr = meta.get("property_address")
+    if name and addr:
+        return f"{name} — {addr}"
+    return name or addr or "Property unavailable"
+
+
+def _pretty_platform(meta: Dict[str, Any]) -> str:
+    for k in ("channel_pretty", "platform", "channelName", "source"):
+        v = meta.get(k)
+        if v:
+            return str(v).strip()
+    return "Hostaway"
+
+
+# ---------------------------------------------------------------------
 # Slack Block Builders
 # ---------------------------------------------------------------------
 def _build_header_block(meta: Dict[str, Any], summary: Optional[str] = None, mood: Optional[str] = None) -> Dict[str, Any]:
-    """Generates the Slack header block with guest + listing info."""
+    """Generates the Slack header block with guest, property, and booking info."""
+
+    guest_name = meta.get("guest_name", "Guest")
+    property_line = _pretty_property(meta)
+    check_in = _fmt_date(meta.get("check_in"))
+    check_out = _fmt_date(meta.get("check_out"))
+    guests = _fmt_int(meta.get("guest_count"), "N/A")
+    status = (meta.get("status") or "Unknown").title()
+    platform = _pretty_platform(meta)
+    conv_id = meta.get("conv_id")
+
     header_text = (
-        f"*✉️ Message from {meta.get('guest_name','Guest')}*\n"
-        f"🏡 *Property:* {meta.get('property_name') or meta.get('property_address','Unknown')}*\n"
-        f"📅 *Dates:* {meta.get('check_in','N/A')} → {meta.get('check_out','N/A')}\n"
-        f"👥 *Guests:* {meta.get('guest_count','?')} | *Status:* {meta.get('status','N/A')} | "
-        f"*Platform:* {meta.get('platform','Unknown')}*\n"
+        f"*{platform}* · *{status}*\n"
+        f"*{guest_name}* → *{property_line}*\n"
+        f"*Dates:* {check_in} → {check_out} · *Guests:* {guests}"
     )
+
+    if conv_id:
+        header_text += f"\n*Conversation:* `{conv_id}`"
 
     if mood:
         header_text += f"\n*🧠 Mood:* {mood}"
@@ -49,19 +99,16 @@ def _build_header_block(meta: Dict[str, Any], summary: Optional[str] = None, moo
         header_text += f"\n*📝 Summary:* {summary}"
 
     guest_photo = meta.get("guest_photo")
+    block = {"type": "section", "text": {"type": "mrkdwn", "text": header_text}}
 
     if guest_photo:
-        return {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": header_text},
-            "accessory": {
-                "type": "image",
-                "image_url": guest_photo,
-                "alt_text": f"Photo of {meta.get('guest_name','Guest')}",
-            },
+        block["accessory"] = {
+            "type": "image",
+            "image_url": guest_photo,
+            "alt_text": f"Photo of {guest_name}",
         }
-    else:
-        return {"type": "section", "text": {"type": "mrkdwn", "text": header_text}}
+
+    return block
 
 
 def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> list:
@@ -74,16 +121,17 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
     header_block = _build_header_block(meta, summary, mood)
 
     blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "Guest Message", "emoji": True}},
         header_block,
         {"type": "divider"},
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"💬 *Guest Message:*\n>{guest_message}"},
+            "text": {"type": "mrkdwn", "text": f"> {guest_message}"},
         },
         {"type": "divider"},
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"💡 *Suggested Reply:*\n{ai_suggestion}"},
+            "text": {"type": "mrkdwn", "text": f"*💡 Suggested Reply:*\n{ai_suggestion}"},
         },
         {
             "type": "actions",
@@ -105,7 +153,7 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
                         "guest_message": guest_message,
                         "draft_text": ai_suggestion,
                         "conv_id": meta.get("conv_id"),
-                        "meta": meta
+                        "meta": meta,
                     }),
                 },
                 {
@@ -119,65 +167,8 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
                 },
             ],
         },
-        {
-            "type": "actions",
-            "block_id": "tone_buttons",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "Friendly Tone"},
-                 "action_id": "rewrite_friendly", "value": json.dumps({"reply": ai_suggestion})},
-                {"type": "button", "text": {"type": "plain_text", "text": "Formal Tone"},
-                 "action_id": "rewrite_formal", "value": json.dumps({"reply": ai_suggestion})},
-                {"type": "button", "text": {"type": "plain_text", "text": "Professional Tone"},
-                 "action_id": "rewrite_professional", "value": json.dumps({"reply": ai_suggestion})},
-            ],
-        },
     ]
     return blocks
-
-
-def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Creates the modal that opens when 'Edit / Improve' is clicked."""
-    meta = payload.get("meta", {})
-    guest_name = payload.get("guest_name", "Guest")
-    guest_message = payload.get("guest_message", "")
-    draft_text = payload.get("draft_text", "")
-
-    header_block = _build_header_block(meta)
-
-    modal = {
-        "type": "modal",
-        "callback_id": "edit_modal_submit",
-        "title": {"type": "plain_text", "text": "Edit Reply"},
-        "submit": {"type": "plain_text", "text": "Send"},
-        "close": {"type": "plain_text", "text": "Cancel"},
-        "private_metadata": json.dumps(meta),
-        "blocks": [
-            header_block,
-            {"type": "divider"},
-            {
-                "type": "input",
-                "block_id": "reply_input",
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "reply_text",
-                    "multiline": True,
-                    "initial_value": draft_text,
-                },
-                "label": {"type": "plain_text", "text": "Edit your message"},
-            },
-            {
-                "type": "actions",
-                "block_id": "improve_ai_actions",
-                "elements": [
-                    {"type": "button",
-                     "text": {"type": "plain_text", "text": "✨ Improve with AI"},
-                     "action_id": "improve_with_ai",
-                     "value": json.dumps({"draft_text": draft_text, "meta": meta})},
-                ],
-            },
-        ],
-    }
-    return modal
 
 
 # ---------------------------------------------------------------------
@@ -273,39 +264,3 @@ def send_hostaway_reply(conversation_id: int, message: str) -> bool:
     except Exception as e:
         logging.error(f"[Hostaway] Error sending reply: {e}")
         return False
-
-
-def fetch_hostaway_reservation(reservation_id: int):
-    if not reservation_id:
-        return {}
-    url = f"{HOSTAWAY_API_BASE}/reservations/{reservation_id}"
-    headers = {"Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}"}
-    try:
-        return requests.get(url, headers=headers, timeout=10).json()
-    except Exception as e:
-        logging.error(f"[fetch_hostaway_reservation] {e}")
-        return {}
-
-
-def fetch_hostaway_listing(listing_id: int):
-    if not listing_id:
-        return {}
-    url = f"{HOSTAWAY_API_BASE}/listings/{listing_id}"
-    headers = {"Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}"}
-    try:
-        return requests.get(url, headers=headers, timeout=10).json()
-    except Exception as e:
-        logging.error(f"[fetch_hostaway_listing] {e}")
-        return {}
-
-
-def fetch_hostaway_conversation(conversation_id: int):
-    if not conversation_id:
-        return {}
-    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}"
-    headers = {"Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}"}
-    try:
-        return requests.get(url, headers=headers, timeout=10).json()
-    except Exception as e:
-        logging.error(f"[fetch_hostaway_conversation] {e}")
-        return {}
