@@ -22,7 +22,6 @@ async def unified_webhook(request: Request):
     obj = payload.get("object")
     data = payload.get("data") or {}
 
-    # Only handle new incoming guest messages
     if event != "message.received" or obj != "conversationMessage":
         return {"status": "ignored"}
 
@@ -34,12 +33,25 @@ async def unified_webhook(request: Request):
     reservation_id = data.get("reservationId")
     listing_id = data.get("listingMapId")
 
-    # --- Fetch details from Hostaway ---
+    # --- Always fetch conversation details ---
+    conversation = fetch_hostaway_conversation(conversation_id) or {}
+    convo_data = (
+        conversation.get("result")
+        or conversation.get("data")
+        or conversation
+        or {}
+    )
+
+    # If reservation or listing missing, get them from conversation
+    if not reservation_id:
+        reservation_id = convo_data.get("reservationId")
+    if not listing_id:
+        listing_id = convo_data.get("listingId")
+
+    # --- Fetch reservation + listing data ---
     reservation = fetch_hostaway_reservation(reservation_id) or {}
     listing = fetch_hostaway_listing(listing_id) or {}
-    conversation = fetch_hostaway_conversation(conversation_id) or {}
 
-    # Hostaway responses sometimes use 'result' or 'data' — handle both
     res_data = (
         reservation.get("result")
         or reservation.get("data")
@@ -52,12 +64,6 @@ async def unified_webhook(request: Request):
         or listing
         or {}
     )
-    convo_data = (
-        conversation.get("result")
-        or conversation.get("data")
-        or conversation
-        or {}
-    )
 
     messages = convo_data.get("conversationMessages", []) or []
     thread = [
@@ -66,7 +72,7 @@ async def unified_webhook(request: Request):
         if m.get("body")
     ]
 
-    # --- AI analysis ---
+    # --- AI Analysis ---
     mood, summary = await analyze_conversation_thread(thread)
 
     ai_context = {
@@ -79,7 +85,7 @@ async def unified_webhook(request: Request):
 
     ai_suggestion = generate_reply(guest_message, ai_context)
 
-    # --- Metadata for Slack ---
+    # --- Build metadata for Slack header ---
     guest_photo = res_data.get("guest", {}).get("pictureLarge") or res_data.get("guestPicture")
     meta = {
         "conv_id": conversation_id,
@@ -98,6 +104,6 @@ async def unified_webhook(request: Request):
         "summary": summary,
     }
 
-    # --- Post to Slack ---
+    # --- Send to Slack ---
     post_message_to_slack(guest_message, ai_suggestion, meta, mood, summary)
     return {"status": "ok"}
