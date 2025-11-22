@@ -13,7 +13,7 @@ from src.api_client import (
     fetch_hostaway_listing,
     fetch_hostaway_conversation,
 )
-from src.ai_engine import generate_reply, analyze_conversation_thread
+from src.ai_assistant import generate_reply, analyze_conversation_thread
 from src.db import already_processed, mark_processed, log_ai_exchange
 from src.places import should_fetch_local_recs, build_local_recs
 
@@ -75,16 +75,16 @@ async def unified_webhook(request: Request):
     lat, lng = listing_data.get("lat"), listing_data.get("lng")
 
     # -------------------------------------------------------------------
-    # AI: Analyze mood + summary
+    # AI: Analyze mood + summary using Assistants API
     # -------------------------------------------------------------------
     try:
-        mood, summary = await analyze_conversation_thread(messages)
+        mood, summary = analyze_conversation_thread(str(conv_id), messages)
     except Exception as e:
         logging.error(f"[AI] analyze_conversation_thread failed: {e}")
         mood, summary = "Neutral", "Summary unavailable."
 
     # -------------------------------------------------------------------
-    # AI: Generate reply
+    # AI: Generate reply using Assistants API (maintains conversation memory)
     # -------------------------------------------------------------------
     context = {
         "guest_name": guest_name,
@@ -96,7 +96,7 @@ async def unified_webhook(request: Request):
         "status": status,
         "platform": platform,
     }
-    ai_reply = generate_reply(guest_message, context)
+    ai_reply = generate_reply(str(conv_id), guest_message, context)
 
     # Log exchange
     log_ai_exchange(
