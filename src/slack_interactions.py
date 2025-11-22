@@ -154,7 +154,7 @@ async def _send_reply(payload: dict, action_id: str):
     try:
         action = payload.get("actions", [{}])[0]
         data = json.loads(action.get("value", "{}"))
-        conv_id = data.get("conv_id")
+        conv_id = data.get("conv_id") or data.get("conversation_id")
         reply_text = data.get("reply_text", "") or data.get("reply", "")
 
         if not conv_id or not reply_text:
