@@ -96,7 +96,7 @@ async def unified_webhook(request: Request):
         "status": status,
         "platform": platform,
     }
-    ai_reply = generate_reply(str(conv_id), guest_message, context)
+    ai_reply = generate_smart_reply(str(conv_id), guest_message, enhanced_context)
 
     # Log exchange
     log_ai_exchange(
