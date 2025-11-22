@@ -13,7 +13,8 @@ from src.api_client import (
     fetch_hostaway_listing,
     fetch_hostaway_conversation,
 )
-from src.ai_assistant import generate_reply, analyze_conversation_thread
+from src.ai_assistant_enhanced import generate_smart_reply
+from src.ai_assistant import analyze_conversation_thread
 from src.db import already_processed, mark_processed, log_ai_exchange
 from src.places import should_fetch_local_recs, build_local_recs
 
@@ -84,18 +85,17 @@ async def unified_webhook(request: Request):
         mood, summary = "Neutral", "Summary unavailable."
 
     # -------------------------------------------------------------------
-    # AI: Generate reply using Assistants API (maintains conversation memory)
+    # AI: Generate reply using Enhanced Assistants API with Hostaway data
     # -------------------------------------------------------------------
-    context = {
+    # Enhanced context with IDs so AI can fetch real Hostaway data
+    enhanced_context = {
+        "conversation_id": conv_id,
+        "reservation_id": reservation_id,
+        "listing_id": listing_id,
         "guest_name": guest_name,
-        "check_in": check_in,
-        "check_out": check_out,
-        "guest_count": guest_count,
-        "property_name": property_name,
-        "property_address": property_address,
-        "status": status,
-        "platform": platform,
     }
+    
+    # Use the smart reply that fetches real data
     ai_reply = generate_smart_reply(str(conv_id), guest_message, enhanced_context)
 
     # Log exchange
