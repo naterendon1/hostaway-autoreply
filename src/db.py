@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 # In-memory storage for processed events (consider using Redis or SQLite for production)
 _processed_events = set()
 _ai_exchanges = []
+_thread_mappings = {}  # Maps Hostaway conversation_id -> OpenAI thread_id
 
 # Configuration
 MAX_PROCESSED_EVENTS = 10000  # Prevent memory overflow
@@ -106,6 +107,43 @@ def clear_old_processed_events() -> None:
     """
     _processed_events.clear()
     logging.info("[db] Cleared all processed events")
+
+
+# -------------------- Thread Management for Assistants API --------------------
+
+def get_thread_id(conversation_id: str) -> Optional[str]:
+    """
+    Get the OpenAI thread ID for a Hostaway conversation.
+
+    Args:
+        conversation_id: Hostaway conversation ID
+
+    Returns:
+        OpenAI thread ID if exists, None otherwise
+    """
+    return _thread_mappings.get(str(conversation_id))
+
+
+def save_thread_id(conversation_id: str, thread_id: str) -> None:
+    """
+    Store the mapping between Hostaway conversation and OpenAI thread.
+
+    Args:
+        conversation_id: Hostaway conversation ID
+        thread_id: OpenAI thread ID
+    """
+    _thread_mappings[str(conversation_id)] = thread_id
+    logging.info(f"[db] Saved thread mapping: conversation {conversation_id} -> thread {thread_id}")
+
+
+def get_all_threads() -> dict:
+    """
+    Get all conversation -> thread mappings.
+
+    Returns:
+        Dictionary of conversation_id -> thread_id mappings
+    """
+    return _thread_mappings.copy()
 
 
 # TODO: Implement persistent storage with SQLite or PostgreSQL
