@@ -38,7 +38,7 @@ async def handle_slack_interaction(request: Request):
     try:
         if action_id == "open_edit_modal":
             return await _open_edit_modal(payload)
-        elif action_id in ("send", "send_guest_portal"):
+        elif action_id in ("send", "send_reply", "send_guest_portal"):
             return await _send_reply(payload, action_id)
         elif "rewrite_" in action_id or action_id in ("adjust_tone_friendlier", "adjust_tone_formal"):
             return await _adjust_tone(payload, action_id)
