@@ -6,7 +6,7 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 # Import modular routers
 from src.slack_interactions import slack_interactions_bp
 from src.message_handler import message_handler_bp, unified_webhook
-from src.ai_assistant import initialize_assistant
+from src.ai_assistant_enhanced import initialize_enhanced_assistant
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +23,7 @@ app.include_router(message_handler_bp, prefix="/webhook", tags=["webhook"])
 async def startup_event():
     """Initialize the OpenAI Assistant on startup"""
     logging.info("🚀 Starting Hostaway AutoReply...")
-    assistant_id = initialize_assistant()
+    assistant_id = initialize_enhanced_assistant()
     if assistant_id:
         logging.info(f"✅ OpenAI Assistant initialized: {assistant_id}")
     else:
