@@ -63,9 +63,10 @@ async def unified_webhook(request: Request):
     messages = conversation.get("result", {}).get("conversationMessages", [])
 
     # -------------------------------------------------------------------
-    # Extract details
+    # Extract details (INCLUDING GUEST PHOTO 📸)
     # -------------------------------------------------------------------
     guest_name = res_data.get("guestFirstName") or res_data.get("guestName") or "Guest"
+    guest_photo = res_data.get("guestPicture")  # 🆕 Extract guest photo URL
     check_in = res_data.get("arrivalDate")
     check_out = res_data.get("departureDate")
     guest_count = res_data.get("numberOfGuests") or res_data.get("adults") or "?"
@@ -117,7 +118,7 @@ async def unified_webhook(request: Request):
             logging.warning(f"[places] Failed to build local recs: {e}")
 
     # -------------------------------------------------------------------
-    # Format Slack Message (emoji-rich)
+    # Format Slack Message (emoji-rich) WITH GUEST PHOTO 📸
     # -------------------------------------------------------------------
     checkin_fmt = (
         datetime.strptime(check_in, "%Y-%m-%d").strftime("%b %d")
@@ -154,8 +155,29 @@ async def unified_webhook(request: Request):
         recs_text = "\n".join(recs_lines)
         suggestion_text += f"\n\n📍 *Nearby Recommendations:*\n{recs_text}"
 
-    blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
+    # 🆕 BUILD BLOCKS WITH GUEST PHOTO
+    blocks = []
+    
+    # Add header section with guest photo as accessory (if available)
+    if guest_photo:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text},
+            "accessory": {
+                "type": "image",
+                "image_url": guest_photo,
+                "alt_text": f"Photo of {guest_name}"
+            }
+        })
+    else:
+        # Fallback if no photo available
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text}
+        })
+    
+    # Add divider and suggestion
+    blocks.extend([
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": suggestion_text}},
         {
@@ -195,7 +217,7 @@ async def unified_webhook(request: Request):
                 },
             ],
         },
-    ]
+    ])
 
     # -------------------------------------------------------------------
     # Post to Slack
@@ -203,7 +225,7 @@ async def unified_webhook(request: Request):
     if client and SLACK_CHANNEL:
         try:
             client.chat_postMessage(channel=SLACK_CHANNEL, blocks=blocks, text="New guest message")
-            logging.info(f"✅ Posted conversation {conv_id} to Slack")
+            logging.info(f"✅ Posted conversation {conv_id} to Slack (with guest photo: {bool(guest_photo)})")
         except Exception as e:
             logging.error(f"[Slack] Failed to post: {e}")
     else:
