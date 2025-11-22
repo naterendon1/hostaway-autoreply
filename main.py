@@ -21,8 +21,8 @@ app.include_router(message_handler_bp, prefix="/webhook", tags=["webhook"])
 # ---------------- Startup Event ----------------
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the OpenAI Assistant on startup"""
-    logging.info("🚀 Starting Hostaway AutoReply...")
+    """Initialize the Enhanced OpenAI Assistant on startup"""
+    logging.info("🚀 Starting Hostaway AutoReply (Enhanced)...")
     assistant_id = initialize_enhanced_assistant()
     if assistant_id:
         logging.info(f"✅ OpenAI Assistant initialized: {assistant_id}")
