@@ -13,12 +13,7 @@ from src.api_client import (
     fetch_hostaway_listing,
     fetch_hostaway_conversation,
 )
-from src.ai_assistant_enhanced import (
-    generate_smart_reply, 
-    initialize_enhanced_assistant
-)
-# Keep analyze_conversation_thread from old module if still needed
-from src.ai_assistant import analyze_conversation_thread
+from src.ai_assistant import generate_reply, analyze_conversation_thread
 from src.db import already_processed, mark_processed, log_ai_exchange
 from src.places import should_fetch_local_recs, build_local_recs
 
@@ -101,13 +96,7 @@ async def unified_webhook(request: Request):
         "status": status,
         "platform": platform,
     }
-    enhanced_context = {
-        "conversation_id": conv_id,
-        "reservation_id": reservation_id,
-        "listing_id": listing_id,
-        "guest_name": guest_name,
-    }
-    ai_reply = generate_smart_reply(str(conv_id), guest_message, enhanced_context)
+    ai_reply = generate_reply(str(conv_id), guest_message, context)
 
     # Log exchange
     log_ai_exchange(
@@ -153,7 +142,16 @@ async def unified_webhook(request: Request):
 
     # Add local recs (optional)
     if nearby_places:
-        recs_text = "\n".join([f"• {p['name']} ({p['type']})" for p in nearby_places[:3]])
+        recs_lines = []
+        for p in nearby_places[:3]:
+            line = f"• {p['name']} ({p['type']})"
+            # Add travel time if available
+            if p.get('travel_time'):
+                line += f" - {p['travel_time']} away"
+            elif p.get('distance'):
+                line += f" - {p['distance']} away"
+            recs_lines.append(line)
+        recs_text = "\n".join(recs_lines)
         suggestion_text += f"\n\n📍 *Nearby Recommendations:*\n{recs_text}"
 
     blocks = [
