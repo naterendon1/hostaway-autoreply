@@ -14,6 +14,7 @@ import requests
 from typing import List, Dict, Optional
 
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+GOOGLE_DISTANCE_MATRIX_API_KEY = os.getenv("GOOGLE_DISTANCE_MATRIX_API_KEY")
 GOOGLE_PLACES_BASE_URL = "https://maps.googleapis.com/maps/api/place"
 
 
@@ -93,12 +94,26 @@ def build_local_recs(
         # Extract and format results
         results = []
         for place in data.get("results", [])[:5]:  # Limit to top 5
-            results.append({
+            place_data = {
                 "name": place.get("name", "Unknown"),
                 "type": place.get("types", ["place"])[0].replace("_", " ").title(),
                 "rating": place.get("rating", "N/A"),
                 "vicinity": place.get("vicinity", "")
-            })
+            }
+            
+            # Add travel time if Distance Matrix API key is available
+            if GOOGLE_DISTANCE_MATRIX_API_KEY:
+                place_location = place.get("geometry", {}).get("location", {})
+                place_lat = place_location.get("lat")
+                place_lng = place_location.get("lng")
+                
+                if place_lat and place_lng:
+                    distance_info = get_distance_matrix(lat, lng, place_lat, place_lng)
+                    if distance_info:
+                        place_data["travel_time"] = distance_info.get("duration", "")
+                        place_data["distance"] = distance_info.get("distance", "")
+            
+            results.append(place_data)
 
         logging.info(f"[places] Found {len(results)} nearby places of type '{place_type}'")
         return results
@@ -157,7 +172,10 @@ def get_distance_matrix(
     Returns:
         Dictionary with distance and duration, or None if error
     """
-    if not GOOGLE_PLACES_API_KEY:
+    # Use Distance Matrix key if available, otherwise fall back to Places key
+    api_key = GOOGLE_DISTANCE_MATRIX_API_KEY or GOOGLE_PLACES_API_KEY
+    
+    if not api_key:
         return None
 
     try:
@@ -165,7 +183,7 @@ def get_distance_matrix(
         params = {
             "origins": f"{origin_lat},{origin_lng}",
             "destinations": f"{dest_lat},{dest_lng}",
-            "key": GOOGLE_PLACES_API_KEY,
+            "key": api_key,
         }
 
         response = requests.get(url, params=params, timeout=10)
