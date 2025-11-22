@@ -13,7 +13,12 @@ from src.api_client import (
     fetch_hostaway_listing,
     fetch_hostaway_conversation,
 )
-from src.ai_assistant import generate_reply, analyze_conversation_thread
+from src.ai_assistant_enhanced import (
+    generate_smart_reply, 
+    initialize_enhanced_assistant
+)
+# Keep analyze_conversation_thread from old module if still needed
+from src.ai_assistant import analyze_conversation_thread
 from src.db import already_processed, mark_processed, log_ai_exchange
 from src.places import should_fetch_local_recs, build_local_recs
 
@@ -96,7 +101,13 @@ async def unified_webhook(request: Request):
         "status": status,
         "platform": platform,
     }
-    ai_reply = generate_reply(str(conv_id), guest_message, context)
+    enhanced_context = {
+        "conversation_id": conv_id,
+        "reservation_id": reservation_id,
+        "listing_id": listing_id,
+        "guest_name": guest_name,
+    }
+    ai_reply = generate_smart_reply(str(conv_id), guest_message, enhanced_context)
 
     # Log exchange
     log_ai_exchange(
