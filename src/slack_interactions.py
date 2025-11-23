@@ -1,4 +1,4 @@
-# file: src/slack_interactions_enhanced.py
+# file: src/slack_interactions.py
 """
 Enhanced Slack interactions with:
 - Async processing for "Improve with AI"
@@ -22,9 +22,6 @@ from fastapi.responses import JSONResponse
 
 from src.slack_client import (
     client as slack_client,
-    build_edit_modal,
-    handle_tone_rewrite,
-    handle_improve_with_ai,
     open_edit_modal,
     send_hostaway_reply,
 )
@@ -151,8 +148,6 @@ async def handle_slack_interaction(
             return await _open_edit_modal(payload)
         elif action_id in ("send", "send_reply", "send_guest_portal"):
             return await _send_reply(payload, action_id)
-        elif "rewrite_" in action_id or action_id in ("adjust_tone_friendlier", "adjust_tone_formal"):
-            return await _adjust_tone(payload, action_id)
         elif action_id == "improve_with_ai":
             return await _improve_with_ai(payload)
         elif action_id == "undo_ai":
@@ -446,32 +441,6 @@ async def _undo_ai(payload: dict):
     except Exception as e:
         logging.error(f"[Slack] Undo failed: {e}", exc_info=True)
         return JSONResponse({"error": "undo_failed"}, status_code=500)
-
-
-# ---------------- Adjust Tone ----------------
-async def _adjust_tone(payload: dict, action_id: str):
-    """Adjusts AI tone to more formal or friendlier."""
-    try:
-        action = payload.get("actions", [{}])[0]
-        data = json.loads(action.get("value", "{}"))
-        tone = (
-            "friendly" if "friendly" in action_id else
-            "formal" if "formal" in action_id else
-            "professional"
-        )
-
-        reply_text = data.get("reply_text", "") or data.get("reply", "")
-        guest_message = data.get("guest_message", "")
-
-        improved_text = generate_reply_with_tone(guest_message, tone, base_reply=reply_text)
-        slack_client.chat_postMessage(
-            channel=os.getenv("SLACK_CHANNEL"),
-            text=f"✨ *Tone adjusted to {tone.title()}:*\n{improved_text}",
-        )
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        logging.error(f"[Slack] Tone adjustment failed: {e}")
-        return JSONResponse({"error": "tone_failed"}, status_code=500)
 
 
 # ---------------- Send Hostaway Reply ----------------
