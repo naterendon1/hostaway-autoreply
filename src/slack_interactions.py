@@ -21,7 +21,6 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 
 @router.post("/interactivity")
 async def handle_slack_interaction(request: Request):
-    """Slack block actions + modal submissions."""
     try:
         form_data = await request.form()
         payload = json.loads(form_data.get("payload", "{}"))
@@ -29,7 +28,6 @@ async def handle_slack_interaction(request: Request):
         logging.error(f"[Slack] Invalid payload: {e}")
         return JSONResponse({"error": "invalid_payload"}, status_code=400)
 
-    # Handle modal submit first
     if payload.get("type") == "view_submission":
         return await _handle_modal_submit(payload)
 
@@ -54,7 +52,6 @@ async def handle_slack_interaction(request: Request):
 
 
 def _get_action_id(payload: dict) -> str:
-    """Return action_id for block_actions; empty otherwise."""
     try:
         actions = payload.get("actions", [])
         if actions and isinstance(actions, list):
@@ -65,15 +62,12 @@ def _get_action_id(payload: dict) -> str:
 
 
 async def _open_edit_modal(payload: dict):
-    """Open the edit modal from a message button."""
     trigger_id = payload.get("trigger_id")
     action = (payload.get("actions") or [{}])[0]
-    data = {}
     try:
         data = json.loads(action.get("value", "{}") or "{}")
     except Exception:
-        pass
-
+        data = {}
     try:
         open_edit_modal(trigger_id, data)
         return JSONResponse({"ok": True})
@@ -83,18 +77,15 @@ async def _open_edit_modal(payload: dict):
 
 
 async def _improve_with_ai(payload: dict):
-    """Rewrite current modal text to be clear, friendly, easy to understand."""
     try:
-        # read user text from modal
         values = payload.get("view", {}).get("state", {}).get("values", {})
         current_text = _extract_input_text(values)
 
         action = (payload.get("actions") or [{}])[0]
-        data = {}
         try:
             data = json.loads(action.get("value", "{}") or "{}")
         except Exception:
-            pass
+            data = {}
 
         improved_text = improve_message_with_ai(current_text, data) or \
             "I refined your message slightly for clarity and friendliness!"
@@ -104,34 +95,26 @@ async def _improve_with_ai(payload: dict):
         except Exception:
             meta = {}
 
-        # Rebuild a CLEAN modal without Slack read-only fields
+        # Build a CLEAN modal and return inline update (no Web API call)
         clean_modal = build_edit_modal({
             "meta": meta,
             "guest_name": meta.get("guest_name", "Guest"),
             "guest_message": meta.get("guest_message", ""),
             "draft_text": improved_text,
         })
-
-        # IMPORTANT: omit 'hash' and do not spread the incoming 'view'
-        slack_client.views_update(
-            view_id=payload["view"]["id"],
-            view=clean_modal,
-        )
-        return JSONResponse({"ok": True})
+        return JSONResponse({"response_action": "update", "view": clean_modal})
     except Exception as e:
         logging.error(f"[Slack] Improve with AI failed: {e}")
         return JSONResponse({"error": "improve_failed"}, status_code=500)
 
 
 async def _adjust_tone(payload: dict, action_id: str):
-    """Adjust tone from a message button."""
     try:
         action = (payload.get("actions") or [{}])[0]
-        data = {}
         try:
             data = json.loads(action.get("value", "{}") or "{}")
         except Exception:
-            pass
+            data = {}
 
         tone = (
             "friendly" if "friendly" in action_id else
@@ -154,14 +137,12 @@ async def _adjust_tone(payload: dict, action_id: str):
 
 
 async def _send_reply(payload: dict, action_id: str):
-    """Send reply (from a message-level button, not modal submit)."""
     try:
         action = (payload.get("actions") or [{}])[0]
-        data = {}
         try:
             data = json.loads(action.get("value", "{}") or "{}")
         except Exception:
-            pass
+            data = {}
 
         conv_id = data.get("conv_id") or data.get("conversation_id")
         reply_text = data.get("reply_text") or data.get("reply") or ""
@@ -180,7 +161,6 @@ async def _send_reply(payload: dict, action_id: str):
 
 
 async def _handle_modal_submit(payload: dict):
-    """Modal submit (user pressed 'Send' in modal)."""
     try:
         values = payload.get("view", {}).get("state", {}).get("values", {})
         reply_text = _extract_input_text(values)
@@ -201,7 +181,6 @@ async def _handle_modal_submit(payload: dict):
 
 
 def _extract_input_text(state_values: dict) -> str:
-    """Return the first 'value' found in input elements."""
     try:
         for block in state_values.values():
             for val in block.values():
