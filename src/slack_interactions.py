@@ -88,38 +88,64 @@ async def _open_edit_modal(payload: dict):
 
 # ---------------- Improve with AI ----------------
 async def _improve_with_ai(payload: dict):
-    """Handles 'Improve with AI' button — rewrites text in modal."""
+    """Rewrite current modal text to be clear, friendly, and easy to understand."""
     try:
-        action = payload.get("actions", [{}])[0]
-        data = json.loads(action.get("value", "{}"))
+        # Extract the current text from the modal state
         user_input = payload.get("view", {}).get("state", {}).get("values", {})
         current_text = _extract_input_text(user_input)
 
-        improved_text = improve_message_with_ai(current_text, data)
-        if not improved_text:
-            improved_text = "I refined your message slightly for clarity and friendliness!"
+        # Call your AI to improve wording
+        action = payload.get("actions", [{}])[0]
+        data = json.loads(action.get("value", "{}")) if action else {}
+        improved_text = improve_message_with_ai(current_text, data) or (
+            "I refined your message slightly for clarity and friendliness!"
+        )
 
+        # Build a CLEAN modal — do NOT reuse Slack's incoming view as-is
+        try:
+            meta = json.loads(payload["view"].get("private_metadata", "{}"))
+        except Exception:
+            meta = {}
+
+        clean_modal = build_edit_modal({
+            "meta": meta,
+            "guest_name": meta.get("guest_name", "Guest"),
+            "guest_message": meta.get("guest_message", ""),
+            "draft_text": improved_text,
+        })
+
+        # Only send allowed fields with views.update
         slack_client.views_update(
             view_id=payload["view"]["id"],
-            hash=payload["view"]["hash"],
-            view={
-                **payload["view"],
-                "blocks": [
-                    b if b.get("block_id") != "reply_input" else {
-                        **b,
-                        "element": {
-                            **b["element"],
-                            "initial_value": improved_text
-                        }
-                    }
-                    for b in payload["view"]["blocks"]
-                ]
-            },
+            hash=payload["view"].get("hash"),
+            view=clean_modal,
         )
         return JSONResponse({"ok": True})
     except Exception as e:
         logging.error(f"[Slack] Improve with AI failed: {e}")
         return JSONResponse({"error": "improve_failed"}, status_code=500)
+
+async def _handle_modal_submit(payload: dict):
+    """User pressed 'Send' in the modal — post to Hostaway and close."""
+    try:
+        view_state = payload.get("view", {}).get("state", {}).get("values", {})
+        reply_text = _extract_input_text(view_state)
+        meta = json.loads(payload["view"].get("private_metadata", "{}"))
+        conv_id = meta.get("conv_id")
+
+        if conv_id and reply_text:
+            ok = send_hostaway_reply(conv_id, reply_text)
+            if not ok:
+                logging.error("[Slack] Hostaway send failed; keeping modal open.")
+                return JSONResponse({
+                    "response_action": "errors",
+                    "errors": {"reply_input": "Failed to send to Hostaway. Try again."}
+                })
+        # Clear modal on success
+        return JSONResponse({"response_action": "clear"})
+    except Exception as e:
+        logging.error(f"[Slack] Modal submission failed: {e}")
+        return JSONResponse({"error": "modal_submit_failed"}, status_code=500)
 
 
 # ---------------- Adjust Tone ----------------
