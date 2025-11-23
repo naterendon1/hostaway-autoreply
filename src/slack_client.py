@@ -198,8 +198,11 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
         f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}"
     )
 
+    # Get conv_id from either top-level payload or nested meta
+    conv_id = payload.get("conv_id") or meta.get("conv_id") or payload.get("conversation_id") or meta.get("conversation_id")
+
     pm = {
-        "conv_id": meta.get("conv_id"),
+        "conv_id": conv_id,
         "guest_name": guest_name,
         "guest_message": guest_message[:900],
         "property_name": meta.get("property_name"),
@@ -232,6 +235,21 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "multiline": True,
                     "initial_value": (draft_text or "")[:2800],
                 },
+            },
+            {
+                "type": "input",
+                "block_id": "coach_prompt_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Coach the AI (optional)"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "coach_prompt",
+                    "multiline": True,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Tell AI how to adjust (e.g., 'be more formal', 'mention parking')"
+                    }
+                }
             },
             {
                 "type": "actions",
