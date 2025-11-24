@@ -1,6 +1,7 @@
 # file: src/slack_interactions.py
 """
 Enhanced Slack interactions with:
+- Proper modal handling (edit, improve with AI, send)
 - Async processing for "Improve with AI"
 - Slack signature verification
 - Retry detection
@@ -17,21 +18,26 @@ import time
 import uuid
 from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, Request, Header, HTTPException
+from fastapi import APIRouter, Request, Header, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
+from openai import OpenAI
 
 from src.slack_client import (
     client as slack_client,
-    open_edit_modal,
     send_hostaway_reply,
 )
-from src.ai_engine import generate_reply_with_tone, improve_message_with_ai
+from src.ai_engine import improve_message_with_ai
 
 router = APIRouter()
 slack_interactions_bp = router
 
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 MAX_PRIVATE_BYTES = 2800  # Slack limit is 3000, leave buffer
+
+# OpenAI client for AI improvements
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 # -------------------- Security: Slack Signature Verify --------------------
@@ -108,10 +114,282 @@ def pack_private_meta(meta: Dict[str, Any]) -> str:
     return s
 
 
-# -------------------- Slack Event Router ----------------
+# -------------------- Helper: Extract Input Text --------------------
+def _extract_input_text(state_values: dict, block_ids: list = None) -> str:
+    """
+    Extracts text input from modal state safely.
+    Tries multiple block_ids in order: reply_input_ai, reply_input, or any input block.
+    """
+    if block_ids is None:
+        block_ids = ["reply_input_ai", "reply_input"]
+    
+    # Try specified block IDs first
+    for block_id in block_ids:
+        block = state_values.get(block_id, {})
+        for action_id, val in block.items():
+            if isinstance(val, dict) and "value" in val:
+                text = val.get("value", "").strip()
+                if text:
+                    return text
+    
+    # Fallback: search all blocks for any plain_text_input with a value
+    for block in state_values.values():
+        for val in block.values():
+            if isinstance(val, dict) and val.get("type") == "plain_text_input":
+                text = val.get("value", "").strip()
+                if text:
+                    return text
+    
+    return ""
+
+
+# -------------------- Modal Building Blocks --------------------
+def get_modal_blocks(
+    guest_name: str,
+    guest_msg: str,
+    draft_text: str = "",
+    checkbox_checked: bool = False,
+    coach_prompt_initial: Optional[str] = None,
+    input_block_id: str = "reply_input_ai",
+    input_action_id: str = "reply_ai",
+) -> list:
+    """Build the blocks for the edit modal."""
+    
+    reply_block = {
+        "type": "input",
+        "block_id": input_block_id,
+        "label": {"type": "plain_text", "text": "Edit your reply:", "emoji": True},
+        "element": {
+            "type": "plain_text_input",
+            "action_id": input_action_id,
+            "multiline": True,
+        },
+    }
+    if draft_text:
+        reply_block["element"]["initial_value"] = draft_text
+
+    coach_block = {
+        "type": "input",
+        "block_id": "coach_prompt_block",
+        "optional": True,
+        "label": {"type": "plain_text", "text": "Coach the AI (optional)", "emoji": True},
+        "element": {
+            "type": "plain_text_input",
+            "action_id": "coach_prompt",
+            "multiline": True,
+            "placeholder": {
+                "type": "plain_text",
+                "text": "Tell the AI how to adjust (e.g., 'make it shorter', 'add parking info')",
+            },
+        },
+    }
+    if coach_prompt_initial:
+        coach_block["element"]["initial_value"] = coach_prompt_initial[:3000]
+
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Guest:* {guest_name}\n*Message:* {guest_msg[:500]}"
+            },
+        },
+        {"type": "divider"},
+        reply_block,
+        coach_block,
+        {
+            "type": "actions",
+            "block_id": "improve_ai_block",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "improve_with_ai",
+                    "text": {"type": "plain_text", "text": "✨ Improve with AI", "emoji": True},
+                    "style": "primary",
+                }
+            ],
+        },
+    ]
+
+
+def add_undo_button(blocks: list, has_previous_draft: bool) -> list:
+    """Add undo button if there's a previous draft."""
+    if has_previous_draft:
+        blocks.append({
+            "type": "actions",
+            "block_id": "undo_block",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "↩️ Undo AI", "emoji": True},
+                    "action_id": "undo_ai",
+                }
+            ],
+        })
+    return blocks
+
+
+# -------------------- Background: Improve with AI --------------------
+def _background_improve_and_update(
+    view_id: str,
+    meta: dict,
+    edited_text: str,
+    coach_prompt_text: Optional[str],
+    guest_name: str,
+    guest_msg: str,
+):
+    """Background task to improve text with AI and update modal view."""
+    logging.info(f"[AI] Starting improvement for view {view_id}")
+    
+    improved = edited_text
+    error_message = None
+
+    if not openai_client:
+        error_message = "OpenAI not configured"
+        logging.warning("[AI] OpenAI client not available")
+    else:
+        try:
+            # Build AI prompt
+            system_prompt = (
+                "You improve guest message replies for a vacation rental host. "
+                "Keep the meaning and intent, but improve tone and brevity. "
+                "No greetings, no sign-offs, no emojis. "
+                "Style: concise, casual, helpful."
+            )
+            
+            user_prompt = f"""Guest message:
+{guest_msg}
+
+Current draft reply:
+{edited_text}
+
+Coach instructions: {coach_prompt_text or '(none)'}
+
+Rewrite the reply to be better while following any coach instructions. Return ONLY the improved reply."""
+
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=500,
+                temperature=0.7,
+            )
+            
+            improved = response.choices[0].message.content.strip()
+            logging.info(f"[AI] Successfully improved text (length: {len(improved)})")
+            
+        except Exception as e:
+            logging.error(f"[AI] Error improving with AI: {e}")
+            error_message = f"AI improvement failed: {str(e)}"
+
+    # Update metadata with previous draft for undo functionality
+    new_meta = {
+        **meta,
+        "previous_draft": edited_text,
+        "coach_prompt": coach_prompt_text or "",
+    }
+
+    # Build updated modal blocks
+    blocks = get_modal_blocks(
+        guest_name=guest_name,
+        guest_msg=guest_msg,
+        draft_text=improved,
+        checkbox_checked=new_meta.get("checkbox_checked", False),
+        coach_prompt_initial=coach_prompt_text or "",
+    )
+    
+    # Add undo button since we now have a previous draft
+    blocks = add_undo_button(blocks, has_previous_draft=True)
+    
+    # Add error message if present
+    if error_message:
+        blocks.insert(0, {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"⚠️ *{error_message}*"}
+        })
+
+    updated_view = {
+        "type": "modal",
+        "callback_id": "edit_modal_submit",
+        "title": {"type": "plain_text", "text": "AI Improved Reply", "emoji": True},
+        "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+        "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+        "private_metadata": pack_private_meta(new_meta),
+        "blocks": blocks,
+    }
+
+    # Update the view
+    if not slack_client:
+        logging.error("[Slack] Slack client not available")
+        return
+    
+    try:
+        result = slack_client.views_update(
+            view_id=view_id,
+            view=updated_view
+        )
+        if result.get("ok"):
+            logging.info(f"[Slack] Successfully updated view {view_id}")
+        else:
+            logging.error(f"[Slack] Failed to update view: {result.get('error')}")
+    except Exception as e:
+        logging.error(f"[Slack] Exception updating view: {e}")
+
+
+# -------------------- Background: Send to Hostaway --------------------
+def _background_send_to_hostaway(
+    meta: dict,
+    reply_text: str,
+):
+    """Background task to send reply to Hostaway and update Slack."""
+    conv_id = meta.get("conv_id") or meta.get("conversation_id")
+    channel = meta.get("channel")
+    ts = meta.get("ts")
+    
+    logging.info(f"[Hostaway] Sending reply to conversation {conv_id}")
+    
+    try:
+        # Send to Hostaway
+        success = send_hostaway_reply(conv_id, reply_text)
+        
+        if success:
+            logging.info(f"[Hostaway] Successfully sent reply to {conv_id}")
+            
+            # Post confirmation to Slack thread
+            if slack_client and channel and ts:
+                try:
+                    slack_client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=ts,
+                        text=f"✅ Reply sent to guest:\n>{reply_text[:200]}{'...' if len(reply_text) > 200 else ''}"
+                    )
+                except Exception as e:
+                    logging.error(f"[Slack] Failed to post confirmation: {e}")
+        else:
+            logging.error(f"[Hostaway] Failed to send reply to {conv_id}")
+            
+            # Post error to Slack thread
+            if slack_client and channel and ts:
+                try:
+                    slack_client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=ts,
+                        text="❌ Failed to send reply to Hostaway. Please try again."
+                    )
+                except Exception as e:
+                    logging.error(f"[Slack] Failed to post error: {e}")
+                    
+    except Exception as e:
+        logging.error(f"[Hostaway] Exception sending reply: {e}")
+
+
+# -------------------- Main Interactivity Endpoint --------------------
 @router.post("/interactivity")
 async def handle_slack_interaction(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_slack_signature: Optional[str] = Header(None, alias="X-Slack-Signature"),
     x_slack_request_timestamp: Optional[str] = Header(None, alias="X-Slack-Request-Timestamp"),
     x_slack_retry_num: Optional[str] = Header(None, alias="X-Slack-Retry-Num"),
@@ -140,408 +418,300 @@ async def handle_slack_interaction(
         logging.error(f"[Slack] Invalid payload: {e}")
         return JSONResponse({"error": "invalid_payload"}, status_code=400)
 
-    action_id = _get_action_id(payload)
-    logging.info(f"[Slack] Action received: {action_id}")
+    payload_type = payload.get("type")
+    logging.info(f"[Slack] Received interaction type: {payload_type}")
 
     try:
-        if action_id == "open_edit_modal":
-            return await _open_edit_modal(payload)
-        elif action_id in ("send", "send_reply", "send_guest_portal"):
-            return await _send_reply(payload, action_id)
-        elif action_id == "improve_with_ai":
-            return await _improve_with_ai(payload)
-        elif action_id == "undo_ai":
-            return await _undo_ai(payload)
+        # ==================== BLOCK ACTIONS ====================
+        if payload_type == "block_actions":
+            actions = payload.get("actions", [])
+            if not actions:
+                return JSONResponse({"ok": True})
+            
+            action = actions[0]
+            action_id = action.get("action_id")
+            trigger_id = payload.get("trigger_id")
+            
+            logging.info(f"[Slack] Block action: {action_id}")
 
-        # Modal form submission
-        if payload.get("type") == "view_submission":
-            return await _handle_modal_submit(payload)
+            # Get metadata from button value
+            try:
+                meta = json.loads(action.get("value", "{}"))
+            except:
+                meta = {}
+            
+            # Normalize conversation ID
+            if "conversation_id" in meta and "conv_id" not in meta:
+                meta["conv_id"] = meta["conversation_id"]
+            
+            # Get channel and timestamp from container
+            container = payload.get("container", {}) or {}
+            channel_id = container.get("channel_id") or (payload.get("channel") or {}).get("id")
+            message_ts = container.get("message_ts") or (payload.get("message") or {}).get("ts")
+            
+            if channel_id:
+                meta["channel"] = channel_id
+            if message_ts:
+                meta["ts"] = message_ts
+            
+            # Generate fingerprint if missing
+            if not meta.get("fingerprint"):
+                meta["fingerprint"] = f"{channel_id}|{message_ts}|{meta.get('conv_id', '')}|{uuid.uuid4()}"
 
-        logging.warning(f"[Slack] Unhandled action: {action_id}")
-        return JSONResponse({"ok": True})
+            # ---------------- SEND REPLY ----------------
+            if action_id in ("send", "send_reply"):
+                logging.info("[Slack] Handling send_reply action")
+                
+                # Get reply text from metadata
+                reply_text = meta.get("reply_text") or meta.get("draft_text") or meta.get("ai_suggestion", "")
+                conv_id = meta.get("conv_id")
+                
+                if not reply_text or not conv_id:
+                    logging.error(f"[Slack] Missing reply_text or conv_id: {meta}")
+                    return JSONResponse({"ok": True})
+                
+                # Send in background
+                background_tasks.add_task(_background_send_to_hostaway, meta, reply_text)
+                
+                # Post immediate acknowledgment to thread
+                if slack_client and channel_id and message_ts:
+                    try:
+                        slack_client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=message_ts,
+                            text="⏳ Sending reply to guest..."
+                        )
+                    except Exception as e:
+                        logging.error(f"[Slack] Failed to post ack: {e}")
+                
+                return JSONResponse({"ok": True})
 
-    except Exception as e:
-        logging.error(f"[Slack] Error handling action {action_id}: {e}", exc_info=True)
-        return JSONResponse({"error": "processing_error"}, status_code=500)
+            # ---------------- OPEN EDIT MODAL ----------------
+            elif action_id in ("edit", "open_edit_modal"):
+                logging.info("[Slack] Opening edit modal")
+                
+                guest_name = meta.get("guest_name", "Guest")
+                guest_msg = meta.get("guest_message", "")
+                draft_text = meta.get("draft_text") or meta.get("ai_suggestion", "")
+                
+                blocks = get_modal_blocks(
+                    guest_name=guest_name,
+                    guest_msg=guest_msg,
+                    draft_text=draft_text,
+                    coach_prompt_initial=meta.get("coach_prompt", ""),
+                )
+                
+                modal = {
+                    "type": "modal",
+                    "callback_id": "edit_modal_submit",
+                    "title": {"type": "plain_text", "text": "Edit AI Reply", "emoji": True},
+                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                    "private_metadata": pack_private_meta(meta),
+                    "blocks": blocks,
+                }
+                
+                if slack_client:
+                    try:
+                        slack_client.views_open(trigger_id=trigger_id, view=modal)
+                        logging.info("[Slack] Edit modal opened successfully")
+                    except Exception as e:
+                        logging.error(f"[Slack] Failed to open modal: {e}")
+                
+                return JSONResponse({"ok": True})
 
-
-# ---------------- Helpers ----------------
-def _get_action_id(payload: dict) -> str:
-    """Extracts action_id safely from any Slack payload type."""
-    try:
-        actions = payload.get("actions", [])
-        if actions and isinstance(actions, list):
-            return actions[0].get("action_id", "")
-        elif payload.get("type") == "view_submission":
-            return payload.get("callback_id", "")
-    except Exception:
-        pass
-    return ""
-
-
-# ---------------- Open Edit Modal ----------------
-async def _open_edit_modal(payload: dict):
-    """Opens an edit modal to modify AI's suggested reply."""
-    trigger_id = payload.get("trigger_id")
-    action = payload.get("actions", [{}])[0]
-    data = json.loads(action.get("value", "{}"))
-
-    # Add fingerprint for deduplication
-    container = payload.get("container", {}) or {}
-    channel_id = container.get("channel_id") or (payload.get("channel") or {}).get("id")
-    message_ts = container.get("message_ts") or (payload.get("message") or {}).get("ts")
-
-    data["fingerprint"] = f"{channel_id}|{message_ts}|{data.get('conv_id','')}|{uuid.uuid4()}"
-    data["channel"] = channel_id
-    data["ts"] = message_ts
-
-    try:
-        open_edit_modal(trigger_id, data)
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        logging.error(f"[Slack] Failed to open edit modal: {e}")
-        return JSONResponse({"error": "modal_open_failed"}, status_code=500)
-
-
-# ---------------- Improve with AI ----------------
-async def _improve_with_ai(payload: dict):
-    """Handles 'Improve with AI' button — rewrites text in modal."""
-    import asyncio
-
-    async def update_modal_view():
-        """Async function to update the modal after acknowledgment."""
-        try:
-            # Extract current data
-            action = payload.get("actions", [{}])[0]
-            data = json.loads(action.get("value", "{}"))
-            view = payload.get("view", {})
-            view_state = view.get("state", {}).get("values", {})
-
-            # Get current text from input
-            current_text = _extract_input_text(view_state)
-
-            # Get coaching prompt if provided
-            coach_prompt = ""
-            cp_block = view_state.get("coach_prompt_block", {})
-            if "coach_prompt" in cp_block and isinstance(cp_block["coach_prompt"], dict):
-                coach_prompt = (cp_block["coach_prompt"].get("value") or "").strip()
-
-            logging.info(f"[Slack] Improving text: {current_text[:50]}...")
-            if coach_prompt:
-                logging.info(f"[Slack] With coaching: {coach_prompt[:50]}...")
-
-            # Improve with AI (with coaching if provided)
-            improved_context = {**data}
-            if coach_prompt:
-                improved_context["coach_prompt"] = coach_prompt
-
-            improved_text = improve_message_with_ai(current_text, improved_context)
-            if not improved_text:
-                improved_text = current_text  # Fallback
-
-            logging.info(f"[Slack] Improved text: {improved_text[:50]}...")
-
-            # Get metadata
-            current_view = payload["view"]
-            meta_str = current_view.get("private_metadata", "{}")
-            meta = json.loads(meta_str) if meta_str else {}
-
-            # Store previous draft for undo
-            meta["previous_draft"] = current_text
-            meta["coach_prompt"] = coach_prompt
-
-            # Rebuild modal with improved text
-            guest_message = data.get("guest_message", "")
-            guest_name = meta.get("guest_name", "Guest")
-
-            # Build header
-            header_text = (
-                f"*✉️ Message from {guest_name}*\n"
-                f"🏡 *Property:* {meta.get('property_name', 'Unknown')}*\n"
-                f"📅 *Dates:* {meta.get('check_in', 'N/A')} → {meta.get('check_out', 'N/A')}\n"
-                f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}*\n"
-            )
-
-            # Build modal blocks
-            blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
-                {"type": "divider"},
-                {
-                    "type": "input",
-                    "block_id": "reply_input",
-                    "label": {"type": "plain_text", "text": "Edit your reply"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "reply_text",
-                        "multiline": True,
-                        "initial_value": improved_text,
-                    },
-                },
-                {
-                    "type": "input",
-                    "block_id": "coach_prompt_block",
-                    "optional": True,
-                    "label": {"type": "plain_text", "text": "Coach the AI (optional)"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "coach_prompt",
-                        "multiline": True,
-                        "placeholder": {
-                            "type": "plain_text",
-                            "text": "Tell AI how to adjust (e.g., 'be more formal', 'mention parking')"
-                        },
-                        **({"initial_value": coach_prompt} if coach_prompt else {})
+            # ---------------- IMPROVE WITH AI ----------------
+            elif action_id == "improve_with_ai":
+                logging.info("[Slack] Handling improve_with_ai action")
+                
+                view = payload.get("view", {})
+                view_id = view.get("id")
+                
+                if not view_id:
+                    logging.error("[Slack] No view_id for improve_with_ai")
+                    return JSONResponse({"ok": True})
+                
+                # Extract current text from modal state
+                state_values = view.get("state", {}).get("values", {})
+                edited_text = _extract_input_text(state_values)
+                
+                # Extract coach prompt
+                coach_prompt_block = state_values.get("coach_prompt_block", {})
+                coach_prompt_value = ""
+                if "coach_prompt" in coach_prompt_block:
+                    coach_prompt_value = coach_prompt_block["coach_prompt"].get("value", "")
+                
+                # Get metadata
+                try:
+                    meta = json.loads(view.get("private_metadata", "{}"))
+                except:
+                    meta = {}
+                
+                guest_name = meta.get("guest_name", "Guest")
+                guest_msg = meta.get("guest_message", "")
+                
+                # Show loading state immediately
+                loading_blocks = [
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": "⏳ *Improving with AI...*"}
                     }
-                },
-                {
-                    "type": "actions",
-                    "block_id": "improve_ai_actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "✨ Improve with AI"},
-                            "action_id": "improve_with_ai",
-                            "value": json.dumps({"conv_id": meta.get("conv_id"), "guest_message": guest_message}),
-                        },
-                    ],
-                },
-            ]
-
-            # Add Undo button if we have a previous draft
-            if meta.get("previous_draft"):
-                blocks.append({
-                    "type": "actions",
-                    "block_id": "undo_actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "↩️ Undo AI"},
-                            "action_id": "undo_ai",
-                            "value": json.dumps(meta),
-                        }
-                    ]
+                ] + get_modal_blocks(
+                    guest_name=guest_name,
+                    guest_msg=guest_msg,
+                    draft_text=edited_text,
+                    coach_prompt_initial=coach_prompt_value,
+                )
+                
+                loading_view = {
+                    "type": "modal",
+                    "callback_id": "edit_modal_submit",
+                    "title": {"type": "plain_text", "text": "Improving...", "emoji": True},
+                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                    "private_metadata": pack_private_meta(meta),
+                    "blocks": loading_blocks,
+                }
+                
+                # Start background improvement
+                background_tasks.add_task(
+                    _background_improve_and_update,
+                    view_id,
+                    meta,
+                    edited_text,
+                    coach_prompt_value,
+                    guest_name,
+                    guest_msg,
+                )
+                
+                # Return loading view immediately
+                return JSONResponse({
+                    "response_action": "update",
+                    "view": loading_view
                 })
 
-            # Update view
-            updated_view = {
-                "type": "modal",
-                "callback_id": "edit_modal_submit",
-                "title": {"type": "plain_text", "text": "Edit AI Reply"},
-                "submit": {"type": "plain_text", "text": "Send"},
-                "close": {"type": "plain_text", "text": "Cancel"},
-                "private_metadata": pack_private_meta(meta),
-                "blocks": blocks,
-            }
-
-            logging.info(f"[Slack] Updating modal view {current_view['id']}...")
-            result = slack_client.views_update(
-                view_id=current_view["id"],
-                hash=current_view.get("hash", ""),
-                view=updated_view
-            )
-            logging.info(f"[Slack] Modal view updated: {result.get('ok', False)}")
-
-        except Exception as e:
-            logging.error(f"[Slack] Failed to update modal view: {e}", exc_info=True)
-
-    # Start background task
-    import asyncio
-    asyncio.create_task(update_modal_view())
-
-    # Return immediate acknowledgment
-    return JSONResponse({"ok": True})
-
-
-# ---------------- Undo AI ----------------
-async def _undo_ai(payload: dict):
-    """Restores previous draft before AI improvement."""
-    try:
-        view = payload.get("view", {})
-        meta = json.loads(view.get("private_metadata", "{}"))
-
-        previous_draft = meta.get("previous_draft", "")
-        if not previous_draft:
-            logging.warning("[Slack] Undo requested but no previous draft found")
-            return JSONResponse({"ok": True})
-
-        guest_name = meta.get("guest_name", "Guest")
-        guest_message = meta.get("guest_message", "")
-
-        # Build header
-        header_text = (
-            f"*✉️ Message from {guest_name}*\n"
-            f"🏡 *Property:* {meta.get('property_name', 'Unknown')}*\n"
-            f"📅 *Dates:* {meta.get('check_in', 'N/A')} → {meta.get('check_out', 'N/A')}\n"
-            f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}*\n"
-        )
-
-        # Restore previous draft
-        blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
-            {"type": "divider"},
-            {
-                "type": "input",
-                "block_id": "reply_input",
-                "label": {"type": "plain_text", "text": "Edit your reply"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "reply_text",
-                    "multiline": True,
-                    "initial_value": previous_draft,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "coach_prompt_block",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Coach the AI (optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "coach_prompt",
-                    "multiline": True,
-                    "placeholder": {"type": "plain_text", "text": "Tell AI how to adjust"}
+            # ---------------- UNDO AI ----------------
+            elif action_id == "undo_ai":
+                logging.info("[Slack] Handling undo_ai action")
+                
+                view = payload.get("view", {})
+                try:
+                    meta = json.loads(view.get("private_metadata", "{}"))
+                except:
+                    meta = {}
+                
+                previous_draft = meta.get("previous_draft", "")
+                if not previous_draft:
+                    logging.warning("[Slack] No previous draft to restore")
+                    return JSONResponse({"ok": True})
+                
+                guest_name = meta.get("guest_name", "Guest")
+                guest_msg = meta.get("guest_message", "")
+                
+                # Restore previous draft
+                blocks = get_modal_blocks(
+                    guest_name=guest_name,
+                    guest_msg=guest_msg,
+                    draft_text=previous_draft,
+                    coach_prompt_initial=meta.get("coach_prompt", ""),
+                )
+                
+                # Remove previous_draft from meta
+                meta.pop("previous_draft", None)
+                
+                restored_view = {
+                    "type": "modal",
+                    "callback_id": "edit_modal_submit",
+                    "title": {"type": "plain_text", "text": "Edit AI Reply", "emoji": True},
+                    "submit": {"type": "plain_text", "text": "Send", "emoji": True},
+                    "close": {"type": "plain_text", "text": "Cancel", "emoji": True},
+                    "private_metadata": pack_private_meta(meta),
+                    "blocks": blocks,
                 }
-            },
-            {
-                "type": "actions",
-                "block_id": "improve_ai_actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "✨ Improve with AI"},
-                        "action_id": "improve_with_ai",
-                        "value": json.dumps({"conv_id": meta.get("conv_id"), "guest_message": guest_message}),
-                    },
-                ],
-            },
-        ]
+                
+                return JSONResponse({
+                    "response_action": "update",
+                    "view": restored_view
+                })
 
-        # Clear previous draft from metadata
-        meta.pop("previous_draft", None)
+            # ---------------- SEND GUEST PORTAL ----------------
+            elif action_id == "send_guest_portal":
+                logging.info("[Slack] Handling send_guest_portal action")
+                
+                conv_id = meta.get("conv_id")
+                portal_url = meta.get("guest_portal_url")
+                
+                if not portal_url or not conv_id:
+                    if slack_client and channel_id and message_ts:
+                        slack_client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=message_ts,
+                            text="⚠️ Guest portal URL not available"
+                        )
+                    return JSONResponse({"ok": True})
+                
+                # Send portal link
+                try:
+                    success = send_hostaway_reply(
+                        conv_id,
+                        f"Here's your guest portal link: {portal_url}"
+                    )
+                    
+                    if success and slack_client and channel_id and message_ts:
+                        slack_client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=message_ts,
+                            text="✅ Guest portal link sent"
+                        )
+                except Exception as e:
+                    logging.error(f"[Hostaway] Error sending portal: {e}")
+                
+                return JSONResponse({"ok": True})
 
-        updated_view = {
-            "type": "modal",
-            "callback_id": "edit_modal_submit",
-            "title": {"type": "plain_text", "text": "Edit AI Reply"},
-            "submit": {"type": "plain_text", "text": "Send"},
-            "close": {"type": "plain_text", "text": "Cancel"},
-            "private_metadata": pack_private_meta(meta),
-            "blocks": blocks,
-        }
-
-        slack_client.views_update(
-            view_id=view["id"],
-            hash=view.get("hash", ""),
-            view=updated_view
-        )
-
-        logging.info("[Slack] Undo successful - restored previous draft")
-        return JSONResponse({"ok": True})
-
-    except Exception as e:
-        logging.error(f"[Slack] Undo failed: {e}", exc_info=True)
-        return JSONResponse({"error": "undo_failed"}, status_code=500)
-
-
-# ---------------- Send Hostaway Reply ----------------
-async def _send_reply(payload: dict, action_id: str):
-    """Sends reply to Hostaway and confirms to Slack."""
-    try:
-        action = payload.get("actions", [{}])[0]
-        data = json.loads(action.get("value", "{}"))
-        conv_id = data.get("conv_id") or data.get("conversation_id")
-        reply_text = data.get("reply_text", "") or data.get("reply", "")
-
-        if not conv_id or not reply_text:
-            raise ValueError("Missing conversation ID or message")
-
-        send_hostaway_reply(conversation_id=conv_id, message=reply_text)
-
-        slack_client.chat_postMessage(
-            channel=os.getenv("SLACK_CHANNEL"),
-            text=f"✅ Message sent to guest: \n>{reply_text}",
-        )
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        logging.error(f"[Slack] Send reply failed: {e}")
-        return JSONResponse({"error": "send_failed"}, status_code=500)
-
-
-# ---------------- Modal Submit ----------------
-async def _handle_modal_submit(payload: dict):
-    """Handles final modal form submission (user presses 'Send')."""
-    try:
-        logging.info("[Slack] Processing modal submission...")
-
-        # Extract view state and text
-        view_state = payload.get("view", {}).get("state", {}).get("values", {})
-        reply_text = _extract_input_text(view_state)
-
-        # Extract metadata
-        meta_str = payload.get("view", {}).get("private_metadata", "{}")
-        meta = json.loads(meta_str) if meta_str else {}
-        conv_id = meta.get("conv_id") or meta.get("conversation_id")
-
-        logging.info(f"[Slack] Modal submission - conv_id: {conv_id}, reply_text length: {len(reply_text) if reply_text else 0}")
-
-        # Validate
-        if not conv_id:
-            logging.error("[Slack] No conversation ID in modal submission")
-            return JSONResponse({
-                "response_action": "errors",
-                "errors": {"reply_input": "Unable to send - missing conversation ID"}
-            })
-
-        if not reply_text:
-            logging.error("[Slack] No reply text in modal submission")
-            return JSONResponse({
-                "response_action": "errors",
-                "errors": {"reply_input": "Please enter a message to send"}
-            })
-
-        # Send to Hostaway
-        logging.info(f"[Slack] Sending message to Hostaway conversation {conv_id}...")
-        success = send_hostaway_reply(conv_id, reply_text)
-
-        if success:
-            # Post confirmation to Slack
-            slack_client.chat_postMessage(
-                channel=os.getenv("SLACK_CHANNEL"),
-                text=f"✅ Edited reply sent to guest:\n>{reply_text}",
-            )
-            logging.info(f"[Slack] Modal message sent successfully to conversation {conv_id}")
-
+        # ==================== VIEW SUBMISSION ====================
+        elif payload_type == "view_submission":
+            logging.info("[Slack] Handling view_submission")
+            
+            view = payload.get("view", {})
+            callback_id = view.get("callback_id")
+            
+            if callback_id != "edit_modal_submit":
+                return JSONResponse({"ok": True})
+            
+            # Extract reply text from modal
+            state_values = view.get("state", {}).get("values", {})
+            reply_text = _extract_input_text(state_values)
+            
+            # Get metadata
+            try:
+                meta = json.loads(view.get("private_metadata", "{}"))
+            except:
+                meta = {}
+            
+            conv_id = meta.get("conv_id") or meta.get("conversation_id")
+            
+            logging.info(f"[Slack] Modal submission - conv_id: {conv_id}, reply length: {len(reply_text)}")
+            
+            # Validate
+            if not reply_text:
+                return JSONResponse({
+                    "response_action": "errors",
+                    "errors": {"reply_input_ai": "Please enter a reply"}
+                })
+            
+            if not conv_id:
+                return JSONResponse({
+                    "response_action": "errors",
+                    "errors": {"reply_input_ai": "Missing conversation ID"}
+                })
+            
+            # Send reply in background
+            background_tasks.add_task(_background_send_to_hostaway, meta, reply_text)
+            
             # Clear modal
             return JSONResponse({"response_action": "clear"})
-        else:
-            logging.error(f"[Slack] Failed to send message to Hostaway for conversation {conv_id}")
-            return JSONResponse({
-                "response_action": "errors",
-                "errors": {"reply_input": "Failed to send message to Hostaway. Please try again."}
-            })
 
-    except json.JSONDecodeError as e:
-        logging.error(f"[Slack] Failed to parse modal metadata: {e}")
-        return JSONResponse({
-            "response_action": "errors",
-            "errors": {"reply_input": "Internal error - invalid modal data"}
-        })
+        return JSONResponse({"ok": True})
+
     except Exception as e:
-        logging.error(f"[Slack] Modal submission failed: {e}", exc_info=True)
-        return JSONResponse({
-            "response_action": "errors",
-            "errors": {"reply_input": f"Error: {str(e)}"}
-        })
-
-
-# ---------------- Internal: Extract Input ----------------
-def _extract_input_text(state_values: dict) -> str:
-    """Extracts text input from modal state safely."""
-    try:
-        for block in state_values.values():
-            for val in block.values():
-                if "value" in val:
-                    return val["value"]
-    except Exception:
-        pass
-    return ""
+        logging.error(f"[Slack] Error handling interaction: {e}", exc_info=True)
+        return JSONResponse({"error": "processing_error"}, status_code=500)
