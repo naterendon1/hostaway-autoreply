@@ -142,6 +142,7 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
         "status": meta.get("status"),
         "platform": meta.get("platform"),
     }
+    logging.info(f"[build_edit_modal] pm dict before JSON: {json.dumps(pm)[:500]}")
     private_metadata = json.dumps(pm)[:2900]
     
     modal = {
