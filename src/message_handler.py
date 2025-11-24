@@ -190,7 +190,7 @@ async def unified_webhook(request: Request):
                     "style": "primary",
                     "action_id": "send_reply",
                     "value": json.dumps({
-                        "conversation_id": conv_id,
+                        "conversationId": conv_id,
                         "reply_text": ai_reply,
                         "guest_message": guest_message,
                     }),
@@ -200,6 +200,7 @@ async def unified_webhook(request: Request):
                     "text": {"type": "plain_text", "text": "Edit"},
                     "action_id": "open_edit_modal",
                     "value": json.dumps({
+                        "conversationId": conv_id,
                         "guest_name": guest_name,
                         "guest_message": guest_message,
                         "draft_text": ai_reply,
@@ -210,7 +211,7 @@ async def unified_webhook(request: Request):
                     "text": {"type": "plain_text", "text": "Send Guest Portal"},
                     "action_id": "send_guest_portal",
                     "value": json.dumps({
-                        "conversation_id": conv_id,
+                        "conversationId": conv_id,
                         "guest_portal_url": res_data.get("guestPortalUrl"),
                         "status": status,
                     }),
