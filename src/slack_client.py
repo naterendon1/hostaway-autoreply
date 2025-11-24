@@ -62,10 +62,19 @@ def _pretty_platform(meta: Dict[str, Any]) -> str:
 
 def _prune_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     """Whitelist only small, needed fields to stay within Slack limits."""
+    
+    # Extract conversationId - the official Hostaway field name
+    conversation_id = meta.get("conversationId")
+    
+    if not conversation_id:
+        logging.warning(f"[_prune_meta] No conversationId found in meta! Keys: {list(meta.keys())}")
+    else:
+        logging.info(f"[_prune_meta] Found conversationId: {conversation_id}")
+    
     pruned = {
-        "conv_id": meta.get("conv_id"),
+        "conversationId": conversation_id,
         "guest_name": meta.get("guest_name", "Guest"),
-        "guest_message": (meta.get("guest_message") or "")[:900],  # keep small
+        "guest_message": (meta.get("guest_message") or "")[:900],
         "property_name": meta.get("property_name"),
         "property_address": meta.get("property_address"),
         "check_in": _fmt_date(meta.get("check_in")),
@@ -74,39 +83,114 @@ def _prune_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
         "status": (meta.get("status") or "Unknown"),
         "platform": _pretty_platform(meta),
     }
-    return {k: v for k, v in pruned.items() if v is not None}
+    
+    # Keep conversationId even if None - critical for tracking
+    result = {}
+    for k, v in pruned.items():
+        if k == "conversationId":
+            result[k] = v  # Keep even if None
+        elif v is not None:
+            result[k] = v
+    
+    return result
 
-# --- Blocks ---
-def _build_header_block(meta: Dict[str, Any], summary: Optional[str] = None, mood: Optional[str] = None) -> Dict[str, Any]:
-    guest_name = meta.get("guest_name", "Guest")
-    property_line = _pretty_property(meta)
-    check_in = _fmt_date(meta.get("check_in"))
-    check_out = _fmt_date(meta.get("check_out"))
-    guests = _fmt_int(meta.get("guest_count"), "N/A")
-    status = (meta.get("status") or "Unknown").title()
-    platform = _pretty_platform(meta)
-    conv_id = meta.get("conv_id")
 
+def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a Slack modal for editing the AI reply.
+    Keeps fields small; private_metadata <= 3000 chars by pruning.
+    """
+    logging.info(f"[build_edit_modal] Input payload keys: {list(payload.keys())}")
+    
+    meta = _prune_meta(payload.get("meta", {}))
+    guest_name = payload.get("guest_name", meta.get("guest_name", "Guest"))
+    guest_message = payload.get("guest_message", meta.get("guest_message", ""))
+    draft_text = payload.get("draft_text", meta.get("draft_text", ""))
+    
     header_text = (
-        f"*{platform}* · *{status}*\n"
-        f"*{guest_name}* → *{property_line}*\n"
-        f"*Dates:* {check_in} → {check_out} · *Guests:* {guests}"
+        f"*✉️ Message from {guest_name}*\n"
+        f"🏡 *Property:* {_pretty_property(meta)}\n"
+        f"📅 *Dates:* {meta.get('check_in', 'N/A')} → {meta.get('check_out', 'N/A')}\n"
+        f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}"
     )
-    if conv_id:
-        header_text += f"\n*Conversation:* `{conv_id}`"
-    if mood:
-        header_text += f"\n*🧠 Mood:* {mood}"
-    if summary:
-        header_text += f"\n*📝 Summary:* {summary}"
-
-    block = {"type": "section", "text": {"type": "mrkdwn", "text": header_text}}
-    if meta.get("guest_photo"):
-        block["accessory"] = {
-            "type": "image",
-            "image_url": meta["guest_photo"],
-            "alt_text": f"Photo of {guest_name}",
-        }
-    return block
+    
+    # Get conversationId from either top-level payload or nested meta
+    conversation_id = payload.get("conversationId") or meta.get("conversationId")
+    
+    logging.info(f"[build_edit_modal] Extracted conversationId: {conversation_id}")
+    
+    if not conversation_id:
+        logging.error(f"[build_edit_modal] No conversationId found! Payload: {json.dumps(payload)[:500]}")
+    
+    pm = {
+        "conversationId": conversation_id,
+        "guest_name": guest_name,
+        "guest_message": guest_message[:900],
+        "property_name": meta.get("property_name"),
+        "property_address": meta.get("property_address"),
+        "check_in": meta.get("check_in"),
+        "check_out": meta.get("check_out"),
+        "guest_count": meta.get("guest_count"),
+        "status": meta.get("status"),
+        "platform": meta.get("platform"),
+    }
+    private_metadata = json.dumps(pm)[:2900]
+    
+    modal = {
+        "type": "modal",
+        "callback_id": "edit_modal_submit",
+        "title": {"type": "plain_text", "text": "Edit AI Reply"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "private_metadata": private_metadata,
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
+            {"type": "divider"},
+            {
+                "type": "input",
+                "block_id": "reply_input",
+                "label": {"type": "plain_text", "text": "Edit your reply"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "reply_text",
+                    "multiline": True,
+                    "initial_value": (draft_text or "")[:2800],
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "coach_prompt_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Coach the AI (optional)"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "coach_prompt",
+                    "multiline": True,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Tell AI how to adjust (e.g., 'be more formal', 'mention parking')"
+                    }
+                }
+            },
+            {
+                "type": "actions",
+                "block_id": "improve_ai_actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✨ Improve with AI"},
+                        "action_id": "improve_with_ai",
+                        "value": json.dumps({
+                            "conversationId": conversation_id,
+                            "guest_message": guest_message[:800],
+                            "draft_text": (draft_text or "")[:800]
+                        })[:1500],
+                    },
+                ],
+            },
+        ],
+    }
+    return modal
 
 def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> list:
     guest_message = meta.get("guest_message", "")
