@@ -100,7 +100,15 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
     Build a Slack modal for editing the AI reply.
     Keeps fields small; private_metadata <= 3000 chars by pruning.
     """
-    logging.info(f"[build_edit_modal] Input payload keys: {list(payload.keys())}")
+    # ADD DEBUGGING
+    logging.info(f"[build_edit_modal] Received payload keys: {list(payload.keys())}")
+    logging.info(f"[build_edit_modal] Payload: {json.dumps(payload)[:1000]}")
+    
+    meta = _prune_meta(payload.get("meta", {}))
+    
+    # ADD DEBUGGING
+    logging.info(f"[build_edit_modal] After _prune_meta, meta keys: {list(meta.keys())}")
+    logging.info(f"[build_edit_modal] Meta: {json.dumps(meta)[:500]}")
     
     meta = _prune_meta(payload.get("meta", {}))
     guest_name = payload.get("guest_name", meta.get("guest_name", "Guest"))
