@@ -490,13 +490,21 @@ async def _send_reply(payload: dict, action_id: str):
     """Sends reply to Hostaway and confirms to Slack."""
     try:
         action = payload.get("actions", [{}])[0]
-        data = json.loads(action.get("value", "{}"))
+        raw_value = action.get("value", "{}")
         
         logging.info(f"[_send_reply] action_id: {action_id}")
         logging.info(f"[_send_reply] Raw action value: {raw_value[:500]}")
+
+        data = json.loads(action.get("value", "{}"))
+
+        logging.info(f"[_send_reply] Parsed data keys: {list(data.keys())}")
         
-        conv_id = data.get("conversation_id")
+        conversation_id = data.get("conversationId")
         reply_text = data.get("reply_text", "") or data.get("reply", "")
+
+        logging.info(f"[_send_reply] conversationId: {conversation_id}")
+        logging.info(f"[_send_reply] reply_text length: {len(reply_text) if reply_text else 0}")
+
 
         if not conv_id or not reply_text:
             logging.error(f"[_send_reply] Missing data - conversationId: {conversation_id}, reply_text: {bool(reply_text)}")
