@@ -190,17 +190,17 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
     guest_name = payload.get("guest_name", meta.get("guest_name", "Guest"))
     guest_message = payload.get("guest_message", meta.get("guest_message", ""))
     draft_text = payload.get("draft_text", meta.get("draft_text", ""))
-
+    
     header_text = (
         f"*✉️ Message from {guest_name}*\n"
         f"🏡 *Property:* {_pretty_property(meta)}\n"
         f"📅 *Dates:* {meta.get('check_in', 'N/A')} → {meta.get('check_out', 'N/A')}\n"
         f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}"
     )
-
+    
     # Get conv_id from either top-level payload or nested meta
     conv_id = payload.get("conv_id") or meta.get("conv_id") or payload.get("conversation_id") or meta.get("conversation_id")
-
+    
     pm = {
         "conv_id": conv_id,
         "guest_name": guest_name,
@@ -214,7 +214,7 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
         "platform": meta.get("platform"),
     }
     private_metadata = json.dumps(pm)[:2900]
-
+    
     modal = {
         "type": "modal",
         "callback_id": "edit_modal_submit",
@@ -259,7 +259,12 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "type": "button",
                         "text": {"type": "plain_text", "text": "✨ Improve with AI"},
                         "action_id": "improve_with_ai",
-                        "value": json.dumps({"draft_text": (draft_text or "")[:1200]})[:1500],
+                        # CHANGED: Include conv_id and guest_message for context
+                        "value": json.dumps({
+                            "conv_id": conv_id,
+                            "guest_message": guest_message[:800],
+                            "draft_text": (draft_text or "")[:800]
+                        })[:1500],
                     },
                 ],
             },
