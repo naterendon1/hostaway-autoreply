@@ -144,6 +144,8 @@ def build_edit_modal(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     logging.info(f"[build_edit_modal] pm dict before JSON: {json.dumps(pm)[:500]}")
     private_metadata = json.dumps(pm)[:2900]
+    logging.info(f"[build_edit_modal] private_metadata after JSON: {private_metadata[:500]}")
+    logging.info(f"[build_edit_modal] private_metadata length: {len(private_metadata)}")
     
     modal = {
         "type": "modal",
