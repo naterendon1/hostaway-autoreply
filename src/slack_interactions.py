@@ -452,7 +452,7 @@ async def _undo_ai(payload: dict):
                         "type": "button",
                         "text": {"type": "plain_text", "text": "✨ Improve with AI"},
                         "action_id": "improve_with_ai",
-                        "value": json.dumps({"conv_id": meta.get("conv_id"), "guest_message": guest_message}),
+                        "value": json.dumps({"conversationId": meta.get("conversationId"), "guest_message": guest_message}),
                     },
                 ],
             },
@@ -510,7 +510,7 @@ async def _send_reply(payload: dict, action_id: str):
             logging.error(f"[_send_reply] Missing data - conversationId: {conversation_id}, reply_text: {bool(reply_text)}")
             raise ValueError("Missing conversation ID or message")
 
-        send_hostaway_reply(conversation_id=conv_id, message=reply_text)
+        send_hostaway_reply(conversation_id=conversation_id, message=reply_text)
 
         slack_client.chat_postMessage(
             channel=os.getenv("SLACK_CHANNEL"),
