@@ -230,36 +230,43 @@ async def _improve_with_ai(payload: dict):
             if coach_prompt:
                 logging.info(f"[Slack] With coaching: {coach_prompt[:50]}...")
 
-            # Improve with AI (with coaching if provided)
-            improved_context = {**data}
+            # Get metadata for full context
+            meta_str = view.get("private_metadata", "{}")
+            meta = json.loads(meta_str) if meta_str else {}
+            
+            # Build improved context with all necessary info
+            improved_context = {
+                "conv_id": data.get("conv_id") or meta.get("conv_id"),
+                "guest_message": data.get("guest_message") or meta.get("guest_message"),
+                "guest_name": meta.get("guest_name", "Guest"),
+                "property_name": meta.get("property_name"),
+                "check_in": meta.get("check_in"),
+                "check_out": meta.get("check_out"),
+            }
+            
             if coach_prompt:
                 improved_context["coach_prompt"] = coach_prompt
 
+            # Improve with AI
             improved_text = improve_message_with_ai(current_text, improved_context)
             if not improved_text:
                 improved_text = current_text  # Fallback
 
             logging.info(f"[Slack] Improved text: {improved_text[:50]}...")
 
-            # Get metadata
-            current_view = payload["view"]
-            meta_str = current_view.get("private_metadata", "{}")
-            meta = json.loads(meta_str) if meta_str else {}
-
             # Store previous draft for undo
             meta["previous_draft"] = current_text
             meta["coach_prompt"] = coach_prompt
 
             # Rebuild modal with improved text
-            guest_message = data.get("guest_message", "")
             guest_name = meta.get("guest_name", "Guest")
 
             # Build header
             header_text = (
                 f"*✉️ Message from {guest_name}*\n"
-                f"🏡 *Property:* {meta.get('property_name', 'Unknown')}*\n"
+                f"🏡 *Property:* {meta.get('property_name', 'Unknown')}\n"
                 f"📅 *Dates:* {meta.get('check_in', 'N/A')} → {meta.get('check_out', 'N/A')}\n"
-                f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}*\n"
+                f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}\n"
             )
 
             # Build modal blocks
@@ -301,7 +308,10 @@ async def _improve_with_ai(payload: dict):
                             "type": "button",
                             "text": {"type": "plain_text", "text": "✨ Improve with AI"},
                             "action_id": "improve_with_ai",
-                            "value": json.dumps({"conv_id": meta.get("conv_id"), "guest_message": guest_message}),
+                            "value": json.dumps({
+                                "conv_id": meta.get("conv_id"),
+                                "guest_message": meta.get("guest_message", "")[:800]
+                            }),
                         },
                     ],
                 },
@@ -317,7 +327,7 @@ async def _improve_with_ai(payload: dict):
                             "type": "button",
                             "text": {"type": "plain_text", "text": "↩️ Undo AI"},
                             "action_id": "undo_ai",
-                            "value": json.dumps(meta),
+                            "value": json.dumps({"previous_draft": meta["previous_draft"]}),
                         }
                     ]
                 })
@@ -333,6 +343,7 @@ async def _improve_with_ai(payload: dict):
                 "blocks": blocks,
             }
 
+            current_view = payload["view"]
             logging.info(f"[Slack] Updating modal view {current_view['id']}...")
             result = slack_client.views_update(
                 view_id=current_view["id"],
@@ -345,12 +356,10 @@ async def _improve_with_ai(payload: dict):
             logging.error(f"[Slack] Failed to update modal view: {e}", exc_info=True)
 
     # Start background task
-    import asyncio
     asyncio.create_task(update_modal_view())
 
     # Return immediate acknowledgment
     return JSONResponse({"ok": True})
-
 
 # ---------------- Undo AI ----------------
 async def _undo_ai(payload: dict):
@@ -492,7 +501,7 @@ async def _handle_modal_submit(payload: dict):
                 "errors": {"reply_input": "Unable to send - missing conversation ID"}
             })
 
-        if not reply_text:
+        if not reply_text or not reply_text.strip():
             logging.error("[Slack] No reply text in modal submission")
             return JSONResponse({
                 "response_action": "errors",
@@ -501,7 +510,7 @@ async def _handle_modal_submit(payload: dict):
 
         # Send to Hostaway
         logging.info(f"[Slack] Sending message to Hostaway conversation {conv_id}...")
-        success = send_hostaway_reply(conv_id, reply_text)
+        success = send_hostaway_reply(conv_id, reply_text.strip())
 
         if success:
             # Post confirmation to Slack
