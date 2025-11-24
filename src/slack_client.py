@@ -217,7 +217,7 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
                     "text": {"type": "plain_text", "text": "Send"},
                     "style": "primary",
                     "action_id": "send",
-                    "value": json.dumps({"conv_id": small_meta.get("conv_id"), "reply": ai_suggestion})[:1900],
+                    "value": json.dumps({"conversationId": small_meta.get("conversationId"), "reply": ai_suggestion})[:1900],
                 },
                 {
                     "type": "button",
@@ -227,7 +227,7 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
                         "guest_name": small_meta.get("guest_name", "Guest"),
                         "guest_message": small_meta.get("guest_message", ""),
                         "draft_text": ai_suggestion,
-                        "conv_id": small_meta.get("conv_id"),
+                        "conversationId": small_meta.get("conversationId"),  # ADD THIS
                         "meta": small_meta,
                     })[:1900],
                 },
@@ -235,7 +235,7 @@ def build_message_blocks(meta: Dict[str, Any], ai_result: Dict[str, str]) -> lis
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Send Guest Portal"},
                     "action_id": "send_guest_portal",
-                    "value": json.dumps({"conv_id": small_meta.get("conv_id"), "guest_portal_url": meta.get("guest_portal_url")})[:1900],
+                    "value": json.dumps({"conversationId": small_meta.get("conversationId"), "guest_portal_url": meta.get("guest_portal_url")})[:1900],
                 },
             ],
         },
