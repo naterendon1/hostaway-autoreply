@@ -204,6 +204,17 @@ async def unified_webhook(request: Request):
                         "guest_name": guest_name,
                         "guest_message": guest_message,
                         "draft_text": ai_reply,
+                        "meta": {  # ADD THIS WHOLE META OBJECT
+                            "conversationId": conv_id,
+                            "guest_name": guest_name,
+                            "property_name": property_name,
+                            "property_address": property_address,
+                            "check_in": check_in,
+                            "check_out": check_out,
+                            "guest_count": guest_count,
+                            "status": status,
+                            "platform": platform,
+                         }
                     }),
                 },
                 {
