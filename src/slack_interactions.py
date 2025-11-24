@@ -69,8 +69,8 @@ def verify_slack_signature(
 
 # -------------------- Private Metadata Packing --------------------
 PRIVATE_META_KEYS = {
-    "conv_id", "conversation_id", "listing_id", "guest_id", "guest_name",
-    "guest_message", "type", "status", "check_in", "check_out", "guest_count",
+    "conversationId", "listing_id", "guest_id", "guest_name", "guest_message",
+    "type", "status", "check_in", "check_out", "guest_count",
     "channel", "ts", "detected_intent", "channel_pretty", "property_address",
     "property_name", "guest_portal_url", "reservation_id", "sent_label",
     "checkbox_checked", "coach_prompt", "location", "fingerprint",
@@ -230,7 +230,7 @@ async def _improve_with_ai(payload: dict):
             if coach_prompt:
                 logging.info(f"[Slack] With coaching: {coach_prompt[:50]}...")
 
-            # CRITICAL: Get metadata from the view's private_metadata
+            # Get metadata for full context
             meta_str = view.get("private_metadata", "{}")
             logging.info(f"[Slack] Raw private_metadata: {meta_str[:200]}...")
             
@@ -240,25 +240,19 @@ async def _improve_with_ai(payload: dict):
                 logging.error(f"[Slack] Failed to parse private_metadata: {e}")
                 meta = {}
             
-            # Extract conv_id from multiple possible sources
-            conv_id = (
-                meta.get("conv_id") or 
-                meta.get("conversation_id") or 
-                data.get("conv_id") or 
-                data.get("conversation_id")
-            )
+            # Extract conversationId from metadata or button value
+            conversation_id = meta.get("conversationId") or data.get("conversationId")
             
-            logging.info(f"[Slack] Extracted conv_id: {conv_id}")
+            logging.info(f"[Slack] Extracted conversationId: {conversation_id}")
             logging.info(f"[Slack] Meta keys available: {list(meta.keys())}")
             
-            if not conv_id:
-                logging.error("[Slack] No conv_id found in metadata or button value!")
-                # Don't proceed without conv_id
+            if not conversation_id:
+                logging.error("[Slack] No conversationId found in metadata or button value!")
                 return
             
             # Build improved context with all necessary info
             improved_context = {
-                "conv_id": conv_id,
+                "conversationId": conversation_id,
                 "guest_message": data.get("guest_message") or meta.get("guest_message", ""),
                 "guest_name": meta.get("guest_name", "Guest"),
                 "property_name": meta.get("property_name"),
@@ -276,20 +270,13 @@ async def _improve_with_ai(payload: dict):
 
             logging.info(f"[Slack] Improved text: {improved_text[:50]}...")
 
-            # CRITICAL: Preserve ALL existing metadata and add new fields
-            # Start with a copy of existing metadata
+            # Preserve ALL existing metadata and add new fields
             updated_meta = meta.copy()
-            
-            # Add/update specific fields
             updated_meta["previous_draft"] = current_text
             updated_meta["coach_prompt"] = coach_prompt
-            updated_meta["conv_id"] = conv_id  # Explicitly ensure conv_id is set
-            
-            # Ensure conversation_id is also set for backward compatibility
-            if "conversation_id" not in updated_meta:
-                updated_meta["conversation_id"] = conv_id
+            updated_meta["conversationId"] = conversation_id  # Explicitly ensure conversationId is set
 
-            logging.info(f"[Slack] Updated meta conv_id: {updated_meta.get('conv_id')}")
+            logging.info(f"[Slack] Updated meta conversationId: {updated_meta.get('conversationId')}")
 
             # Rebuild modal with improved text
             guest_name = updated_meta.get("guest_name", "Guest")
@@ -342,7 +329,7 @@ async def _improve_with_ai(payload: dict):
                             "text": {"type": "plain_text", "text": "✨ Improve with AI"},
                             "action_id": "improve_with_ai",
                             "value": json.dumps({
-                                "conv_id": conv_id,
+                                "conversationId": conversation_id,
                                 "guest_message": updated_meta.get("guest_message", "")[:800]
                             }),
                         },
@@ -368,7 +355,6 @@ async def _improve_with_ai(payload: dict):
             # Pack metadata
             packed_meta = pack_private_meta(updated_meta)
             logging.info(f"[Slack] Packed metadata length: {len(packed_meta)} bytes")
-            logging.info(f"[Slack] Packed metadata preview: {packed_meta[:200]}...")
 
             # Update view
             updated_view = {
@@ -382,7 +368,7 @@ async def _improve_with_ai(payload: dict):
             }
 
             current_view = payload["view"]
-            logging.info(f"[Slack] Updating modal view {current_view['id']} with conv_id: {conv_id}")
+            logging.info(f"[Slack] Updating modal view {current_view['id']} with conversationId: {conversation_id}")
             result = slack_client.views_update(
                 view_id=current_view["id"],
                 hash=current_view.get("hash", ""),
@@ -527,13 +513,13 @@ async def _handle_modal_submit(payload: dict):
         # Extract metadata
         meta_str = payload.get("view", {}).get("private_metadata", "{}")
         meta = json.loads(meta_str) if meta_str else {}
-        conv_id = meta.get("conv_id") or meta.get("conversation_id")
+        conversation_id = meta.get("conversationId")
 
-        logging.info(f"[Slack] Modal submission - conv_id: {conv_id}, reply_text length: {len(reply_text) if reply_text else 0}")
+        logging.info(f"[Slack] Modal submission - conversationId: {conversation_id}, reply_text length: {len(reply_text) if reply_text else 0}")
 
         # Validate
-        if not conv_id:
-            logging.error("[Slack] No conversation ID in modal submission")
+        if not conversation_id:
+            logging.error("[Slack] No conversationId in modal submission")
             return JSONResponse({
                 "response_action": "errors",
                 "errors": {"reply_input": "Unable to send - missing conversation ID"}
@@ -547,8 +533,8 @@ async def _handle_modal_submit(payload: dict):
             })
 
         # Send to Hostaway
-        logging.info(f"[Slack] Sending message to Hostaway conversation {conv_id}...")
-        success = send_hostaway_reply(conv_id, reply_text.strip())
+        logging.info(f"[Slack] Sending message to Hostaway conversation {conversation_id}...")
+        success = send_hostaway_reply(conversation_id, reply_text.strip())
 
         if success:
             # Post confirmation to Slack
@@ -556,12 +542,12 @@ async def _handle_modal_submit(payload: dict):
                 channel=os.getenv("SLACK_CHANNEL"),
                 text=f"✅ Edited reply sent to guest:\n>{reply_text}",
             )
-            logging.info(f"[Slack] Modal message sent successfully to conversation {conv_id}")
+            logging.info(f"[Slack] Modal message sent successfully to conversation {conversation_id}")
 
             # Clear modal
             return JSONResponse({"response_action": "clear"})
         else:
-            logging.error(f"[Slack] Failed to send message to Hostaway for conversation {conv_id}")
+            logging.error(f"[Slack] Failed to send message to Hostaway for conversation {conversation_id}")
             return JSONResponse({
                 "response_action": "errors",
                 "errors": {"reply_input": "Failed to send message to Hostaway. Please try again."}
