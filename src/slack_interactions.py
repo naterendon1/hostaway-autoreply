@@ -491,10 +491,15 @@ async def _send_reply(payload: dict, action_id: str):
     try:
         action = payload.get("actions", [{}])[0]
         data = json.loads(action.get("value", "{}"))
-        conv_id = data.get("conv_id") or data.get("conversation_id")
+        
+        logging.info(f"[_send_reply] action_id: {action_id}")
+        logging.info(f"[_send_reply] Raw action value: {raw_value[:500]}")
+        
+        conv_id = data.get("conversation_id")
         reply_text = data.get("reply_text", "") or data.get("reply", "")
 
         if not conv_id or not reply_text:
+            logging.error(f"[_send_reply] Missing data - conversationId: {conversation_id}, reply_text: {bool(reply_text)}")
             raise ValueError("Missing conversation ID or message")
 
         send_hostaway_reply(conversation_id=conv_id, message=reply_text)
