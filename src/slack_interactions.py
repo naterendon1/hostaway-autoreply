@@ -230,14 +230,36 @@ async def _improve_with_ai(payload: dict):
             if coach_prompt:
                 logging.info(f"[Slack] With coaching: {coach_prompt[:50]}...")
 
-            # Get metadata for full context
+            # CRITICAL: Get metadata from the view's private_metadata
             meta_str = view.get("private_metadata", "{}")
-            meta = json.loads(meta_str) if meta_str else {}
+            logging.info(f"[Slack] Raw private_metadata: {meta_str[:200]}...")
+            
+            try:
+                meta = json.loads(meta_str) if meta_str else {}
+            except json.JSONDecodeError as e:
+                logging.error(f"[Slack] Failed to parse private_metadata: {e}")
+                meta = {}
+            
+            # Extract conv_id from multiple possible sources
+            conv_id = (
+                meta.get("conv_id") or 
+                meta.get("conversation_id") or 
+                data.get("conv_id") or 
+                data.get("conversation_id")
+            )
+            
+            logging.info(f"[Slack] Extracted conv_id: {conv_id}")
+            logging.info(f"[Slack] Meta keys available: {list(meta.keys())}")
+            
+            if not conv_id:
+                logging.error("[Slack] No conv_id found in metadata or button value!")
+                # Don't proceed without conv_id
+                return
             
             # Build improved context with all necessary info
             improved_context = {
-                "conv_id": data.get("conv_id") or meta.get("conv_id"),
-                "guest_message": data.get("guest_message") or meta.get("guest_message"),
+                "conv_id": conv_id,
+                "guest_message": data.get("guest_message") or meta.get("guest_message", ""),
                 "guest_name": meta.get("guest_name", "Guest"),
                 "property_name": meta.get("property_name"),
                 "check_in": meta.get("check_in"),
@@ -254,19 +276,30 @@ async def _improve_with_ai(payload: dict):
 
             logging.info(f"[Slack] Improved text: {improved_text[:50]}...")
 
-            # Store previous draft for undo
-            meta["previous_draft"] = current_text
-            meta["coach_prompt"] = coach_prompt
+            # CRITICAL: Preserve ALL existing metadata and add new fields
+            # Start with a copy of existing metadata
+            updated_meta = meta.copy()
+            
+            # Add/update specific fields
+            updated_meta["previous_draft"] = current_text
+            updated_meta["coach_prompt"] = coach_prompt
+            updated_meta["conv_id"] = conv_id  # Explicitly ensure conv_id is set
+            
+            # Ensure conversation_id is also set for backward compatibility
+            if "conversation_id" not in updated_meta:
+                updated_meta["conversation_id"] = conv_id
+
+            logging.info(f"[Slack] Updated meta conv_id: {updated_meta.get('conv_id')}")
 
             # Rebuild modal with improved text
-            guest_name = meta.get("guest_name", "Guest")
+            guest_name = updated_meta.get("guest_name", "Guest")
 
             # Build header
             header_text = (
                 f"*✉️ Message from {guest_name}*\n"
-                f"🏡 *Property:* {meta.get('property_name', 'Unknown')}\n"
-                f"📅 *Dates:* {meta.get('check_in', 'N/A')} → {meta.get('check_out', 'N/A')}\n"
-                f"👥 *Guests:* {meta.get('guest_count', '?')} | *Status:* {meta.get('status', 'N/A')}\n"
+                f"🏡 *Property:* {updated_meta.get('property_name', 'Unknown')}\n"
+                f"📅 *Dates:* {updated_meta.get('check_in', 'N/A')} → {updated_meta.get('check_out', 'N/A')}\n"
+                f"👥 *Guests:* {updated_meta.get('guest_count', '?')} | *Status:* {updated_meta.get('status', 'N/A')}\n"
             )
 
             # Build modal blocks
@@ -309,8 +342,8 @@ async def _improve_with_ai(payload: dict):
                             "text": {"type": "plain_text", "text": "✨ Improve with AI"},
                             "action_id": "improve_with_ai",
                             "value": json.dumps({
-                                "conv_id": meta.get("conv_id"),
-                                "guest_message": meta.get("guest_message", "")[:800]
+                                "conv_id": conv_id,
+                                "guest_message": updated_meta.get("guest_message", "")[:800]
                             }),
                         },
                     ],
@@ -318,7 +351,7 @@ async def _improve_with_ai(payload: dict):
             ]
 
             # Add Undo button if we have a previous draft
-            if meta.get("previous_draft"):
+            if updated_meta.get("previous_draft"):
                 blocks.append({
                     "type": "actions",
                     "block_id": "undo_actions",
@@ -327,10 +360,15 @@ async def _improve_with_ai(payload: dict):
                             "type": "button",
                             "text": {"type": "plain_text", "text": "↩️ Undo AI"},
                             "action_id": "undo_ai",
-                            "value": json.dumps({"previous_draft": meta["previous_draft"]}),
+                            "value": json.dumps({"previous_draft": updated_meta["previous_draft"]}),
                         }
                     ]
                 })
+
+            # Pack metadata
+            packed_meta = pack_private_meta(updated_meta)
+            logging.info(f"[Slack] Packed metadata length: {len(packed_meta)} bytes")
+            logging.info(f"[Slack] Packed metadata preview: {packed_meta[:200]}...")
 
             # Update view
             updated_view = {
@@ -339,12 +377,12 @@ async def _improve_with_ai(payload: dict):
                 "title": {"type": "plain_text", "text": "Edit AI Reply"},
                 "submit": {"type": "plain_text", "text": "Send"},
                 "close": {"type": "plain_text", "text": "Cancel"},
-                "private_metadata": pack_private_meta(meta),
+                "private_metadata": packed_meta,
                 "blocks": blocks,
             }
 
             current_view = payload["view"]
-            logging.info(f"[Slack] Updating modal view {current_view['id']}...")
+            logging.info(f"[Slack] Updating modal view {current_view['id']} with conv_id: {conv_id}")
             result = slack_client.views_update(
                 view_id=current_view["id"],
                 hash=current_view.get("hash", ""),
