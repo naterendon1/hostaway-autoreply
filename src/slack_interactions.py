@@ -495,7 +495,7 @@ async def _send_reply(payload: dict, action_id: str):
         logging.info(f"[_send_reply] action_id: {action_id}")
         logging.info(f"[_send_reply] Raw action value: {raw_value[:500]}")
 
-        data = json.loads(action.get("value", "{}"))
+        data = json.loads(raw_value)
 
         logging.info(f"[_send_reply] Parsed data keys: {list(data.keys())}")
         
@@ -506,7 +506,7 @@ async def _send_reply(payload: dict, action_id: str):
         logging.info(f"[_send_reply] reply_text length: {len(reply_text) if reply_text else 0}")
 
 
-        if not conv_id or not reply_text:
+        if not conversation_id or not reply_text:
             logging.error(f"[_send_reply] Missing data - conversationId: {conversation_id}, reply_text: {bool(reply_text)}")
             raise ValueError("Missing conversation ID or message")
 
