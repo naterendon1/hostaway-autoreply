@@ -184,14 +184,24 @@ async def _open_edit_modal(payload: dict):
     """Opens an edit modal to modify AI's suggested reply."""
     trigger_id = payload.get("trigger_id")
     action = payload.get("actions", [{}])[0]
-    data = json.loads(action.get("value", "{}"))
-
+    
+    # ADD DEBUGGING
+    raw_value = action.get("value", "{}")
+    logging.info(f"[_open_edit_modal] Raw button value: {raw_value[:500]}")
+    
+    data = json.loads(raw_value)
+    
+    # ADD MORE DEBUGGING
+    logging.info(f"[_open_edit_modal] Parsed data keys: {list(data.keys())}")
+    logging.info(f"[_open_edit_modal] conversationId in data: {data.get('conversationId')}")
+    logging.info(f"[_open_edit_modal] meta in data: {data.get('meta')}")
+    
     # Add fingerprint for deduplication
     container = payload.get("container", {}) or {}
     channel_id = container.get("channel_id") or (payload.get("channel") or {}).get("id")
     message_ts = container.get("message_ts") or (payload.get("message") or {}).get("ts")
 
-    data["fingerprint"] = f"{channel_id}|{message_ts}|{data.get('conv_id','')}|{uuid.uuid4()}"
+    data["fingerprint"] = f"{channel_id}|{message_ts}|{data.get('conversationId','')}|{uuid.uuid4()}"
     data["channel"] = channel_id
     data["ts"] = message_ts
 
@@ -201,7 +211,6 @@ async def _open_edit_modal(payload: dict):
     except Exception as e:
         logging.error(f"[Slack] Failed to open edit modal: {e}")
         return JSONResponse({"error": "modal_open_failed"}, status_code=500)
-
 
 # ---------------- Improve with AI ----------------
 async def _improve_with_ai(payload: dict):
