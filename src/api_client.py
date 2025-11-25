@@ -88,3 +88,35 @@ def fetch_hostaway_conversation(conversation_id: int):
     except Exception as e:
         logging.error(f"[api_client] fetch_hostaway_conversation failed: {e}")
         return {}
+
+def fetch_conversation_messages(conversation_id: int, limit: int = 50) -> list:
+    """
+    Fetch all messages from a Hostaway conversation.
+    
+    Returns list of messages sorted by date (oldest first).
+    """
+    url = f"{HOSTAWAY_API_BASE}/conversations/{conversation_id}/messages"
+    headers = {"Authorization": f"Bearer {HOSTAWAY_ACCESS_TOKEN}"}
+    
+    try:
+        response = requests.get(
+            url, 
+            headers=headers,
+            params={"limit": limit, "includeScheduledMessages": 0},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            messages = data.get("result", [])
+            
+            # Sort by insertedOn (oldest first)
+            messages.sort(key=lambda m: m.get("insertedOn", ""))
+            
+            return messages
+        else:
+            logging.error(f"Failed to fetch messages: {response.status_code}")
+            return []
+    except Exception as e:
+        logging.error(f"Error fetching messages: {e}")
+        return []
