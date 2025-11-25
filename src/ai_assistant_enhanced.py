@@ -283,15 +283,7 @@ def generate_smart_reply(
     context: Dict[str, Any]
 ) -> str:
     """
-    Generate a reply using the enhanced assistant with full Hostaway context.
-    
-    Args:
-        conversation_id: Hostaway conversation ID
-        guest_message: The guest's latest message
-        context: Dict with reservation_id, listing_id, conversation_id, etc.
-    
-    Returns:
-        AI-generated reply in your voice
+    Generate a reply using the enhanced assistant with FULL conversation history.
     """
     fallback = "Thanks for reaching out! Let me look into that and get back to you shortly."
 
@@ -306,18 +298,35 @@ def generate_smart_reply(
             logging.error("[assistant] Failed to get/create thread")
             return fallback
 
+        # 🆕 FETCH FULL CONVERSATION HISTORY FROM HOSTAWAY
+        from src.api_client import fetch_conversation_messages
+        
+        messages = fetch_conversation_messages(int(conversation_id))
+        conversation_history = format_conversation_history(messages)
+        
+        logging.info(f"[assistant] Loaded {len(messages)} messages from Hostaway")
+
         # Build rich context from Hostaway API
         rich_context = build_rich_context(context)
         
-        # Combine guest message with context
-        full_message = f"""{rich_context}
+        # Combine everything
+        full_message = f"""{conversation_history}
 
-=== GUEST'S NEW MESSAGE ===
+{rich_context}
+
+=== GUEST'S NEW MESSAGE (needs reply) ===
 {guest_message}
 
 ---
-Remember: You are the HOST responding to this guest. Use the REAL information above.
-Keep it friendly, brief, and natural. No placeholders - use actual details from above."""
+IMPORTANT CONTEXT:
+- You are responding as the property manager/host
+- The conversation history above shows ALL previous messages
+- Consider the full context when crafting your reply
+- Reference earlier topics if relevant
+- Keep your reply natural and conversational
+- Use REAL information from the context above
+
+Remember: You are the HOST responding to this guest. No placeholders - use actual details."""
 
         # Add message to thread
         client.beta.threads.messages.create(
@@ -406,3 +415,106 @@ def _wait_for_run_completion(thread_id: str, run_id: str, timeout: int = 30) -> 
 
     logging.error(f"[assistant] Run timed out after {timeout}s")
     return None
+
+def format_conversation_history(messages: list) -> str:
+    """
+    Format Hostaway messages into readable conversation history.
+    
+    Args:
+        messages: List of Hostaway message objects
+    
+    Returns:
+        Formatted string for AI context
+    """
+    if not messages:
+        return "No previous messages in this conversation."
+    
+    lines = ["=== CONVERSATION HISTORY ===\n"]
+    
+    for msg in messages:
+        # isIncoming: 0 = host, 1 = guest
+        sender = "Guest" if msg.get("isIncoming") == 1 else "You (Host)"
+        body = msg.get("body", "").strip()
+        timestamp = msg.get("insertedOn", "")
+        
+        if body:
+            # Format: [2025-01-15 10:30] Guest: What time is check-in?
+            date_str = timestamp[:16] if timestamp else "Unknown"
+            lines.append(f"[{date_str}] {sender}: {body}")
+    
+    lines.append("\n=== END OF HISTORY ===")
+    
+    return "\n".join(lines)
+
+
+def analyze_conversation_mood_and_summary(messages: list) -> tuple:
+    """
+    Analyze conversation history to determine mood and summary.
+    Uses OpenAI to intelligently assess the conversation.
+    
+    Args:
+        messages: List of Hostaway message objects
+    
+    Returns:
+        Tuple of (mood, summary)
+    """
+    if not messages or not client:
+        return "Neutral", "No conversation history available."
+    
+    # Format conversation
+    history = format_conversation_history(messages)
+    
+    # Get the latest guest message
+    guest_messages = [m for m in messages if m.get("isIncoming") == 1]
+    latest_guest_msg = guest_messages[-1].get("body", "") if guest_messages else ""
+    
+    try:
+        # Use a simple completion (not assistant) for analysis
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You analyze guest conversations for a property manager. "
+                        "Assess the guest's mood and summarize the conversation. "
+                        "Be concise and accurate."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"{history}\n\n"
+                        "Based on this conversation:\n"
+                        "1. What is the guest's current mood? (one word: happy, excited, confused, frustrated, concerned, neutral, urgent)\n"
+                        "2. Summarize the conversation in one sentence (max 15 words)\n\n"
+                        "Format:\n"
+                        "Mood: [mood]\n"
+                        "Summary: [summary]"
+                    )
+                }
+            ],
+            temperature=0.3,
+            max_tokens=100
+        )
+        
+        result = response.choices[0].message.content.strip()
+        
+        # Parse response
+        mood = "Neutral"
+        summary = "Conversation in progress"
+        
+        if "Mood:" in result and "Summary:" in result:
+            try:
+                mood = result.split("Mood:")[1].split("Summary:")[0].strip()
+                summary = result.split("Summary:")[1].strip()
+            except Exception:
+                pass
+        
+        logging.info(f"[Analysis] Mood: {mood}, Summary: {summary}")
+        
+        return mood, summary
+    
+    except Exception as e:
+        logging.error(f"[Analysis] Error: {e}")
+        return "Neutral", "Unable to analyze conversation"
