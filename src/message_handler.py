@@ -49,6 +49,17 @@ async def unified_webhook(request: Request):
         return {"status": "ignored"}
 
     conv_id = data.get("conversationId")
+    # 🆕 Fetch FULL conversation history
+    from src.api_client import fetch_conversation_messages
+    messages = fetch_conversation_messages(conv_id)
+    
+    # 🆕 Analyze with full history
+    from src.ai_assistant_enhanced import analyze_conversation_mood_and_summary
+    try:
+        mood, summary = analyze_conversation_mood_and_summary(messages)
+    except Exception as e:
+        logging.error(f"[AI] analyze failed: {e}")
+        mood, summary = "Neutral", "Summary unavailable."
     reservation_id = data.get("reservationId")
     listing_id = data.get("listingMapId")
 
