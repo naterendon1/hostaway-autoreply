@@ -120,117 +120,139 @@ async def unified_webhook(request: Request):
     # -------------------------------------------------------------------
     # Format Slack Message (emoji-rich) WITH GUEST PHOTO 📸
     # -------------------------------------------------------------------
-    checkin_fmt = (
-        datetime.strptime(check_in, "%Y-%m-%d").strftime("%b %d")
-        if check_in else "N/A"
-    )
-    checkout_fmt = (
-        datetime.strptime(check_out, "%Y-%m-%d").strftime("%b %d")
-        if check_out else "N/A"
-    )
+    # Map platform names to friendly versions
+platform_map = {
+    "airbnbOfficial": "Airbnb",
+    "airbnb": "Airbnb",
+    "vrboical": "VRBO",
+    "vrbo": "VRBO",
+    "direct": "Direct Booking",
+    "bookingengine": "Booking Engine",
+    "google": "Google",
+    "bookingcom": "Booking.com",
+    "expedia": "Expedia",
+    "partner": "Partner Channel"
+}
+friendly_platform = platform_map.get(platform.lower(), platform)
 
-    header_text = (
-        f"*✉️ Message from {guest_name}*\n"
-        f"🏡 *Property:* {property_name} — {property_address}\n"
-        f"📅 *Dates:* {checkin_fmt} → {checkout_fmt}\n"
-        f"👥 *Guests:* {guest_count} | Status: *{status}* | Platform: *{platform}*\n"
-        f"🧠 *Mood:* {mood}\n"
-        f"📝 *Summary:* {summary}\n\n"
-        f"💬 *Guest Message:*\n{guest_message}"
-    )
+# Format dates with year
+checkin_fmt = (
+    datetime.strptime(check_in, "%Y-%m-%d").strftime("%b %d, %Y")
+    if check_in else "N/A"
+)
+checkout_fmt = (
+    datetime.strptime(check_out, "%Y-%m-%d").strftime("%b %d, %Y")
+    if check_out else "N/A"
+)
 
-    suggestion_text = f"💡 *Suggested Reply:*\n{ai_reply}"
+# Build visually appealing header
+header_text = (
+    f"*✉️ New Message from {guest_name}*\n\n"
+    f"🏠 *{property_address}*\n"
+    f"📅 {checkin_fmt} → {checkout_fmt}\n"
+    f"👥 {guest_count} guest{'s' if str(guest_count) != '1' else ''} • _{status}_ • via *{friendly_platform}*"
+)
 
-    # Add local recs (optional)
-    if nearby_places:
-        recs_lines = []
-        for p in nearby_places[:3]:
-            line = f"• {p['name']} ({p['type']})"
-            # Add travel time if available
-            if p.get('travel_time'):
-                line += f" - {p['travel_time']} away"
-            elif p.get('distance'):
-                line += f" - {p['distance']} away"
-            recs_lines.append(line)
-        recs_text = "\n".join(recs_lines)
-        suggestion_text += f"\n\n📍 *Nearby Recommendations:*\n{recs_text}"
+# Only add mood if it's not "Neutral"
+if mood and mood != "Neutral":
+    header_text += f"\n😊 _{mood}_"
 
-    # 🆕 BUILD BLOCKS WITH GUEST PHOTO
-    blocks = []
-    
-    # Add header section with guest photo as accessory (if available)
-    if guest_photo:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": header_text},
-            "accessory": {
-                "type": "image",
-                "image_url": guest_photo,
-                "alt_text": f"Photo of {guest_name}"
-            }
-        })
-    else:
-        # Fallback if no photo available
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": header_text}
-        })
-    
-    # Add divider and suggestion
-    blocks.extend([
-        {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": suggestion_text}},
-        {
-            "type": "actions",
-            "block_id": "action_buttons",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Send"},
-                    "style": "primary",
-                    "action_id": "send_reply",
-                    "value": json.dumps({
-                        "conversationId": conv_id,
-                        "reply_text": ai_reply,
-                        "guest_message": guest_message,
-                    }),
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Edit"},
-                    "action_id": "open_edit_modal",
-                    "value": json.dumps({
+# Only add summary if it's meaningful
+if summary and summary not in ("Summary unavailable.", "No summary available.", ""):
+    header_text += f"\n💭 _{summary}_"
+
+# Guest message in code block for visual separation
+suggestion_text = f"\n\n*💬 Guest Message:*\n```{guest_message}```\n\n*✨ Suggested Reply:*\n{ai_reply}"
+
+# Add local recs (optional)
+if nearby_places:
+    recs_lines = []
+    for p in nearby_places[:3]:
+        line = f"• *{p['name']}* ({p['type']})"
+        # Add travel time if available
+        if p.get('travel_time'):
+            line += f" — _{p['travel_time']} away_"
+        elif p.get('distance'):
+            line += f" — _{p['distance']} away_"
+        recs_lines.append(line)
+    recs_text = "\n".join(recs_lines)
+    suggestion_text += f"\n\n📍 *Nearby Recommendations:*\n{recs_text}"
+
+# 🆕 BUILD BLOCKS WITH GUEST PHOTO
+blocks = []
+
+# Add header section with guest photo as accessory (if available)
+if guest_photo:
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": header_text},
+        "accessory": {
+            "type": "image",
+            "image_url": guest_photo,
+            "alt_text": f"Photo of {guest_name}"
+        }
+    })
+else:
+    # Fallback if no photo available
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": header_text}
+    })
+
+# Add divider and suggestion
+blocks.extend([
+    {"type": "divider"},
+    {"type": "section", "text": {"type": "mrkdwn", "text": suggestion_text}},
+    {
+        "type": "actions",
+        "block_id": "action_buttons",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✅ Send", "emoji": True},
+                "style": "primary",
+                "action_id": "send_reply",
+                "value": json.dumps({
+                    "conversationId": conv_id,
+                    "reply_text": ai_reply,
+                    "guest_message": guest_message,
+                }),
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✏️ Edit", "emoji": True},
+                "action_id": "open_edit_modal",
+                "value": json.dumps({
+                    "conversationId": conv_id,
+                    "guest_name": guest_name,
+                    "guest_message": guest_message,
+                    "draft_text": ai_reply,
+                    "meta": {
                         "conversationId": conv_id,
                         "guest_name": guest_name,
-                        "guest_message": guest_message,
-                        "draft_text": ai_reply,
-                        "meta": {  # ADD THIS WHOLE META OBJECT
-                            "conversationId": conv_id,
-                            "guest_name": guest_name,
-                            "property_name": property_name,
-                            "property_address": property_address,
-                            "check_in": check_in,
-                            "check_out": check_out,
-                            "guest_count": guest_count,
-                            "status": status,
-                            "platform": platform,
-                         }
-                    }),
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Send Guest Portal"},
-                    "action_id": "send_guest_portal",
-                    "value": json.dumps({
-                        "conversationId": conv_id,
-                        "guest_portal_url": res_data.get("guestPortalUrl"),
+                        "property_name": property_name,
+                        "property_address": property_address,
+                        "check_in": check_in,
+                        "check_out": check_out,
+                        "guest_count": guest_count,
                         "status": status,
-                    }),
-                },
-            ],
-        },
-    ])
-
+                        "platform": platform,
+                    }
+                }),
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "🔗 Portal", "emoji": True},
+                "action_id": "send_guest_portal",
+                "value": json.dumps({
+                    "conversationId": conv_id,
+                    "guest_portal_url": res_data.get("guestPortalUrl"),
+                    "status": status,
+                }),
+            },
+        ],
+    },
+])
     # -------------------------------------------------------------------
     # Post to Slack
     # -------------------------------------------------------------------
