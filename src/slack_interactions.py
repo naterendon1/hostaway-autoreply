@@ -81,7 +81,7 @@ def _background_improve_and_update(
 ):
     """Background thread to improve text with OpenAI and update modal"""
 
-    logging.info(f"[Background] Starting improvement for conversationId: {meta.get('conversationId')}")
+    logging.info(f"[Background] Starting improvement for conversationId: {meta.get('conv_id') or meta.get('conversationId')}")
 
     improved = edited_text
     error_message = None
@@ -169,7 +169,7 @@ Please improve this reply to be clearer, more concise, and more natural. Return 
         "coach_prompt": coach_prompt_text or ""
     }
 
-    logging.info(f"[Background] New meta conversationId: {new_meta.get('conversationId')}")
+    logging.info(f"[Background] New meta conversationId: {new_meta.get('conv_id') or new_meta.get('conversationId')}")
 
     # Build header
     header_text = (
@@ -219,7 +219,7 @@ Please improve this reply to be clearer, more concise, and more natural. Return 
                     "text": {"type": "plain_text", "text": "✨ Improve with AI"},
                     "action_id": "improve_with_ai",
                     "value": json.dumps({
-                        "conversationId": new_meta.get("conversationId"),
+                        "conv_id": new_meta.get("conv_id") or new_meta.get("conversationId"),
                         "guest_message": guest_msg[:800]
                     }),
                 },
@@ -327,7 +327,7 @@ def verify_slack_signature(
 
 # -------------------- Private Metadata Packing --------------------
 PRIVATE_META_KEYS = {
-    "conversationId", "listing_id", "guest_id", "guest_name", "guest_message",
+    "conv_id", "conversationId", "listing_id", "guest_id", "guest_name", "guest_message",
     "type", "status", "check_in", "check_out", "guest_count",
     "channel", "ts", "detected_intent", "channel_pretty", "property_address",
     "property_name", "guest_portal_url", "reservation_id", "sent_label",
@@ -451,6 +451,7 @@ async def _open_edit_modal(payload: dict):
 
     # ADD MORE DEBUGGING
     logging.info(f"[_open_edit_modal] Parsed data keys: {list(data.keys())}")
+    logging.info(f"[_open_edit_modal] conv_id in data: {data.get('conv_id')}")
     logging.info(f"[_open_edit_modal] conversationId in data: {data.get('conversationId')}")
     logging.info(f"[_open_edit_modal] meta in data: {data.get('meta')}")
 
@@ -459,7 +460,7 @@ async def _open_edit_modal(payload: dict):
     channel_id = container.get("channel_id") or (payload.get("channel") or {}).get("id")
     message_ts = container.get("message_ts") or (payload.get("message") or {}).get("ts")
 
-    data["fingerprint"] = f"{channel_id}|{message_ts}|{data.get('conversationId','')}|{uuid.uuid4()}"
+    data["fingerprint"] = f"{channel_id}|{message_ts}|{data.get('conv_id') or data.get('conversationId','')}|{uuid.uuid4()}"
     data["channel"] = channel_id
     data["ts"] = message_ts
 
@@ -505,8 +506,8 @@ async def _improve_with_ai(payload: dict):
             logging.error(f"[Slack] Failed to parse private_metadata: {e}")
             meta = {}
 
-        # Extract conversationId
-        conversation_id = meta.get("conversationId")
+        # Extract conversationId (using conv_id key)
+        conversation_id = meta.get("conv_id") or meta.get("conversationId")
         guest_name = meta.get("guest_name", "Guest")
         guest_message = meta.get("guest_message", "")
 
@@ -613,7 +614,7 @@ async def _undo_ai(payload: dict):
                         "type": "button",
                         "text": {"type": "plain_text", "text": "✨ Improve with AI"},
                         "action_id": "improve_with_ai",
-                        "value": json.dumps({"conversationId": meta.get("conversationId"), "guest_message": guest_message}),
+                        "value": json.dumps({"conv_id": meta.get("conv_id") or meta.get("conversationId"), "guest_message": guest_message}),
                     },
                 ],
             },
@@ -660,7 +661,7 @@ async def _send_reply(payload: dict, action_id: str):
 
         logging.info(f"[_send_reply] Parsed data keys: {list(data.keys())}")
 
-        conversation_id = data.get("conversationId")
+        conversation_id = data.get("conv_id") or data.get("conversationId")
         reply_text = data.get("reply_text", "") or data.get("reply", "")
 
         logging.info(f"[_send_reply] conversationId: {conversation_id}")
@@ -696,7 +697,7 @@ async def _handle_modal_submit(payload: dict):
         # Extract metadata
         meta_str = payload.get("view", {}).get("private_metadata", "{}")
         meta = json.loads(meta_str) if meta_str else {}
-        conversation_id = meta.get("conversationId")
+        conversation_id = meta.get("conv_id") or meta.get("conversationId")
 
         logging.info(f"[Slack] Modal submission - conversationId: {conversation_id}, reply_text length: {len(reply_text) if reply_text else 0}")
 
