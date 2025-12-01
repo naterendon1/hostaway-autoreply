@@ -49,17 +49,6 @@ async def unified_webhook(request: Request):
         return {"status": "ignored"}
 
     conv_id = data.get("conversationId")
-    # 🆕 Fetch FULL conversation history
-    from src.api_client import fetch_conversation_messages
-    messages = fetch_conversation_messages(conv_id)
-    
-    # 🆕 Analyze with full history
-    from src.ai_assistant_enhanced import analyze_conversation_mood_and_summary
-    try:
-        mood, summary = analyze_conversation_mood_and_summary(messages)
-    except Exception as e:
-        logging.error(f"[AI] analyze failed: {e}")
-        mood, summary = "Neutral", "Summary unavailable."
     reservation_id = data.get("reservationId")
     listing_id = data.get("listingMapId")
 
@@ -131,67 +120,44 @@ async def unified_webhook(request: Request):
     # -------------------------------------------------------------------
     # Format Slack Message (emoji-rich) WITH GUEST PHOTO 📸
     # -------------------------------------------------------------------
-    # Map platform names to friendly versions
-    platform_map = {
-        "airbnbOfficial": "Airbnb",
-        "airbnb": "Airbnb",
-        "vrboical": "VRBO",
-        "vrbo": "VRBO",
-        "direct": "Direct Booking",
-        "bookingengine": "Booking Engine",
-        "google": "Google",
-        "bookingcom": "Booking.com",
-        "expedia": "Expedia",
-        "partner": "Partner Channel"
-    }
-    friendly_platform = platform_map.get(platform.lower(), platform)
-
-    # Format dates with year
     checkin_fmt = (
-        datetime.strptime(check_in, "%Y-%m-%d").strftime("%b %d, %Y")
+        datetime.strptime(check_in, "%Y-%m-%d").strftime("%b %d")
         if check_in else "N/A"
     )
     checkout_fmt = (
-        datetime.strptime(check_out, "%Y-%m-%d").strftime("%b %d, %Y")
+        datetime.strptime(check_out, "%Y-%m-%d").strftime("%b %d")
         if check_out else "N/A"
     )
 
-    # Build visually appealing header
     header_text = (
-        f"*✉️ New Message from {guest_name}*\n\n"
-        f"🏠 *{property_address}*\n"
-        f"📅 {checkin_fmt} → {checkout_fmt}\n"
-        f"👥 {guest_count} guest{'s' if str(guest_count) != '1' else ''} • _{status}_ • via *{friendly_platform}*"
+        f"*✉️ Message from {guest_name}*\n"
+        f"🏡 *Property:* {property_name} — {property_address}\n"
+        f"📅 *Dates:* {checkin_fmt} → {checkout_fmt}\n"
+        f"👥 *Guests:* {guest_count} | Status: *{status}* | Platform: *{platform}*\n"
+        f"🧠 *Mood:* {mood}\n"
+        f"📝 *Summary:* {summary}\n\n"
+        f"💬 *Guest Message:*\n{guest_message}"
     )
 
-    # Only add mood if it's not "Neutral"
-    if mood and mood != "Neutral":
-        header_text += f"\n😊 _{mood}_"
-
-    # Only add summary if it's meaningful
-    if summary and summary not in ("Summary unavailable.", "No summary available.", ""):
-        header_text += f"\n💭 _{summary}_"
-
-    # Guest message in code block for visual separation
-    suggestion_text = f"\n\n*💬 Guest Message:*\n```{guest_message}```\n\n*✨ Suggested Reply:*\n{ai_reply}"
+    suggestion_text = f"💡 *Suggested Reply:*\n{ai_reply}"
 
     # Add local recs (optional)
     if nearby_places:
         recs_lines = []
         for p in nearby_places[:3]:
-            line = f"• *{p['name']}* ({p['type']})"
+            line = f"• {p['name']} ({p['type']})"
             # Add travel time if available
             if p.get('travel_time'):
-                line += f" — _{p['travel_time']} away_"
+                line += f" - {p['travel_time']} away"
             elif p.get('distance'):
-                line += f" — _{p['distance']} away_"
+                line += f" - {p['distance']} away"
             recs_lines.append(line)
         recs_text = "\n".join(recs_lines)
         suggestion_text += f"\n\n📍 *Nearby Recommendations:*\n{recs_text}"
 
     # 🆕 BUILD BLOCKS WITH GUEST PHOTO
     blocks = []
-
+    
     # Add header section with guest photo as accessory (if available)
     if guest_photo:
         blocks.append({
@@ -209,7 +175,7 @@ async def unified_webhook(request: Request):
             "type": "section",
             "text": {"type": "mrkdwn", "text": header_text}
         })
-
+    
     # Add divider and suggestion
     blocks.extend([
         {"type": "divider"},
@@ -220,26 +186,26 @@ async def unified_webhook(request: Request):
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Send", "emoji": True},
+                    "text": {"type": "plain_text", "text": "Send"},
                     "style": "primary",
                     "action_id": "send_reply",
                     "value": json.dumps({
-                        "conversationId": conv_id,
+                        "conversation_id": conv_id,
                         "reply_text": ai_reply,
                         "guest_message": guest_message,
                     }),
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✏️ Edit", "emoji": True},
+                    "text": {"type": "plain_text", "text": "Edit"},
                     "action_id": "open_edit_modal",
                     "value": json.dumps({
-                        "conversationId": conv_id,
+                        "conv_id": conv_id,
                         "guest_name": guest_name,
                         "guest_message": guest_message,
                         "draft_text": ai_reply,
                         "meta": {
-                            "conversationId": conv_id,
+                            "conv_id": conv_id,
                             "guest_name": guest_name,
                             "property_name": property_name,
                             "property_address": property_address,
@@ -253,10 +219,10 @@ async def unified_webhook(request: Request):
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "🔗 Portal", "emoji": True},
+                    "text": {"type": "plain_text", "text": "Send Guest Portal"},
                     "action_id": "send_guest_portal",
                     "value": json.dumps({
-                        "conversationId": conv_id,
+                        "conversation_id": conv_id,
                         "guest_portal_url": res_data.get("guestPortalUrl"),
                         "status": status,
                     }),
@@ -264,6 +230,7 @@ async def unified_webhook(request: Request):
             ],
         },
     ])
+
     # -------------------------------------------------------------------
     # Post to Slack
     # -------------------------------------------------------------------
