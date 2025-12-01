@@ -266,24 +266,30 @@ Please improve this reply to be clearer, more concise, and more natural. Return 
 
     try:
         logging.info("[Background] Updating modal with improved text...")
-        if hash_value:
-            resp = slack_client.views_update(view_id=view_id, hash=hash_value, view=final_view)
-        else:
-            resp = slack_client.views_update(view_id=view_id, view=final_view)
+        try:
+            # Try with hash first for optimistic locking
+            if hash_value:
+                resp = slack_client.views_update(view_id=view_id, hash=hash_value, view=final_view)
+            else:
+                resp = slack_client.views_update(view_id=view_id, view=final_view)
 
-        if not resp.get("ok"):
-            logging.error(f"[Background] views_update failed: {resp.get('error')}")
-            try:
-                slack_client.views_update(view_id=view_id, view=final_view)
-            except Exception as e2:
-                logging.error(f"[Background] Retry failed: {e2}")
+            if not resp.get("ok"):
+                logging.error(f"[Background] views_update failed: {resp.get('error')}")
+
+        except Exception as e:
+            # Hash conflict or other error - retry without hash
+            error_msg = str(e)
+            if "hash_conflict" in error_msg:
+                logging.warning("[Background] Hash conflict detected, retrying without hash...")
+            else:
+                logging.error(f"[Background] views_update error: {e}")
+
+            # Retry without hash to force update
+            slack_client.views_update(view_id=view_id, view=final_view)
+            logging.info("[Background] Modal updated successfully after retry")
 
     except Exception as e:
-        logging.error(f"[Background] Exception updating view: {e}", exc_info=True)
-        try:
-            slack_client.views_update(view_id=view_id, view=final_view)
-        except Exception as e2:
-            logging.error(f"[Background] Final retry failed: {e2}")
+        logging.error(f"[Background] Failed to update modal after all retries: {e}", exc_info=True)
 
 router = APIRouter()
 slack_interactions_bp = router
@@ -512,9 +518,31 @@ async def _improve_with_ai(payload: dict):
         guest_message = meta.get("guest_message", "")
 
         logging.info(f"[Slack] Extracted conversationId: {conversation_id}")
+        logging.info(f"[Slack] Full metadata keys: {list(meta.keys())}")
+        logging.info(f"[Slack] Full metadata: {meta}")
 
         if not conversation_id:
             logging.error("[Slack] No conversationId found in metadata!")
+            logging.error(f"[Slack] conv_id value: {meta.get('conv_id')}, conversationId value: {meta.get('conversationId')}")
+
+            # Try to show error to user
+            try:
+                error_view = {
+                    "type": "modal",
+                    "callback_id": "edit_modal_submit",
+                    "title": {"type": "plain_text", "text": "Error"},
+                    "close": {"type": "plain_text", "text": "Close"},
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn", "text": "❌ *Error: No conversation ID found*\n\nThis message cannot be improved because the conversation ID is missing. This might be a test message or draft that hasn't been linked to a Hostaway conversation yet."}
+                        }
+                    ],
+                }
+                slack_client.views_update(view_id=view_id, hash=hash_value, view=error_view)
+            except Exception as e:
+                logging.error(f"[Slack] Failed to show error modal: {e}")
+
             return JSONResponse({"ok": True})
 
         # Update modal to show "Improving..." immediately
@@ -538,11 +566,11 @@ async def _improve_with_ai(payload: dict):
         except Exception as e:
             logging.error(f"[Slack] Error showing improving state: {e}")
 
-        # Start background thread
+        # Start background thread (pass None for hash since we just updated the modal)
         logging.info("[Slack] Starting background improvement thread...")
         threading.Thread(
             target=_background_improve_and_update,
-            args=(view_id, hash_value, meta, current_text, coach_prompt, guest_name, guest_message),
+            args=(view_id, None, meta, current_text, coach_prompt, guest_name, guest_message),
             daemon=True
         ).start()
 
