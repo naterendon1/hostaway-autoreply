@@ -51,30 +51,73 @@ Write a helpful reply:
 
 
 # -------------------- Improve Message --------------------
-def improve_message_with_ai(text: str, context: Dict[str, Any]) -> str:
-    """Improve an existing message with clarity and tone."""
+def improve_message_with_ai(
+    text: str,
+    user_instructions: str,
+    context: Dict[str, Any]
+) -> str:
+    """
+    Improve an existing message based on specific user instructions.
+
+    Args:
+        text: The draft reply to improve
+        user_instructions: What the user wants changed (tone, content, style, complete rewrite, etc.)
+        context: Additional context like guest_message, conversation_thread, property_info, etc.
+
+    Returns:
+        The improved message based on user instructions
+    """
     if not client:
         return text
 
+    # Build conversation context if available
     guest_message = context.get("guest_message", "")
-    prompt = f"""
-Guest said: "{guest_message}"
+    conversation_thread = context.get("conversation_thread", [])
 
-Your draft reply:
+    # Format conversation history if it exists (last 5 messages for context)
+    thread_text = ""
+    if conversation_thread and len(conversation_thread) > 0:
+        thread_text = "Previous conversation:\n" + "\n".join(
+            [f"{m.get('sender', 'Guest')}: {m.get('body', '')}"
+             for m in conversation_thread[-5:]]
+        ) + "\n\n"
+
+    system_prompt = """You are an expert assistant helping hosts craft perfect guest replies.
+
+Your job is to take a draft message and modify it EXACTLY as the user requests. The user knows what they want - follow their instructions precisely.
+
+Common requests might include:
+- Changing the tone (more formal, casual, friendly, professional, apologetic, etc.)
+- Adding or removing specific information
+- Making it shorter or more detailed
+- Completely rewriting with different approach
+- Fixing factual errors or wrong assumptions
+- Adjusting formality level
+- Adding or removing emojis
+- Being more direct or more diplomatic
+
+Always preserve important details like dates, prices, check-in times, and policies unless specifically asked to change them.
+Keep the message natural and conversational unless asked otherwise."""
+
+    user_prompt = f"""{thread_text}Most recent guest message:
+"{guest_message}"
+
+Current draft reply:
 {text}
 
-Improve this reply to sound more clear, concise, friendly, and natural.
-Do not add greetings or sign-offs.
-"""
+USER'S IMPROVEMENT REQUEST:
+{user_instructions}
+
+Please rewrite the reply following the user's instructions exactly:"""
 
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are an assistant editing guest replies for clarity and tone."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
-            temperature=0.6,
+            temperature=0.7,  # Slightly higher for more creative rewrites
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
