@@ -34,7 +34,7 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI
 def clean_ai_reply(text: str, guest_msg: str) -> str:
     """Clean up AI-generated reply"""
     text = text.strip()
-    
+
     # Remove greeting if it starts with one
     greetings = ["hi", "hello", "hey", "dear"]
     first_word = text.split()[0].lower().rstrip(",!") if text.split() else ""
@@ -43,7 +43,7 @@ def clean_ai_reply(text: str, guest_msg: str) -> str:
             text = ".".join(text.split(".")[1:]).strip()
         elif "\n" in text:
             text = "\n".join(text.split("\n")[1:]).strip()
-    
+
     # Remove sign-offs
     sign_offs = ["best", "regards", "sincerely", "thanks", "thank you", "cheers"]
     lines = text.split("\n")
@@ -52,7 +52,7 @@ def clean_ai_reply(text: str, guest_msg: str) -> str:
         if any(s in last_line for s in sign_offs):
             lines = lines[:-1]
             text = "\n".join(lines).strip()
-    
+
     return text
 
 
@@ -61,12 +61,12 @@ def sanitize_ai_reply(text: str, guest_msg: str) -> str:
     # Remove excessive line breaks
     while "\n\n\n" in text:
         text = text.replace("\n\n\n", "\n\n")
-    
+
     # Remove emojis
     emoji_chars = ["😊", "👍", "🏠", "🎉", "✨", "💯", "🙏", "❤️", "⭐"]
     for emoji in emoji_chars:
         text = text.replace(emoji, "")
-    
+
     return text.strip()
 
 
@@ -80,38 +80,65 @@ def _background_improve_and_update(
     guest_msg: str,
 ):
     """Background thread to improve text with OpenAI and update modal"""
-    
+
     logging.info(f"[Background] Starting improvement for conversationId: {meta.get('conversationId')}")
-    
+
     improved = edited_text
     error_message = None
-    
+
     if not openai_client:
         error_message = "OpenAI key not configured; showing your original text."
         logging.warning("[Background] OpenAI client not configured")
     else:
-        sys = (
-            "You edit messages for a vacation-rental host. "
-            "Read the ENTIRE guest message. Do not introduce topics the guest didn't ask about. "
-            "If the guest mentions trash, accessibility, parking, check-in/out, or codes, focus on that. "
-            "Only include dining or local recommendations if the guest explicitly asks for places to eat/drink. "
-            "Keep meaning, improve tone and brevity. No greetings, no sign-offs, no emojis. "
-            "Style: concise, casual, easy to understand."
-        )
-        
-        user = (
-            "Guest message:\n"
-            f"{guest_msg}\n\n"
-            "Current draft reply (to improve, not to lengthen):\n"
-            f"{edited_text}\n\n"
-            "Coach prompt (host's instruction to adjust the reply):\n"
-            f"{(coach_prompt_text or '').strip() or '(none)'}\n\n"
-            "Rewrite the reply to satisfy the coach prompt if present, keep the same intent, and stay concise. "
-            "Return ONLY the rewritten reply."
-        )
-        
+        # NEW SYSTEM PROMPT - More flexible and instruction-following
+        sys = """You are an expert assistant helping vacation rental hosts craft perfect guest replies.
+
+Your job is to improve the draft reply based on the user's coaching instructions (if provided).
+
+If coaching instructions are provided, follow them EXACTLY. The host knows what they want.
+
+Common requests might include:
+- Changing the tone (more formal, casual, friendly, professional, apologetic, etc.)
+- Adding or removing specific information
+- Making it shorter or more detailed
+- Completely rewriting with different approach
+- Fixing factual errors or wrong assumptions
+
+IMPORTANT RULES:
+1. Read the ENTIRE guest message - don't introduce topics they didn't ask about
+2. If guest mentions trash, accessibility, parking, check-in/out, or codes, focus on that
+3. Only include dining/local recommendations if guest explicitly asks
+4. Keep the meaning, improve tone and brevity
+5. NO greetings, NO sign-offs, NO emojis
+6. Style: concise, casual, easy to understand
+7. Preserve important details like dates, prices, check-in times, policies unless asked to change them"""
+
+        # Build user prompt with coaching instructions prominently featured
+        if coach_prompt_text and coach_prompt_text.strip():
+            user = f"""Guest message:
+{guest_msg}
+
+Current draft reply:
+{edited_text}
+
+HOST'S IMPROVEMENT INSTRUCTIONS:
+{coach_prompt_text.strip()}
+
+Please rewrite the reply following the host's instructions exactly. Return ONLY the rewritten reply."""
+        else:
+            user = f"""Guest message:
+{guest_msg}
+
+Current draft reply (to improve, not to lengthen):
+{edited_text}
+
+Please improve this reply to be clearer, more concise, and more natural. Return ONLY the improved reply."""
+
         try:
             logging.info("[Background] Calling OpenAI API...")
+            if coach_prompt_text:
+                logging.info(f"[Background] With instructions: {coach_prompt_text[:100]}...")
+
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -121,19 +148,19 @@ def _background_improve_and_update(
                 temperature=0.7,
                 max_tokens=500
             )
-            
+
             improved = (response.choices[0].message.content or "").strip()
             logging.info(f"[Background] OpenAI response received (length={len(improved)})")
-            
+
             improved = clean_ai_reply(improved, guest_msg)
             improved = sanitize_ai_reply(improved, guest_msg)
-            
+
             logging.info(f"[Background] Cleaned improved text: {improved[:100]}...")
-            
+
         except Exception as e:
             logging.error(f"[Background] OpenAI error: {e}", exc_info=True)
             error_message = f"Error improving with AI: {str(e)}"
-    
+
     # Create new metadata with previous draft saved
     new_meta = {
         **meta,
@@ -141,9 +168,9 @@ def _background_improve_and_update(
         "improving": False,
         "coach_prompt": coach_prompt_text or ""
     }
-    
+
     logging.info(f"[Background] New meta conversationId: {new_meta.get('conversationId')}")
-    
+
     # Build header
     header_text = (
         f"*✉️ Message from {guest_name}*\n"
@@ -151,7 +178,7 @@ def _background_improve_and_update(
         f"📅 *Dates:* {new_meta.get('check_in', 'N/A')} → {new_meta.get('check_out', 'N/A')}\n"
         f"👥 *Guests:* {new_meta.get('guest_count', '?')} | *Status:* {new_meta.get('status', 'N/A')}\n"
     )
-    
+
     # Build modal blocks with improved text
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
@@ -171,14 +198,14 @@ def _background_improve_and_update(
             "type": "input",
             "block_id": "coach_prompt_block",
             "optional": True,
-            "label": {"type": "plain_text", "text": "Coach the AI (optional)"},
+            "label": {"type": "plain_text", "text": "Improve with AI Instructions (optional)"},
             "element": {
                 "type": "plain_text_input",
                 "action_id": "coach_prompt",
                 "multiline": True,
                 "placeholder": {
                     "type": "plain_text",
-                    "text": "Tell AI how to adjust (e.g., 'be more formal', 'mention parking')"
+                    "text": "Examples: 'Make more apologetic' • 'Too long, 2 sentences max' • 'Add check-in is at 3pm' • 'More professional tone' • 'Completely rewrite to..'"
                 },
                 **({"initial_value": coach_prompt_text} if coach_prompt_text else {})
             }
@@ -199,7 +226,7 @@ def _background_improve_and_update(
             ],
         },
     ]
-    
+
     # Add Undo button if we have previous draft
     if new_meta.get("previous_draft"):
         blocks.append({
@@ -214,13 +241,13 @@ def _background_improve_and_update(
                 }
             ]
         })
-    
+
     # Add error message if any
     if error_message:
         blocks = [
             {"type": "section", "text": {"type": "mrkdwn", "text": f":warning: *{error_message}*"}}
         ] + blocks
-    
+
     # Build final view
     final_view = {
         "type": "modal",
@@ -231,26 +258,26 @@ def _background_improve_and_update(
         "private_metadata": pack_private_meta(new_meta),
         "blocks": blocks,
     }
-    
+
     # Update the modal
     if not slack_client:
         logging.error("[Background] Slack client not initialized")
         return
-    
+
     try:
         logging.info("[Background] Updating modal with improved text...")
         if hash_value:
             resp = slack_client.views_update(view_id=view_id, hash=hash_value, view=final_view)
         else:
             resp = slack_client.views_update(view_id=view_id, view=final_view)
-        
+
         if not resp.get("ok"):
             logging.error(f"[Background] views_update failed: {resp.get('error')}")
             try:
                 slack_client.views_update(view_id=view_id, view=final_view)
             except Exception as e2:
                 logging.error(f"[Background] Retry failed: {e2}")
-    
+
     except Exception as e:
         logging.error(f"[Background] Exception updating view: {e}", exc_info=True)
         try:
@@ -415,18 +442,18 @@ async def _open_edit_modal(payload: dict):
     """Opens an edit modal to modify AI's suggested reply."""
     trigger_id = payload.get("trigger_id")
     action = payload.get("actions", [{}])[0]
-    
+
     # ADD DEBUGGING
     raw_value = action.get("value", "{}")
     logging.info(f"[_open_edit_modal] Raw button value: {raw_value[:500]}")
-    
+
     data = json.loads(raw_value)
-    
+
     # ADD MORE DEBUGGING
     logging.info(f"[_open_edit_modal] Parsed data keys: {list(data.keys())}")
     logging.info(f"[_open_edit_modal] conversationId in data: {data.get('conversationId')}")
     logging.info(f"[_open_edit_modal] meta in data: {data.get('meta')}")
-    
+
     # Add fingerprint for deduplication
     container = payload.get("container", {}) or {}
     channel_id = container.get("channel_id") or (payload.get("channel") or {}).get("id")
@@ -447,7 +474,7 @@ async def _open_edit_modal(payload: dict):
 async def _improve_with_ai(payload: dict):
     """Handles 'Improve with AI' button — rewrites text in modal."""
     import threading
-    
+
     try:
         # Extract current data
         view = payload.get("view", {})
@@ -471,24 +498,24 @@ async def _improve_with_ai(payload: dict):
         # Get metadata
         meta_str = view.get("private_metadata", "{}")
         logging.info(f"[Slack] Raw private_metadata: {meta_str[:200]}...")
-        
+
         try:
             meta = json.loads(meta_str) if meta_str else {}
         except json.JSONDecodeError as e:
             logging.error(f"[Slack] Failed to parse private_metadata: {e}")
             meta = {}
-        
+
         # Extract conversationId
         conversation_id = meta.get("conversationId")
         guest_name = meta.get("guest_name", "Guest")
         guest_message = meta.get("guest_message", "")
-        
+
         logging.info(f"[Slack] Extracted conversationId: {conversation_id}")
-        
+
         if not conversation_id:
             logging.error("[Slack] No conversationId found in metadata!")
             return JSONResponse({"ok": True})
-        
+
         # Update modal to show "Improving..." immediately
         improving_view = {
             "type": "modal",
@@ -504,12 +531,12 @@ async def _improve_with_ai(payload: dict):
                 }
             ],
         }
-        
+
         try:
             slack_client.views_update(view_id=view_id, hash=hash_value, view=improving_view)
         except Exception as e:
             logging.error(f"[Slack] Error showing improving state: {e}")
-        
+
         # Start background thread
         logging.info("[Slack] Starting background improvement thread...")
         threading.Thread(
@@ -517,7 +544,7 @@ async def _improve_with_ai(payload: dict):
             args=(view_id, hash_value, meta, current_text, coach_prompt, guest_name, guest_message),
             daemon=True
         ).start()
-        
+
         # Return immediate acknowledgment
         return JSONResponse({"ok": True})
 
@@ -567,12 +594,15 @@ async def _undo_ai(payload: dict):
                 "type": "input",
                 "block_id": "coach_prompt_block",
                 "optional": True,
-                "label": {"type": "plain_text", "text": "Coach the AI (optional)"},
+                "label": {"type": "plain_text", "text": "Improve with AI Instructions (optional)"},
                 "element": {
                     "type": "plain_text_input",
                     "action_id": "coach_prompt",
                     "multiline": True,
-                    "placeholder": {"type": "plain_text", "text": "Tell AI how to adjust"}
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Examples: 'Make more apologetic' • 'Too long, 2 sentences max' • 'Add check-in is at 3pm' • 'More professional tone' • 'Completely rewrite to..'"
+                    }
                 }
             },
             {
@@ -622,14 +652,14 @@ async def _send_reply(payload: dict, action_id: str):
     try:
         action = payload.get("actions", [{}])[0]
         raw_value = action.get("value", "{}")
-        
+
         logging.info(f"[_send_reply] action_id: {action_id}")
         logging.info(f"[_send_reply] Raw action value: {raw_value[:500]}")
 
         data = json.loads(raw_value)
 
         logging.info(f"[_send_reply] Parsed data keys: {list(data.keys())}")
-        
+
         conversation_id = data.get("conversationId")
         reply_text = data.get("reply_text", "") or data.get("reply", "")
 
