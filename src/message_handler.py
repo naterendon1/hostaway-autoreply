@@ -190,7 +190,7 @@ async def unified_webhook(request: Request):
                     "style": "primary",
                     "action_id": "send_reply",
                     "value": json.dumps({
-                        "conversation_id": conv_id,
+                        "conv_id": conv_id,
                         "reply_text": ai_reply,
                         "guest_message": guest_message,
                     }),
